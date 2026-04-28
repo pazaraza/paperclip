@@ -1033,10 +1033,20 @@ export function issueRoutes(
     throw unauthorized();
   }
 
-  function requireAgentRunId(req: Request, res: Response) {
+  async function resolveAgentRunId(req: Request, res: Response) {
     if (req.actor.type !== "agent") return null;
     const runId = req.actor.runId?.trim();
     if (runId) return runId;
+
+    const actorAgentId = req.actor.agentId;
+    const getActiveRunForAgent = heartbeat.getActiveRunForAgent;
+    if (actorAgentId && typeof getActiveRunForAgent === "function") {
+      const activeRun = await getActiveRunForAgent(actorAgentId);
+      if (activeRun?.status === "running") {
+        return activeRun.id;
+      }
+    }
+
     res.status(401).json({ error: "Agent run id required" });
     return null;
   }
@@ -1117,7 +1127,7 @@ export function issueRoutes(
     if (issue.status !== "in_progress") {
       return true;
     }
-    const runId = requireAgentRunId(req, res);
+    const runId = await resolveAgentRunId(req, res);
     if (!runId) return false;
     const ownership = await svc.assertCheckoutOwner(issue.id, actorAgentId, runId);
     if (ownership.adoptedFromRunId) {
@@ -3682,7 +3692,7 @@ export function issueRoutes(
       return;
     }
 
-    const checkoutRunId = requireAgentRunId(req, res);
+    const checkoutRunId = await resolveAgentRunId(req, res);
     if (req.actor.type === "agent" && !checkoutRunId) return;
     const updated = await svc.checkout(id, req.body.agentId, req.body.expectedStatuses, checkoutRunId);
     const actor = getActorInfo(req);
@@ -3732,7 +3742,7 @@ export function issueRoutes(
     }
     assertCompanyAccess(req, existing.companyId);
     if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
-    const actorRunId = requireAgentRunId(req, res);
+    const actorRunId = await resolveAgentRunId(req, res);
     if (req.actor.type === "agent" && !actorRunId) return;
 
     const released = await svc.release(
@@ -3867,7 +3877,7 @@ export function issueRoutes(
     }
 
     const actor = getActorInfo(req);
-    const agentSourceRunId = req.actor.type === "agent" ? requireAgentRunId(req, res) : null;
+    const agentSourceRunId = req.actor.type === "agent" ? await resolveAgentRunId(req, res) : null;
     if (req.actor.type === "agent" && !agentSourceRunId) return;
 
     const interaction = await issueThreadInteractionService(db).create(issue, {
