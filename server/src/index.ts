@@ -345,12 +345,27 @@ export async function startServer(): Promise<StartedServer> {
     const getRunningPid = (): number | null => {
       if (!existsSync(postmasterPidFile)) return null;
       try {
-        const pidLine = readFileSync(postmasterPidFile, "utf8").split("\n")[0]?.trim();
+        const postmasterPidLines = readFileSync(postmasterPidFile, "utf8").split("\n");
+        const pidLine = postmasterPidLines[0]?.trim();
         const pid = Number(pidLine);
         if (!Number.isInteger(pid) || pid <= 0) return null;
         if (!isPidRunning(pid)) return null;
+
+        // PostgreSQL stores the postmaster state on line 8 of postmaster.pid.
+        // A still-running process in `stopping` state is not safe to reuse as the embedded dev DB.
+        const postmasterState = postmasterPidLines[7]?.trim();
+        if (postmasterState === "stopping") {
+          throw new Error(
+            `Embedded PostgreSQL process is already shutting down (pid=${pid}, dataDir=${dataDir}). ` +
+              "Wait for it to exit, or stop the lingering postgres process before restarting Paperclip.",
+          );
+        }
+
         return pid;
-      } catch {
+      } catch (err) {
+        if (err instanceof Error && err.message.includes("already shutting down")) {
+          throw err;
+        }
         return null;
       }
     };
