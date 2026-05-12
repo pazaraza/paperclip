@@ -7089,9 +7089,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       runScopedMentionedSkillKeys,
     );
     const runtimeSkillEntries = await companySkills.listRuntimeSkillEntries(agent.companyId);
+    const paperclipIssueContext = parseObject(context.paperclipIssue);
     let runtimeConfig = {
       ...effectiveResolvedConfig,
       paperclipRuntimeSkills: runtimeSkillEntries,
+      taskId: readNonEmptyString(context.taskId) ?? readNonEmptyString(context.issueId) ?? undefined,
+      taskTitle: readNonEmptyString(paperclipIssueContext.title) ?? undefined,
+      taskBody:
+        readNonEmptyString(context.paperclipTaskMarkdown) ??
+        readNonEmptyString(paperclipIssueContext.description) ??
+        undefined,
+      commentId: readNonEmptyString(context.commentId) ?? readNonEmptyString(context.wakeCommentId) ?? undefined,
+      wakeReason: readNonEmptyString(context.wakeReason) ?? undefined,
     };
     const workspaceOperationRecorder = workspaceOperationsSvc.createRecorder({
       companyId: agent.companyId,

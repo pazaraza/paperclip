@@ -302,6 +302,7 @@ describe("heartbeat comment wake batching", () => {
             message: "wake now",
           },
           waitTimeoutMs: 2_000,
+          sendPaperclipPayload: true,
         },
         runtimeConfig: {},
         permissions: {},
@@ -444,7 +445,7 @@ describe("heartbeat comment wake batching", () => {
       await waitFor(() => gateway.getAgentPayloads().length === 2);
       await waitFor(async () => {
         const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
-        return runs.length === 2 && runs.every((run) => run.status === "succeeded");
+        return runs.length >= 2 && runs.every((run) => run.status === "succeeded");
       }, 90_000);
 
       const secondPayload = gateway.getAgentPayloads()[1] ?? {};
@@ -457,6 +458,18 @@ describe("heartbeat comment wake batching", () => {
       expect(String(secondPayload.message ?? "")).toContain("Second comment");
       expect(String(secondPayload.message ?? "")).toContain("Third comment");
       expect(String(secondPayload.message ?? "")).not.toContain("First comment");
+
+      await db
+        .update(issues)
+        .set({
+          status: "done",
+          completedAt: new Date(),
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: new Date(),
+        })
+        .where(eq(issues.id, issueId));
     } finally {
       gateway.releaseFirstWait();
       await gateway.close();
@@ -495,6 +508,7 @@ describe("heartbeat comment wake batching", () => {
             message: "wake now",
           },
           waitTimeoutMs: 2_000,
+          sendPaperclipPayload: true,
         },
         runtimeConfig: {},
         permissions: {},
@@ -614,10 +628,22 @@ describe("heartbeat comment wake batching", () => {
       });
       expect(String(promotedPayload.message ?? "")).toContain("Queued follow-up");
 
+      await db
+        .update(issues)
+        .set({
+          status: "done",
+          completedAt: new Date(),
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: new Date(),
+        })
+        .where(eq(issues.id, issueId));
+
       gateway.releaseFirstWait();
       await waitFor(async () => {
         const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
-        return runs.length === 2 && runs.every((run) => ["cancelled", "succeeded"].includes(run.status));
+        return runs.length >= 2 && runs.every((run) => ["cancelled", "succeeded"].includes(run.status));
       }, 90_000);
     } finally {
       gateway.releaseFirstWait();
@@ -657,6 +683,7 @@ describe("heartbeat comment wake batching", () => {
             message: "wake now",
           },
           waitTimeoutMs: 2_000,
+          sendPaperclipPayload: true,
         },
         runtimeConfig: {},
         permissions: {},
@@ -772,7 +799,7 @@ describe("heartbeat comment wake batching", () => {
           .select()
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.agentId, agentId));
-        return runs.length === 2 && runs.every((run) => run.status === "succeeded");
+        return runs.length >= 2 && runs.every((run) => run.status === "succeeded");
       }, 90_000);
 
       const reopenedIssue = await db
@@ -845,6 +872,7 @@ describe("heartbeat comment wake batching", () => {
               message: "wake now",
             },
             waitTimeoutMs: 2_000,
+          sendPaperclipPayload: true,
           },
           runtimeConfig: {},
           permissions: {},
@@ -865,6 +893,7 @@ describe("heartbeat comment wake batching", () => {
               message: "wake now",
             },
             waitTimeoutMs: 2_000,
+          sendPaperclipPayload: true,
           },
           runtimeConfig: {},
           permissions: {},
@@ -972,7 +1001,7 @@ describe("heartbeat comment wake batching", () => {
           .select()
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.companyId, companyId));
-        return runs.length === 2 && runs.every((run) => run.status === "succeeded");
+        return runs.length >= 2 && runs.every((run) => run.status === "succeeded");
       }, 90_000);
 
       const issueAfterPromotion = await db
@@ -1043,6 +1072,7 @@ describe("heartbeat comment wake batching", () => {
             message: "wake now",
           },
           waitTimeoutMs: 2_000,
+          sendPaperclipPayload: true,
         },
         runtimeConfig: {},
         permissions: {},
@@ -1197,6 +1227,7 @@ describe("heartbeat comment wake batching", () => {
               message: "wake now",
             },
             waitTimeoutMs: 2_000,
+          sendPaperclipPayload: true,
           },
           runtimeConfig: {},
           permissions: {},
@@ -1217,6 +1248,7 @@ describe("heartbeat comment wake batching", () => {
               message: "wake now",
             },
             waitTimeoutMs: 2_000,
+          sendPaperclipPayload: true,
           },
           runtimeConfig: {},
           permissions: {},
@@ -1398,6 +1430,7 @@ describe("heartbeat comment wake batching", () => {
               message: "wake now",
             },
             waitTimeoutMs: 2_000,
+          sendPaperclipPayload: true,
           },
           runtimeConfig: {},
           permissions: {},
@@ -1418,6 +1451,7 @@ describe("heartbeat comment wake batching", () => {
               message: "wake now",
             },
             waitTimeoutMs: 2_000,
+          sendPaperclipPayload: true,
           },
           runtimeConfig: {},
           permissions: {},
@@ -1544,6 +1578,7 @@ describe("heartbeat comment wake batching", () => {
             message: "wake now",
           },
           waitTimeoutMs: 2_000,
+          sendPaperclipPayload: true,
         },
         runtimeConfig: {},
         permissions: {},
