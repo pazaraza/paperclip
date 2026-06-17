@@ -246,6 +246,7 @@ export const ISSUE_RECOVERY_ACTION_OUTCOMES = [
   "blocked",
   "escalated",
   "cancelled",
+  "continuing",
 ] as const;
 export type IssueRecoveryActionOutcome = (typeof ISSUE_RECOVERY_ACTION_OUTCOMES)[number];
 

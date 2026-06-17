@@ -325,6 +325,8 @@ export function buildSuccessfulRunHandoffInstruction(input: {
     "**Is there more work to do?**",
     `4. Either delegate follow-up work (create/link a follow-up issue and block this one on it, or close this issue if its scope is independently complete) or record an explicit continuation path with \`resumeIntent: true\`, \`resumeFromRunId: ${input.sourceRunId}\`, and a concrete next action.`,
     "",
+    "**Auto-clear hint:** if the source issue has open child issues (delegated follow-up) OR the run lands a PATCH with `resume: true` plus a concrete next action, the missing_disposition recovery action will be auto-cleared on the next reconciliation pass and the issue will be kept at `in_progress`. You do not need to force the issue to `done`/`in_review`/`blocked` to clear the recovery action.",
+    "",
     "Comments, document revisions, work-product writes, and continuation summaries are supporting evidence only — they do not satisfy this handoff unless the issue state/path also records one valid disposition.",
   ].join("\n");
 }

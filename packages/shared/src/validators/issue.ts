@@ -207,12 +207,13 @@ const RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES = [
   "false_positive",
   "blocked",
   "cancelled",
+  "continuing",
 ] as const;
 
 export const resolveIssueRecoveryActionSchema = z.object({
   actionId: z.string().uuid().optional(),
   outcome: z.enum(RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES),
-  sourceIssueStatus: z.enum(["done", "in_review", "blocked"]),
+  sourceIssueStatus: z.enum(["done", "in_review", "blocked", "in_progress"]),
   resolutionNote: multilineTextSchema.optional().nullable(),
 }).strict().superRefine((value, ctx) => {
   if (value.outcome === "restored") {
@@ -231,6 +232,17 @@ export const resolveIssueRecoveryActionSchema = z.object({
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message: "Blocked recovery actions must move the source issue to blocked",
+        path: ["sourceIssueStatus"],
+      });
+    }
+    return;
+  }
+
+  if (value.outcome === "continuing") {
+    if (value.sourceIssueStatus !== "in_progress") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Continuing recovery actions must keep the source issue at in_progress",
         path: ["sourceIssueStatus"],
       });
     }

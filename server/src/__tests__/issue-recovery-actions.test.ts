@@ -298,6 +298,291 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
+  it("routes stranded recovery to the operating assignee, not the executive desk (RUAAAAA-1703)", async () => {
+    // Reproduces the bug where specialist routine residue woke the CEO lane
+    // because resolveStrandedIssueRecoveryOwnerAgentId tried assignee.reportsTo
+    // before the assignee. With the fix, the invokable assignee wins and the
+    // executive role agents are reserved for the narrow escalation case.
+    const companyId = randomUUID();
+    const ceoId = randomUUID();
+    const leadId = randomUUID();
+    const specialistId = randomUUID();
+    const sourceIssueId = randomUUID();
+    const prefix = `RA${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Recovery Routing Co",
+      issuePrefix: prefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: ceoId,
+        companyId,
+        name: "CEO",
+        role: "ceo",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: leadId,
+        companyId,
+        name: "Marketing Lead",
+        role: "cmo",
+        status: "idle",
+        reportsTo: ceoId,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: specialistId,
+        companyId,
+        name: "Demand Gen Specialist",
+        role: "general",
+        status: "idle",
+        reportsTo: leadId,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values({
+      id: sourceIssueId,
+      companyId,
+      title: "Core Health Review",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: specialistId,
+      createdByAgentId: specialistId,
+      issueNumber: 1,
+      identifier: `${prefix}-1`,
+    });
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue!,
+      previousStatus: "in_progress",
+      latestRun: {
+        id: randomUUID(),
+        agentId: specialistId,
+        status: "failed",
+        error: "adapter failed",
+        errorCode: "adapter_failed",
+        contextSnapshot: { retryReason: "issue_continuation_needed" },
+        livenessState: "needs_followup",
+      },
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]).toMatchObject({
+      ownerAgentId: specialistId,
+      previousOwnerAgentId: specialistId,
+      returnOwnerAgentId: specialistId,
+    });
+    expect(actionRows[0]?.ownerAgentId).not.toBe(ceoId);
+    expect(actionRows[0]?.ownerAgentId).not.toBe(leadId);
+  });
+
+  it("escalates to the assignee's manager when the assignee is no longer invokable (RUAAAAA-1703)", async () => {
+    // The narrow manager-escalation path: the operating owner exists but is
+    // paused/terminated/budget-blocked, so recovery ownership should step up
+    // the reportsTo chain rather than skip straight to the executive.
+    const companyId = randomUUID();
+    const ceoId = randomUUID();
+    const leadId = randomUUID();
+    const specialistId = randomUUID();
+    const sourceIssueId = randomUUID();
+    const prefix = `RA${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Recovery Routing Co 2",
+      issuePrefix: prefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: ceoId,
+        companyId,
+        name: "CEO",
+        role: "ceo",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: leadId,
+        companyId,
+        name: "Marketing Lead",
+        role: "cmo",
+        status: "idle",
+        reportsTo: ceoId,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: specialistId,
+        companyId,
+        name: "Paused Specialist",
+        role: "general",
+        status: "paused",
+        reportsTo: leadId,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values({
+      id: sourceIssueId,
+      companyId,
+      title: "Routine Health Check",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: specialistId,
+      createdByAgentId: specialistId,
+      issueNumber: 1,
+      identifier: `${prefix}-1`,
+    });
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue!,
+      previousStatus: "in_progress",
+      latestRun: {
+        id: randomUUID(),
+        agentId: specialistId,
+        status: "failed",
+        error: "adapter failed",
+        errorCode: "adapter_failed",
+        contextSnapshot: { retryReason: "issue_continuation_needed" },
+        livenessState: "needs_followup",
+      },
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+    expect(actionRows).toHaveLength(1);
+    // Paused specialist is not invokable, so the lead (assignee.reportsTo) is
+    // the next operating-lane escalation. CEO is reserved for the case where
+    // the whole chain is unavailable.
+    expect(actionRows[0]?.ownerAgentId).toBe(leadId);
+    expect(actionRows[0]?.ownerAgentId).not.toBe(ceoId);
+  });
+
+  it("falls back to executive integration only when the entire operating chain is unavailable (RUAAAAA-1703)", async () => {
+    // The narrow CEO rule: when both the assignee and their manager are not
+    // invokable, executive ownership is the legitimate recovery destination.
+    const companyId = randomUUID();
+    const ceoId = randomUUID();
+    const leadId = randomUUID();
+    const specialistId = randomUUID();
+    const sourceIssueId = randomUUID();
+    const prefix = `RA${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Recovery Routing Co 3",
+      issuePrefix: prefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: ceoId,
+        companyId,
+        name: "CEO",
+        role: "ceo",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: leadId,
+        companyId,
+        name: "Paused Marketing Lead",
+        role: "cmo",
+        status: "paused",
+        reportsTo: ceoId,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: specialistId,
+        companyId,
+        name: "Terminated Specialist",
+        role: "general",
+        status: "terminated",
+        reportsTo: leadId,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values({
+      id: sourceIssueId,
+      companyId,
+      title: "Orphan routine work",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: specialistId,
+      createdByAgentId: ceoId,
+      issueNumber: 1,
+      identifier: `${prefix}-1`,
+    });
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue!,
+      previousStatus: "in_progress",
+      latestRun: {
+        id: randomUUID(),
+        agentId: specialistId,
+        status: "failed",
+        error: "adapter failed",
+        errorCode: "adapter_failed",
+        contextSnapshot: { retryReason: "issue_continuation_needed" },
+        livenessState: "needs_followup",
+      },
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+    expect(actionRows).toHaveLength(1);
+    // Entire operating chain is unavailable → executive integration is the
+    // legitimate recovery owner for board-created or orphaned work.
+    expect(actionRows[0]?.ownerAgentId).toBe(ceoId);
+  });
+
   it("reuses the same source-scoped action when latest run IDs change while the cause stays the same", async () => {
     const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
     const enqueueWakeup = vi.fn(async () => null);
@@ -723,6 +1008,94 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       status: "resolved",
       outcome: "false_positive",
       resolutionNote: "Recovery signal was stale; return to review.",
+    });
+  });
+
+  it("allows continuing recovery resolution to keep the source issue at in_progress (RUAAAAA-1817)", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "successful_run_missing_state",
+      fingerprint: "missing-disposition:continuing",
+      evidence: {
+        sourceRunId: "run-1",
+        correctiveRunId: "run-2",
+        missingDisposition: "clear_next_step",
+      },
+      nextAction: "Choose and record a valid issue disposition.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    const app = createApp();
+
+    const resolved = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "continuing",
+        sourceIssueStatus: "in_progress",
+        resolutionNote:
+          "Source issue remains in_progress with a valid continuation path recorded by the corrective run.",
+      })
+      .expect(200);
+
+    expect(resolved.body.issue).toMatchObject({
+      id: sourceIssueId,
+      status: "in_progress",
+      activeRecoveryAction: null,
+    });
+    expect(resolved.body.recoveryAction).toMatchObject({
+      id: action.id,
+      status: "resolved",
+      outcome: "continuing",
+      resolutionNote: expect.stringContaining("continuation path recorded by the corrective run"),
+    });
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+  });
+
+  it("rejects continuing recovery resolution when sourceIssueStatus is not in_progress (RUAAAAA-1817)", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "successful_run_missing_state",
+      fingerprint: "missing-disposition:continuing-rejected",
+      evidence: { sourceRunId: "run-1" },
+      nextAction: "Choose a valid issue disposition.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    const app = createApp();
+
+    const rejected = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "continuing",
+        sourceIssueStatus: "done",
+      })
+      .expect(400);
+
+    expect(JSON.stringify(rejected.body)).toContain("Continuing recovery actions must keep the source issue at in_progress");
+
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(sourceIssue?.status).toBe("in_progress");
+
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow).toMatchObject({
+      status: "active",
+      outcome: null,
+      resolvedAt: null,
     });
   });
 

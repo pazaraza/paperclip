@@ -1715,6 +1715,190 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("auto-clears the missing_disposition recovery action when the source issue has open child issues (RUAAAAA-1817)", async () => {
+    const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+    });
+    const sourceRunId = randomUUID();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "finish_successful_run_handoff",
+          sourceRunId,
+          resumeFromRunId: sourceRunId,
+          handoffRequired: true,
+          handoffReason: "successful_run_missing_state",
+          missingDisposition: "clear_next_step",
+          handoffAttempt: 1,
+          maxHandoffAttempts: 1,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    // Seed an active missing_disposition recovery action (as if a previous
+    // reconciliation pass had already escalated the source issue and a
+    // corrective agent run has since re-set the source to in_progress).
+    const recoveryActionId = randomUUID();
+    await db.insert(issueRecoveryActions).values({
+      id: recoveryActionId,
+      companyId,
+      sourceIssueId: issueId,
+      kind: "missing_disposition",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: agentId,
+      previousOwnerAgentId: agentId,
+      returnOwnerAgentId: agentId,
+      cause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+      fingerprint: `source_scoped_recovery:${companyId}:${issueId}:${SUCCESSFUL_RUN_MISSING_STATE_REASON}`,
+      evidence: {
+        sourceIssueId: issueId,
+        previousStatus: "in_progress",
+        latestIssueStatus: "in_progress",
+        latestRunId: runId,
+        latestRunStatus: "succeeded",
+        sourceRunId,
+        correctiveRunId: runId,
+        missingDisposition: "clear_next_step",
+        handoffAttempt: 1,
+        maxHandoffAttempts: 1,
+      },
+      nextAction: "Choose and record a valid issue disposition without copying transcript content.",
+      attemptCount: 1,
+    });
+    // Seed an open child issue to act as the delegated follow-up continuation path.
+    const childIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: childIssueId,
+      companyId,
+      title: "Delegate child for continuation",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      parentId: issueId,
+      issueNumber: 999,
+      identifier: `RA-999`,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.successfulRunHandoffAutoCleared).toBe(1);
+    expect(result.successfulRunHandoffEscalated).toBe(0);
+
+    // Source issue should remain in_progress (not force-blocked).
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(sourceIssue?.status).toBe("in_progress");
+
+    // Recovery action should be resolved with outcome=continuing.
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      );
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]).toMatchObject({
+      kind: "missing_disposition",
+      status: "resolved",
+      outcome: "continuing",
+    });
+    expect(actionRows[0].resolutionNote).toMatch(
+      /valid continuation path recorded by run .*open child issue/i,
+    );
+    expect(actionRows[0].resolvedAt).toBeTruthy();
+  });
+
+  it("auto-clears the missing_disposition recovery action when the corrective handoff run recorded resumeIntent (RUAAAAA-1817)", async () => {
+    const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+    });
+    const sourceRunId = randomUUID();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "finish_successful_run_handoff",
+          sourceRunId,
+          resumeFromRunId: sourceRunId,
+          handoffRequired: true,
+          handoffReason: "successful_run_missing_state",
+          missingDisposition: "clear_next_step",
+          handoffAttempt: 1,
+          maxHandoffAttempts: 1,
+          resumeIntent: true,
+          followUpRequested: true,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    // Seed an active missing_disposition recovery action.
+    const recoveryActionId = randomUUID();
+    await db.insert(issueRecoveryActions).values({
+      id: recoveryActionId,
+      companyId,
+      sourceIssueId: issueId,
+      kind: "missing_disposition",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: agentId,
+      previousOwnerAgentId: agentId,
+      returnOwnerAgentId: agentId,
+      cause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+      fingerprint: `source_scoped_recovery:${companyId}:${issueId}:${SUCCESSFUL_RUN_MISSING_STATE_REASON}`,
+      evidence: {
+        sourceIssueId: issueId,
+        previousStatus: "in_progress",
+        latestIssueStatus: "in_progress",
+        latestRunId: runId,
+        latestRunStatus: "succeeded",
+        sourceRunId,
+        correctiveRunId: runId,
+        missingDisposition: "clear_next_step",
+        handoffAttempt: 1,
+        maxHandoffAttempts: 1,
+      },
+      nextAction: "Choose and record a valid issue disposition without copying transcript content.",
+      attemptCount: 1,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.successfulRunHandoffAutoCleared).toBe(1);
+    expect(result.successfulRunHandoffEscalated).toBe(0);
+
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(sourceIssue?.status).toBe("in_progress");
+
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      );
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]).toMatchObject({
+      kind: "missing_disposition",
+      status: "resolved",
+      outcome: "continuing",
+    });
+    expect(actionRows[0].resolutionNote).toMatch(
+      /explicit continuation intent \(resume=true\)/i,
+    );
+  });
+
   it("clears the detached warning when the run reports activity again", async () => {
     const { runId } = await seedRunFixture({
       includeIssue: false,

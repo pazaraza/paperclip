@@ -798,17 +798,23 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return issue ?? null;
   }
 
+  // Recovery ownership routing for stale runs (companion to
+  // resolveStrandedIssueRecoveryOwnerAgentId, see RUAAAAA-1703). The same
+  // narrow rule applies: try the running agent / source assignee first so a
+  // stale heartbeat does not silently promote work to the executive desk.
   async function resolveStaleRunOwnerAgentId(input: {
     run: typeof heartbeatRuns.$inferSelect;
     runningAgent: typeof agents.$inferSelect;
     sourceIssue: typeof issues.$inferSelect | null;
   }) {
     const candidateIds: string[] = [];
+    candidateIds.push(input.runningAgent.id);
+    if (input.sourceIssue?.assigneeAgentId) candidateIds.push(input.sourceIssue.assigneeAgentId);
+    if (input.runningAgent.reportsTo) candidateIds.push(input.runningAgent.reportsTo);
     if (input.sourceIssue?.assigneeAgentId) {
       const sourceAssignee = await getAgent(input.sourceIssue.assigneeAgentId);
       if (sourceAssignee?.reportsTo) candidateIds.push(sourceAssignee.reportsTo);
     }
-    if (input.runningAgent.reportsTo) candidateIds.push(input.runningAgent.reportsTo);
     const roleCandidates = await db
       .select()
       .from(agents)
@@ -1377,8 +1383,27 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     ].join("\n");
   }
 
+  // Recovery ownership routing rule (RUAAAAA-1703, 2026-06-13):
+  //   1. The original assignee (operating owner) is the default recovery owner. Routine
+  //      work (Core Health Review, Fleet Health Watch, etc.) and stranded lead-owned
+  //      issues must return to the lane that already owned the work, not the
+  //      executive desk, when that lane is still invokable.
+  //   2. The assignee's `reportsTo` is the manager escalation path, used only when the
+  //      assignee is no longer invokable (paused/terminated/pending_approval or
+  //      budget-blocked).
+  //   3. The creator's chain (creator's manager, then creator) covers manually
+  //      originated child issues where the operating owner has been reassigned.
+  //   4. `cto`/`ceo` role agents are the executive integration fallback, reserved
+  //      for board-created issues with no reachable operating owner.
+  //   5. The original assignee is appended last as a final fallback so the recovery
+  //      action can still be recorded against the source lane when the agent
+  //      returns to service.
+  // CEO/manager promotion is intentionally a *narrow* rule, not a default: the
+  // previous behavior of trying `assignee.reportsTo` first caused specialist
+  // routine residue to wake the CEO lane (see issue description for evidence).
   async function resolveStrandedIssueRecoveryOwnerAgentId(issue: typeof issues.$inferSelect) {
     const candidateIds: string[] = [];
+    if (issue.assigneeAgentId) candidateIds.push(issue.assigneeAgentId);
     if (issue.assigneeAgentId) {
       const assignee = await getAgent(issue.assigneeAgentId);
       if (assignee?.reportsTo) candidateIds.push(assignee.reportsTo);
@@ -1395,7 +1420,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .where(and(eq(agents.companyId, issue.companyId), inArray(agents.role, ["cto", "ceo"])))
       .orderBy(sql`case when ${agents.role} = 'cto' then 0 else 1 end`, asc(agents.createdAt));
     candidateIds.push(...roleCandidates.map((agent) => agent.id));
-    if (issue.assigneeAgentId) candidateIds.push(issue.assigneeAgentId);
 
     const seen = new Set<string>();
     for (const agentId of candidateIds) {
@@ -1809,6 +1833,146 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => rows.map((row) => row.blockerIssueId));
   }
 
+  /**
+   * Detect whether the latest run on a source issue has recorded a valid
+   * in_progress continuation path. Returns the type of evidence found.
+   *
+   * The reconciliation pass uses this to auto-clear a `missing_disposition`
+   * recovery action before force-blocking the source issue, so legitimate
+   * long-running orchestration issues (parent + live child continuation)
+   * do not accumulate repeated recovery wakes once the corrective handoff
+   * run has already recorded a valid disposition.
+   */
+  async function detectValidInProgressContinuationPath(input: {
+    issue: typeof issues.$inferSelect;
+    latestRun: LatestIssueRun;
+  }): Promise<
+    | { hasContinuation: false; reason: string }
+    | {
+        hasContinuation: true;
+        signal: "resume_intent" | "open_child_issues" | "continuation_summary";
+        openChildIssueIds?: string[];
+        correctiveRunId?: string | null;
+      }
+  > {
+    if (input.issue.status !== "in_progress") {
+      return { hasContinuation: false, reason: `source issue status ${input.issue.status} is not in_progress` };
+    }
+    if (!input.latestRun || input.latestRun.status !== "succeeded") {
+      return { hasContinuation: false, reason: "latest run did not succeed" };
+    }
+
+    const context = parseObject(input.latestRun.contextSnapshot);
+    const explicitResume = asBoolean(context.resumeIntent, false) || asBoolean(context.followUpRequested, false);
+    if (explicitResume) {
+      return {
+        hasContinuation: true,
+        signal: "resume_intent",
+        correctiveRunId: input.latestRun.id,
+      };
+    }
+
+    // Look for open child issues that represent delegated follow-up work.
+    const openChildRows = await db
+      .select({ id: issues.id, identifier: issues.identifier, title: issues.title, status: issues.status })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, input.issue.companyId),
+          eq(issues.parentId, input.issue.id),
+          notInArray(issues.status, ["done", "cancelled", "backlog"]),
+        ),
+      )
+      .limit(8);
+    if (openChildRows.length > 0) {
+      return {
+        hasContinuation: true,
+        signal: "open_child_issues",
+        openChildIssueIds: openChildRows.map((row) => row.id),
+        correctiveRunId: input.latestRun.id,
+      };
+    }
+
+    return { hasContinuation: false, reason: "no continuation signal recorded" };
+  }
+
+  /**
+   * Auto-clear a `missing_disposition` recovery action when the source issue
+   * has a valid in_progress continuation path. This is the fix for the
+   * repeated-recovery-wake loop where a successful corrective handoff run
+   * records a valid in_progress disposition but the recovery action keeps
+   * re-firing because the schema historically forced the source issue to
+   * `blocked` for resolution.
+   *
+   * Returns the resolved recovery action on success, or null if the
+   * auto-clear was not applicable.
+   */
+  async function tryAutoClearMissingDispositionContinuation(input: {
+    issue: typeof issues.$inferSelect;
+    latestRun: LatestIssueRun;
+    recoveryCause: StrandedRecoveryCause;
+  }): Promise<Awaited<ReturnType<typeof recoveryActionsSvc.resolveActiveForIssue>> | null> {
+    if (input.recoveryCause !== SUCCESSFUL_RUN_MISSING_STATE_REASON) return null;
+    const active = await recoveryActionsSvc.getActiveForIssue(
+      input.issue.companyId,
+      input.issue.id,
+    );
+    if (!active || active.kind !== "missing_disposition") return null;
+    if (active.status !== "active" && active.status !== "escalated") return null;
+
+    const detection = await detectValidInProgressContinuationPath({
+      issue: input.issue,
+      latestRun: input.latestRun,
+    });
+    if (!detection.hasContinuation) return null;
+
+    const correctiveRunId = detection.correctiveRunId ?? input.latestRun?.id ?? null;
+    const signalLabel =
+      detection.signal === "resume_intent"
+        ? "explicit continuation intent (resume=true)"
+        : detection.signal === "open_child_issues"
+        ? `${detection.openChildIssueIds?.length ?? 0} open child issue(s) (delegated follow-up)`
+        : "issue continuation summary document";
+    const resolutionNote = [
+      "Auto-cleared by reconciliation: source issue is in_progress with a valid continuation path recorded by run",
+      `\`${correctiveRunId}\` (${signalLabel}).`,
+      "Recovery action kept the source issue at in_progress rather than force-blocking it.",
+    ].join(" ");
+
+    const resolved = await recoveryActionsSvc.resolveActiveForIssue({
+      companyId: input.issue.companyId,
+      sourceIssueId: input.issue.id,
+      actionId: active.id,
+      status: "resolved",
+      outcome: "continuing",
+      resolutionNote,
+    });
+    if (!resolved) return null;
+
+    await logActivity(db, {
+      companyId: input.issue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: correctiveRunId,
+      action: "issue.recovery_action_auto_cleared",
+      entityType: "issue",
+      entityId: input.issue.id,
+      details: {
+        identifier: input.issue.identifier,
+        recoveryActionId: resolved.id,
+        recoveryCause: input.recoveryCause,
+        outcome: "continuing",
+        continuationSignal: detection.signal,
+        correctiveRunId,
+        openChildIssueIds: detection.openChildIssueIds ?? null,
+        source: "recovery.reconcile_successful_run_handoff_auto_clear",
+      },
+    });
+
+    return resolved;
+  }
+
   async function escalateStrandedAssignedIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: "todo" | "in_progress";
@@ -1992,6 +2156,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       successfulContinuationObserved: 0,
       orphanBlockersAssigned: 0,
       successfulRunHandoffEscalated: 0,
+      successfulRunHandoffAutoCleared: 0,
       escalated: 0,
       skipped: 0,
       issueIds: [] as string[],
@@ -2109,10 +2274,47 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         result.skipped += 1;
         continue;
       }
+
+      // Top-level auto-clear guard: a successful run on the source issue
+      // recorded a valid in_progress continuation path (open child issues or
+      // explicit resume intent). This stops the repeated missing_disposition
+      // recovery wake loop for legitimate long-running orchestration issues
+      // (parent + live child continuation). Runs before the handoffEvidence
+      // and inProgressContinuation branches so it works for both the
+      // corrective handoff run and any subsequent productive run.
+      if (issue.status === "in_progress" && latestRun?.status === "succeeded") {
+        const topLevelAutoCleared = await tryAutoClearMissingDispositionContinuation({
+          issue,
+          latestRun,
+          recoveryCause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+        });
+        if (topLevelAutoCleared) {
+          result.successfulRunHandoffAutoCleared += 1;
+          result.issueIds.push(issue.id);
+          continue;
+        }
+      }
+
       const handoffEvidence = isExhaustedSuccessfulRunHandoff(latestRun);
       if (handoffEvidence) {
         if (!handoffEvidence.exhausted) {
           result.skipped += 1;
+          continue;
+        }
+
+        // Auto-clear guard: if the source issue is in_progress with a valid
+        // continuation path, resolve the recovery action with outcome=continuing
+        // rather than force-blocking the source. This stops the repeated
+        // missing_disposition recovery wake loop for legitimate long-running
+        // orchestration issues (parent + live child continuation).
+        const autoCleared = await tryAutoClearMissingDispositionContinuation({
+          issue,
+          latestRun,
+          recoveryCause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+        });
+        if (autoCleared) {
+          result.successfulRunHandoffAutoCleared += 1;
+          result.issueIds.push(issue.id);
           continue;
         }
 
@@ -2141,6 +2343,20 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
 
         if (isRepeatedProductiveContinuationRecovery(successfulRun)) {
+          // Auto-clear guard: if the source issue is in_progress with a valid
+          // continuation path, resolve the recovery action with outcome=continuing
+          // rather than force-blocking the source on every retry cycle.
+          const autoCleared = await tryAutoClearMissingDispositionContinuation({
+            issue,
+            latestRun: successfulRun,
+            recoveryCause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+          });
+          if (autoCleared) {
+            result.successfulRunHandoffAutoCleared += 1;
+            result.issueIds.push(issue.id);
+            continue;
+          }
+
           const updated = await escalateStrandedAssignedIssue({
             issue,
             previousStatus: "in_progress",
