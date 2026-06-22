@@ -270,6 +270,15 @@ export interface PluginRouteWebhookDeps {
 export interface PluginRouteToolDeps {
   /** The tool dispatcher for listing and executing plugin tools. */
   toolDispatcher: PluginToolDispatcher;
+  /**
+   * Optional runtime PDP runtime (RUAAAAA-1955, Slice 1949-B). When
+   * provided, every tool call goes through the PDP middleware before
+   * the tool implementation runs; the middleware returns
+   * 202+interaction (soft_pause), 403+reason (hard_stop), or
+   * `next()` (allow). When omitted, the route behaves exactly as
+   * it did before 1955 (no enforcement layer).
+   */
+  pdp?: import("../policy-decision-point/types.js").PdpRuntime;
 }
 
 /**
@@ -771,7 +780,15 @@ export function pluginRoutes(
    * - 501 if tool dispatcher is not configured
    * - 502 if the plugin worker is unavailable or the RPC call fails
    */
-  router.post("/plugins/tools/execute", async (req, res) => {
+  router.post("/plugins/tools/execute",
+    // The runtime PDP middleware (RUAAAAA-1955, Slice 1949-B) sits
+    // between the route handler and the tool implementation. When
+    // `toolDeps.pdp` is configured, the middleware enforces the
+    // 5-row decision table (allow / soft_pause / hard_stop). When
+    // it is not configured, the route behaves exactly as it did
+    // before 1955 (no enforcement).
+    toolDeps?.pdp?.middleware ?? ((_req, _res, next) => { next(); }),
+    async (req, res) => {
     assertBoardOrgAccess(req);
 
     if (!toolDeps) {

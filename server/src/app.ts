@@ -12,6 +12,7 @@ import { privateHostnameGuard, resolvePrivateHostnameAllowSet } from "./middlewa
 import { healthRoutes } from "./routes/health.js";
 import { companyRoutes } from "./routes/companies.js";
 import { companySkillRoutes } from "./routes/company-skills.js";
+import { toolInventoryRouter } from "./routes/company-tool-inventory.js";
 import { agentRoutes } from "./routes/agents.js";
 import { projectRoutes } from "./routes/projects.js";
 import { issueRoutes } from "./routes/issues.js";
@@ -133,6 +134,14 @@ export async function createApp(
     pluginWorkerManager?: PluginWorkerManager;
     betterAuthHandler?: express.RequestHandler;
     resolveSession?: (req: ExpressRequest) => Promise<BetterAuthSessionResult | null>;
+    /**
+     * Optional runtime PDP runtime (RUAAAAA-1955, Slice 1949-B). When
+     * provided, the PDP middleware is wired into the tool-execute
+     * route. When omitted, the tool dispatcher behaves exactly as
+     * it did before 1955 (no enforcement layer). The runtime is
+     * produced by `initPdp()` in `src/policy-decision-point/init.ts`.
+     */
+    pdp?: import("./policy-decision-point/types.js").PdpRuntime;
   },
 ) {
   const app = express();
@@ -190,6 +199,7 @@ export async function createApp(
   api.use("/companies", companyRoutes(db, opts.storageService));
   api.use(companySkillRoutes(db));
   api.use(agentRoutes(db, { pluginWorkerManager: workerManager }));
+  api.use(toolInventoryRouter(db));
   api.use(assetRoutes(db, opts.storageService));
   api.use(projectRoutes(db));
   api.use(issueRoutes(db, opts.storageService, {
@@ -280,7 +290,7 @@ export async function createApp(
       loader,
       { scheduler, jobStore },
       { workerManager },
-      { toolDispatcher },
+      { toolDispatcher, pdp: opts.pdp },
       { workerManager },
     ),
   );
