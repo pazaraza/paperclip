@@ -18,6 +18,7 @@ import {
   heartbeatRuns,
   issueApprovals,
   issueRecoveryActions,
+  issueWorkProducts,
   issueRelations,
   issueThreadInteractions,
   issues,
@@ -1905,6 +1906,210 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
    * `blocked` for resolution.
    *
    * Returns the resolved recovery action on success, or null if the
+  /**
+   * Detect whether a `timed_out` continuation retry on an in_progress issue
+   * recorded durable progress (open child issues, comments, or work
+   * products) BEFORE the gateway wait-timeout fired. This is the
+   * stranded-after-write detector for the `stranded_assigned_issue` cause.
+   *
+   * The reconciliation pass uses this to auto-clear the recovery action
+   * instead of force-blocking the source issue, so legitimate long-running
+   * orchestration issues (parent + live child continuation, parent + open
+   * review interactions, parent + comments) do not accumulate repeated
+   * `source_scoped_recovery_action` wakes once the timed-out retry has
+   * already produced durable evidence of advancing the issue.
+   *
+   * Returns the type of evidence found, or `hasContinuation: false` if the
+   * timed-out run left no durable trace.
+   */
+  async function detectValidTimedOutContinuationPath(input: {
+    issue: typeof issues.$inferSelect;
+    latestRun: LatestIssueRun;
+  }): Promise<
+    | { hasContinuation: false; reason: string }
+    | {
+        hasContinuation: true;
+        signal: "open_child_issues" | "issue_comments_landed" | "work_products_landed";
+        openChildIssueIds?: string[];
+        commentIds?: string[];
+        workProductIds?: string[];
+        correctiveRunId: string;
+      }
+  > {
+    if (input.issue.status !== "in_progress") {
+      return { hasContinuation: false, reason: `source issue status ${input.issue.status} is not in_progress` };
+    }
+    if (!input.latestRun || input.latestRun.status !== "timed_out") {
+      return { hasContinuation: false, reason: "latest run did not time out" };
+    }
+
+    // Look for open child issues that represent delegated follow-up work
+    // that landed before the gateway wait-timeout fired.
+    const openChildRows = await db
+      .select({ id: issues.id, identifier: issues.identifier, title: issues.title, status: issues.status })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, input.issue.companyId),
+          eq(issues.parentId, input.issue.id),
+          notInArray(issues.status, ["done", "cancelled", "backlog"]),
+        ),
+      )
+      .limit(8);
+    if (openChildRows.length > 0) {
+      return {
+        hasContinuation: true,
+        signal: "open_child_issues",
+        openChildIssueIds: openChildRows.map((row) => row.id),
+        correctiveRunId: input.latestRun.id,
+      };
+    }
+
+    // Look for issue comments that the timed-out run created. These are a
+    // strong "wrote something durable" signal even when no child issues
+    // were filed (e.g., review comments, progress notes, unblock notes).
+    const commentRows = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, input.issue.id),
+          eq(issueComments.createdByRunId, input.latestRun.id),
+        ),
+      )
+      .limit(8);
+    if (commentRows.length > 0) {
+      return {
+        hasContinuation: true,
+        signal: "issue_comments_landed",
+        commentIds: commentRows.map((row) => row.id),
+        correctiveRunId: input.latestRun.id,
+      };
+    }
+
+    // Look for work products the timed-out run created (e.g., attached
+    // design docs, deployment artifacts). These also represent durable
+    // progress that survived the timeout.
+    const workProductRows = await db
+      .select({ id: issueWorkProducts.id })
+      .from(issueWorkProducts)
+      .where(
+        and(
+          eq(issueWorkProducts.companyId, input.issue.companyId),
+          eq(issueWorkProducts.issueId, input.issue.id),
+          eq(issueWorkProducts.createdByRunId, input.latestRun.id),
+        ),
+      )
+      .limit(8);
+    if (workProductRows.length > 0) {
+      return {
+        hasContinuation: true,
+        signal: "work_products_landed",
+        workProductIds: workProductRows.map((row) => row.id),
+        correctiveRunId: input.latestRun.id,
+      };
+    }
+
+    return {
+      hasContinuation: false,
+      reason: "no durable progress (open children, comments, or work products) recorded by the timed-out run",
+    };
+  }
+
+  /**
+   * Auto-clear a `stranded_assigned_issue` recovery action when the latest
+   * timed-out continuation retry recorded durable progress on the source
+   * issue before the openclaw_gateway wait-timeout fired. This is the
+   * paired fix for the false-positive recovery churn pattern observed on
+   * 2026-06-22 (RUAAAAA-2061) where a long-running Lead run timed out at
+   * the 300s gateway boundary AFTER creating child issues and posting
+   * progress comments, and the reconciliation sweep kept force-blocking
+   * the source issue on every retry cycle.
+   *
+   * Mirrors `tryAutoClearMissingDispositionContinuation` (the
+   * successful_run_missing_state path) so the two auto-clear guards stay
+   * structurally identical — both keep the source issue at `in_progress`
+   * with the live continuation path rather than force-blocking it.
+   *
+   * Returns the resolved recovery action on success, or null if the
+   * auto-clear was not applicable.
+   */
+  async function tryAutoClearTimedOutStrandedAssignedContinuation(input: {
+    issue: typeof issues.$inferSelect;
+    latestRun: LatestIssueRun;
+  }): Promise<Awaited<ReturnType<typeof recoveryActionsSvc.resolveActiveForIssue>> | null> {
+    if (input.latestRun?.status !== "timed_out") return null;
+    const active = await recoveryActionsSvc.getActiveForIssue(
+      input.issue.companyId,
+      input.issue.id,
+    );
+    if (!active || active.kind !== "stranded_assigned_issue") return null;
+    if (active.status !== "active" && active.status !== "escalated") return null;
+
+    const detection = await detectValidTimedOutContinuationPath({
+      issue: input.issue,
+      latestRun: input.latestRun,
+    });
+    if (!detection.hasContinuation) return null;
+
+    const signalLabel =
+      detection.signal === "open_child_issues"
+        ? `${detection.openChildIssueIds?.length ?? 0} open child issue(s) (delegated follow-up landed before timeout)`
+        : detection.signal === "issue_comments_landed"
+        ? `${detection.commentIds?.length ?? 0} issue comment(s) landed before timeout`
+        : `${detection.workProductIds?.length ?? 0} work product(s) landed before timeout`;
+    const resolutionNote = [
+      "Auto-cleared by reconciliation: timed-out continuation retry recorded durable progress on the source issue.",
+      `Run \`${detection.correctiveRunId}\` produced ${signalLabel}.`,
+      "The 300s openclaw_gateway wait-timeout fired AFTER durable writes had already landed;",
+      "the source issue is still advancing and the recovery action was triggered by run-finalization ordering, not a real stall.",
+    ].join(" ");
+
+    const resolved = await recoveryActionsSvc.resolveActiveForIssue({
+      companyId: input.issue.companyId,
+      sourceIssueId: input.issue.id,
+      actionId: active.id,
+      status: "resolved",
+      outcome: "continuing",
+      resolutionNote,
+    });
+    if (!resolved) return null;
+
+    await logActivity(db, {
+      companyId: input.issue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: detection.correctiveRunId,
+      action: "issue.recovery_action_auto_cleared",
+      entityType: "issue",
+      entityId: input.issue.id,
+      details: {
+        identifier: input.issue.identifier,
+        recoveryActionId: resolved.id,
+        recoveryCause: "stranded_assigned_issue",
+        outcome: "continuing",
+        continuationSignal: detection.signal,
+        correctiveRunId: detection.correctiveRunId,
+        openChildIssueIds: detection.openChildIssueIds ?? null,
+        commentIds: detection.commentIds ?? null,
+        workProductIds: detection.workProductIds ?? null,
+        source: "recovery.reconcile_timed_out_continuation_auto_clear",
+      },
+    });
+
+    return resolved;
+  }
+
+  /**
+   * Auto-clear a `missing_disposition` recovery action when the source issue
+   * has a valid in_progress continuation path. This is the fix for the
+   * repeated-recovery-wake loop where a successful corrective handoff run
+   * records a valid in_progress disposition but the recovery action keeps
+   * re-firing because the schema historically forced the source issue to
+   * `blocked` for resolution.
+   *
+   * Returns the resolved recovery action on success, or null if the
    * auto-clear was not applicable.
    */
   async function tryAutoClearMissingDispositionContinuation(input: {
@@ -2396,6 +2601,24 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
       if (didAutomaticRecoveryFail(latestRun, "issue_continuation_needed")) {
+        // Auto-clear guard: a `timed_out` continuation retry that landed
+        // durable progress before the openclaw_gateway wait-timeout fired
+        // is not a real stall. The recovery action was triggered by
+        // run-finalization ordering, not by the source issue actually
+        // failing. This is the fix for the false-positive recovery churn
+        // observed on RUAAAAA-2061 (2026-06-22) where a long-running Lead
+        // run kept timing out at 300s AFTER child issues and progress
+        // comments had already landed.
+        const timedOutAutoCleared = await tryAutoClearTimedOutStrandedAssignedContinuation({
+          issue,
+          latestRun,
+        });
+        if (timedOutAutoCleared) {
+          result.successfulRunHandoffAutoCleared += 1;
+          result.issueIds.push(issue.id);
+          continue;
+        }
+
         const failureSummary = summarizeRunFailureForIssueComment(latestRun);
         const updated = await escalateStrandedAssignedIssue({
           issue,

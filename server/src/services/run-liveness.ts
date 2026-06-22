@@ -310,6 +310,39 @@ export function classifyRunLiveness(input: RunLivenessClassificationInput): RunL
   });
 
   if (input.runStatus !== "succeeded") {
+    // openclaw_gateway runs frequently exceed the gateway's wait timeout
+    // AFTER the agent has already landed durable writes (child issues,
+    // comments, work products, document revisions, activity events). The
+    // recovery classifier must not treat those as failures — the work is
+    // durable and the issue is still advancing. Classify as `advanced`
+    // with the concrete evidence so the source issue's continuation path
+    // is preserved by reconciliation (see
+    // recovery/service.ts `tryAutoClearTimedOutStrandedAssignedContinuation`).
+    //
+    // Gating conditions for the override:
+    //  1. runStatus === "timed_out" (the openclaw_gateway wait-timeout case;
+    //     `failed`/`cancelled` still classify as `failed` — those usually
+    //     mean the agent actually stopped without producing durable work).
+    //  2. issue.status === "in_progress" — if the agent already PATCHed the
+    //     issue to `done`/`blocked`/etc, the run-finalization ordering is
+    //     not the proximate cause and the recovery action should not be
+    //     auto-cleared.
+    //  3. concreteEvidence is true — issue comments, document revisions,
+    //     work products, activity events, or tool/action events were
+    //     produced during the run. (Workspace-creation-only evidence is
+    //     excluded by `hasConcreteActionEvidence` because it represents
+    //     setup work, not task progress.)
+    if (
+      input.runStatus === "timed_out" &&
+      input.issue?.status === "in_progress" &&
+      concreteEvidence
+    ) {
+      return output(
+        "advanced",
+        `Run timed out at gateway but produced concrete action evidence: ${evidenceReason(evidence)}`,
+        nextAction,
+      );
+    }
     return output("failed", input.errorCode ? `Run ended with ${input.runStatus} (${input.errorCode})` : `Run ended with ${input.runStatus}`);
   }
 
