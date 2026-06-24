@@ -69,6 +69,8 @@ import {
   type ActiveIssueTreePauseHoldGate,
 } from "./issue-tree-control.js";
 import { parseIssueGraphLivenessIncidentKey } from "./recovery/origins.js";
+import { issueRecoveryActionService } from "./issue-recovery-actions.js";
+import { logActivity } from "./activity-log.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
@@ -1780,6 +1782,7 @@ async function blockedByMapForIssues(
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
+  const recoveryActionsSvc = issueRecoveryActionService(db);
 
   async function getIssueByUuid(id: string) {
     const row = await db
@@ -1943,6 +1946,29 @@ export function issueService(db: Db) {
     }, null);
     if (minCommentCreatedAtMs === null || maxCommentCreatedAtMs === null) return comments;
 
+    const activityRunIds = Array.from(
+      new Set(
+        (
+          await db
+            .select({ runId: activityLog.runId })
+            .from(activityLog)
+            .where(
+              and(
+                eq(activityLog.companyId, companyId),
+                eq(activityLog.entityType, "issue"),
+                eq(activityLog.entityId, issueId),
+              ),
+            )
+        )
+          .map((row) => row.runId)
+          .filter((runId): runId is string => typeof runId === "string" && runId.length > 0),
+      ),
+    );
+    const issueRunCondition =
+      activityRunIds.length > 0
+        ? or(sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`, inArray(heartbeatRuns.id, activityRunIds))
+        : sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`;
+
     const runs = await db
       .select({
         runId: heartbeatRuns.id,
@@ -1958,19 +1984,9 @@ export function issueService(db: Db) {
       .where(
         and(
           eq(heartbeatRuns.companyId, companyId),
-          or(
-            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
-            sql`exists (
-              select 1
-              from ${activityLog}
-              where ${activityLog.companyId} = ${companyId}
-                and ${activityLog.entityType} = 'issue'
-                and ${activityLog.entityId} = ${issueId}
-                and ${activityLog.runId} = ${heartbeatRuns.id}
-            )`,
-          ),
-          sql`coalesce(${heartbeatRuns.finishedAt}, ${heartbeatRuns.createdAt}) >= ${new Date(minCommentCreatedAtMs)}`,
-          sql`coalesce(${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) <= ${new Date(maxCommentCreatedAtMs + ISSUE_COMMENT_RUN_LOG_DERIVATION_END_SLACK_MS)}`,
+          issueRunCondition,
+          sql`coalesce(${heartbeatRuns.finishedAt}, ${heartbeatRuns.createdAt}) >= ${new Date(minCommentCreatedAtMs).toISOString()}`,
+          sql`coalesce(${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) <= ${new Date(maxCommentCreatedAtMs + ISSUE_COMMENT_RUN_LOG_DERIVATION_END_SLACK_MS).toISOString()}`,
         ),
       )
       .orderBy(desc(heartbeatRuns.createdAt));
@@ -3473,6 +3489,103 @@ export function issueService(db: Db) {
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;
+
+        // Safety net (RUAAAAA-1928 / RUAAAAA-1931 / RUAAAAA-2100): when a
+        // source issue transitions to a terminal status (done / cancelled),
+        // to `blocked`, OR to `in_review`, auto-resolve any active recovery
+        // actions on it. This prevents stale recovery actions from waking
+        // owners for issues that are already dispositioned. The resolution
+        // runs in the same transaction as the issue update, so a failed
+        // resolution rolls back the status change.
+        //
+        // The `blocked` branch (RUAAAAA-1931) and the new `in_review` branch
+        // (RUAAAAA-2100) are both gated on an explicit operator actor
+        // (`actorAgentId` or `actorUserId`). The recovery system itself
+        // transitions sources to `blocked` as part of its own workflow (see
+        // `escalateStrandedAssignedIssue` /
+        // `reconcileStrandedAssignedIssue` / the critical-output-silence
+        // detector in `services/recovery/service.ts`) and does not pass an
+        // actor; clearing the recovery in those internal transitions would
+        // erase the recovery the system just created, which would prevent
+        // the recovery owner from ever being woken. The same defensive gate
+        // is applied to `in_review` for consistency — no current server path
+        // transitions a source to `in_review` without an operator actor,
+        // but the gate keeps the safety net from ever erasing an internal
+        // recovery artifact if a future internal flow ever does. Operator-
+        // driven blocked / in_review PATCHes (the cases RUAAAAA-1929 /
+        // RUAAAAA-1931 / RUAAAAA-2100 actually fix) come from a run or board
+        // action and always carry an actor.
+        const isTerminalTransition =
+          issueData.status !== undefined
+          && (issueData.status === "done" || issueData.status === "cancelled")
+          && existing.status !== updated.status;
+        const isOperatorBlockedTransition =
+          issueData.status !== undefined
+          && issueData.status === "blocked"
+          && existing.status !== updated.status
+          && (actorAgentId !== undefined || actorUserId !== undefined);
+        const isOperatorInReviewTransition =
+          issueData.status !== undefined
+          && issueData.status === "in_review"
+          && existing.status !== updated.status
+          && (actorAgentId !== undefined || actorUserId !== undefined);
+        const isOperatorSafetyNetTransition =
+          isTerminalTransition
+          || isOperatorBlockedTransition
+          || isOperatorInReviewTransition;
+        if (isOperatorSafetyNetTransition) {
+          const safetyNetTag = isOperatorInReviewTransition
+            ? "2100"
+            : isOperatorBlockedTransition
+              ? "1931"
+              : "1928";
+          const autoCleared = await recoveryActionsSvc.resolveActiveForIssue(
+            {
+              companyId: existing.companyId,
+              sourceIssueId: updated.id,
+              status: "resolved",
+              outcome: "restored",
+              resolutionNote: `Auto-cleared by source issue status transition ${existing.status}\u2192${updated.status} (RUAAAAA-${safetyNetTag} safety net)`,
+            },
+            tx,
+          );
+          if (autoCleared) {
+            const autoClearActorType: "agent" | "user" | "system" = actorAgentId
+              ? "agent"
+              : actorUserId
+                ? "user"
+                : "system";
+            const autoClearActorId = actorAgentId ?? actorUserId ?? "system";
+            const autoClearSource: "auto_clear_on_in_review_status"
+              | "auto_clear_on_blocked_status"
+              | "auto_clear_on_terminal_status" = isOperatorInReviewTransition
+                ? "auto_clear_on_in_review_status"
+                : isOperatorBlockedTransition
+                  ? "auto_clear_on_blocked_status"
+                  : "auto_clear_on_terminal_status";
+            await logActivity(db, {
+              companyId: existing.companyId,
+              actorType: autoClearActorType,
+              actorId: autoClearActorId,
+              agentId: actorAgentId ?? null,
+              runId: null,
+              action: "issue.recovery_action_resolved",
+              entityType: "issue",
+              entityId: updated.id,
+              details: {
+                identifier: updated.identifier,
+                recoveryActionId: autoCleared.id,
+                recoveryActionStatus: autoCleared.status,
+                outcome: autoCleared.outcome,
+                sourceIssueStatus: updated.status,
+                resolutionNote: autoCleared.resolutionNote,
+                source: autoClearSource,
+                previousStatus: existing.status,
+              },
+            });
+          }
+        }
+
         if (nextLabelIds !== undefined) {
           await syncIssueLabels(updated.id, existing.companyId, nextLabelIds, tx);
         }

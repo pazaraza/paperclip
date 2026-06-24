@@ -20,6 +20,7 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
+import { issueService } from "../services/issues.js";
 import { recoveryService } from "../services/recovery/service.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -1136,5 +1137,901 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.id, action.id));
     expect(actionRow?.status).toBe("active");
+  });
+
+  it("auto-resolves active recovery actions when the source issue transitions to done (RUAAAAA-1928 safety net)", async () => {
+    const { companyId, managerId, sourceIssueId, sourceIssue } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `auto-clear-done:${sourceIssueId}`,
+      evidence: { sourceIssueId },
+      nextAction: "Pick up the stranded issue and continue.",
+      wakePolicy: { type: "wake_owner" },
+    });
+
+    const updated = await issueService(db).update(sourceIssueId, {
+      status: "done",
+      actorAgentId: managerId,
+    });
+    expect(updated?.status).toBe("done");
+
+    const [cleared] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(cleared?.status).toBe("resolved");
+    expect(cleared?.outcome).toBe("restored");
+    expect(cleared?.resolutionNote).toMatch(/Auto-cleared by source issue status transition/);
+    expect(cleared?.resolutionNote).toMatch(/done/);
+    expect(cleared?.resolvedAt).toBeTruthy();
+
+    const active = await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId);
+    expect(active).toBeNull();
+
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, sourceIssueId));
+    const autoClearLog = activityRows.find(
+      (row) => row.action === "issue.recovery_action_resolved"
+        && (row.details as Record<string, unknown> | null)?.source === "auto_clear_on_terminal_status",
+    );
+    expect(autoClearLog).toBeTruthy();
+    expect((autoClearLog!.details as Record<string, unknown>)).toMatchObject({
+      source: "auto_clear_on_terminal_status",
+      outcome: "restored",
+      sourceIssueStatus: "done",
+      previousStatus: sourceIssue.status,
+    });
+
+    // Resolve is idempotent: a second call should not throw or change state.
+    const after = await issueService(db).update(sourceIssueId, {
+      status: "done",
+      actorAgentId: managerId,
+    });
+    expect(after?.status).toBe("done");
+  });
+
+  it("auto-resolves active recovery actions when the source issue transitions to cancelled (RUAAAAA-1928 safety net)", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "successful_run_missing_issue_disposition",
+      fingerprint: `auto-clear-cancelled:${sourceIssueId}`,
+      evidence: { sourceIssueId },
+      nextAction: "Choose a valid issue disposition.",
+      wakePolicy: { type: "wake_owner" },
+    });
+
+    const updated = await issueService(db).update(sourceIssueId, {
+      status: "cancelled",
+      actorAgentId: managerId,
+    });
+    expect(updated?.status).toBe("cancelled");
+
+    const [cleared] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(cleared?.status).toBe("resolved");
+    expect(cleared?.outcome).toBe("restored");
+    expect(cleared?.resolutionNote).toMatch(/cancelled/);
+    expect(cleared?.resolvedAt).toBeTruthy();
+
+    const active = await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId);
+    expect(active).toBeNull();
+  });
+
+  it("does not auto-resolve active recovery actions on non-safety-net status transitions (RUAAAAA-1928 safety net)", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `auto-clear-non-terminal:${sourceIssueId}`,
+      evidence: { sourceIssueId },
+      nextAction: "Pick up the stranded issue and continue.",
+      wakePolicy: { type: "wake_owner" },
+    });
+
+    // Move to `todo` (truly non-safety-net — the safety net now covers
+    // done/cancelled/blocked/in_review only after the 1931 + 2100 fixes).
+    const updated = await issueService(db).update(sourceIssueId, {
+      status: "todo",
+      actorAgentId: managerId,
+    });
+    expect(updated?.status).toBe("todo");
+
+    const [stillActive] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(stillActive?.status).toBe("active");
+    expect(stillActive?.resolvedAt).toBeNull();
+  });
+
+  it("does not auto-resolve recovery actions when status is set but unchanged (RUAAAAA-1928 safety net)", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    // Move source to done first
+    await issueService(db).update(sourceIssueId, { status: "done", actorAgentId: managerId });
+
+    // Now create an active recovery on an already-done source
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `auto-clear-no-transition:${sourceIssueId}`,
+      evidence: { sourceIssueId },
+      nextAction: "Pick up the stranded issue and continue.",
+      wakePolicy: { type: "wake_owner" },
+    });
+
+    // Update with the same status (no actual transition)
+    const updated = await issueService(db).update(sourceIssueId, {
+      status: "done",
+      actorAgentId: managerId,
+    });
+    expect(updated?.status).toBe("done");
+
+    // Recovery should still be active because the status didn't actually change
+    const [stillActive] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(stillActive?.status).toBe("active");
+  });
+
+  it("auto-resolves active recovery actions across multiple sources in independent transitions (RUAAAAA-1928 safety net)", async () => {
+    const { companyId, managerId, sourceIssueId, prefix } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const svc = issueService(db);
+
+    // Set up a second source issue in the same company
+    const sourceIssueId2 = randomUUID();
+    await db.insert(issues).values({
+      id: sourceIssueId2,
+      companyId,
+      title: "Second source for multi-clear test",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: managerId,
+      issueNumber: 99,
+      identifier: `${prefix}-99`,
+    });
+
+    const action1 = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "successful_run_missing_issue_disposition",
+      fingerprint: `auto-clear-multi-1:${sourceIssueId}`,
+      evidence: { sourceIssueId },
+      nextAction: "Choose a valid issue disposition.",
+      wakePolicy: { type: "wake_owner" },
+    });
+
+    const action2 = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId: sourceIssueId2,
+      kind: "issue_graph_liveness",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "issue_graph_liveness",
+      fingerprint: `auto-clear-multi-2:${sourceIssueId2}`,
+      evidence: { sourceIssueId: sourceIssueId2 },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner" },
+    });
+
+    // Transition both sources to done; each transition should auto-clear its own action
+    const updated1 = await svc.update(sourceIssueId, { status: "done", actorAgentId: managerId });
+    const updated2 = await svc.update(sourceIssueId2, { status: "done", actorAgentId: managerId });
+    expect(updated1?.status).toBe("done");
+    expect(updated2?.status).toBe("done");
+
+    const active1 = await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId);
+    const active2 = await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId2);
+    expect(active1).toBeNull();
+    expect(active2).toBeNull();
+
+    const rows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.companyId, companyId));
+    const ourRows = rows.filter(
+      (r) => r.fingerprint === action1.fingerprint || r.fingerprint === action2.fingerprint,
+    );
+    expect(ourRows).toHaveLength(2);
+    for (const row of ourRows) {
+      expect(row.status).toBe("resolved");
+      expect(row.outcome).toBe("restored");
+      expect(row.resolutionNote).toMatch(/Auto-cleared by source issue status transition/);
+    }
+  });
+
+  // RUAAAAA-1931 — extend the 1928 safety net to also auto-resolve active
+  // recovery actions on a `blocked` source transition. The original safety
+  // net only covered `done` / `cancelled`, which left stranded recoveries on
+  // blocked sources with no clean resolution path and kept firing wakes to
+  // the recovery owner. The cleanest fix is parallel: when the source status
+  // transitions to `blocked`, call the same `resolveActiveForIssue` resolver
+  // and emit a distinct `auto_clear_on_blocked_status` activity log entry.
+
+  it("auto-resolves active recovery actions when the source issue transitions to blocked (RUAAAAA-1931 safety net)", async () => {
+    const { companyId, managerId, sourceIssueId, sourceIssue } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `auto-clear-blocked:${sourceIssueId}`,
+      evidence: { sourceIssueId },
+      nextAction: "Pick up the stranded issue and continue.",
+      wakePolicy: { type: "wake_owner" },
+    });
+
+    const updated = await issueService(db).update(sourceIssueId, {
+      status: "blocked",
+      actorAgentId: managerId,
+    });
+    expect(updated?.status).toBe("blocked");
+
+    const [cleared] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(cleared?.status).toBe("resolved");
+    expect(cleared?.outcome).toBe("restored");
+    expect(cleared?.resolutionNote).toMatch(/Auto-cleared by source issue status transition/);
+    expect(cleared?.resolutionNote).toMatch(/blocked/);
+    expect(cleared?.resolvedAt).toBeTruthy();
+
+    const active = await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId);
+    expect(active).toBeNull();
+
+    // Activity log must use the new `auto_clear_on_blocked_status` source
+    // value, NOT `auto_clear_on_terminal_status`, so dashboards can tell
+    // blocked-clear from done/cancelled-clear apart.
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, sourceIssueId));
+    const autoClearLog = activityRows.find(
+      (row) => row.action === "issue.recovery_action_resolved"
+        && (row.details as Record<string, unknown> | null)?.source === "auto_clear_on_blocked_status",
+    );
+    expect(autoClearLog).toBeTruthy();
+    expect((autoClearLog!.details as Record<string, unknown>)).toMatchObject({
+      source: "auto_clear_on_blocked_status",
+      outcome: "restored",
+      sourceIssueStatus: "blocked",
+      previousStatus: sourceIssue.status,
+    });
+  });
+
+  it("is a no-op when an already-blocked source is re-PATCHed to blocked (RUAAAAA-1931 safety net)", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `auto-clear-blocked-idempotent:${sourceIssueId}`,
+      evidence: { sourceIssueId },
+      nextAction: "Pick up the stranded issue and continue.",
+      wakePolicy: { type: "wake_owner" },
+    });
+
+    // First transition: in_progress -> blocked resolves the action.
+    await issueService(db).update(sourceIssueId, {
+      status: "blocked",
+      actorAgentId: managerId,
+    });
+    const [afterFirst] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(afterFirst?.status).toBe("resolved");
+    const firstResolvedAt = afterFirst?.resolvedAt;
+    expect(firstResolvedAt).toBeTruthy();
+
+    // Second update with the same status: must not throw, must not mutate
+    // the already-resolved row, must not emit a fresh activity log.
+    const afterSecond = await issueService(db).update(sourceIssueId, {
+      status: "blocked",
+      actorAgentId: managerId,
+    });
+    expect(afterSecond?.status).toBe("blocked");
+
+    const [afterSecondRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(afterSecondRow?.status).toBe("resolved");
+    expect(afterSecondRow?.resolvedAt?.getTime()).toBe(firstResolvedAt!.getTime());
+  });
+
+  it("does not re-resolve an already-resolved recovery when the source moves from blocked back to in_progress (RUAAAAA-1931 safety net)", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `auto-clear-blocked-to-in-progress:${sourceIssueId}`,
+      evidence: { sourceIssueId },
+      nextAction: "Pick up the stranded issue and continue.",
+      wakePolicy: { type: "wake_owner" },
+    });
+
+    // in_progress -> blocked: resolves the action.
+    await issueService(db).update(sourceIssueId, {
+      status: "blocked",
+      actorAgentId: managerId,
+    });
+    const [afterBlock] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(afterBlock?.status).toBe("resolved");
+    const blockResolvedAt = afterBlock?.resolvedAt;
+    expect(blockResolvedAt).toBeTruthy();
+
+    // blocked -> in_progress: must not re-resolve the already-resolved action,
+    // must not write a new auto-clear activity log.
+    const reopened = await issueService(db).update(sourceIssueId, {
+      status: "in_progress",
+      actorAgentId: managerId,
+    });
+    expect(reopened?.status).toBe("in_progress");
+
+    const [afterReopen] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(afterReopen?.status).toBe("resolved");
+    expect(afterReopen?.resolvedAt?.getTime()).toBe(blockResolvedAt!.getTime());
+
+    const reopenActivityRows = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, sourceIssueId));
+    const reopenAutoClear = reopenActivityRows.filter(
+      (row) => row.action === "issue.recovery_action_resolved"
+        && (
+          (row.details as Record<string, unknown> | null)?.source === "auto_clear_on_blocked_status"
+          || (row.details as Record<string, unknown> | null)?.source === "auto_clear_on_terminal_status"
+        )
+        && (row.details as Record<string, unknown> | null)?.sourceIssueStatus === "in_progress",
+    );
+    expect(reopenAutoClear).toHaveLength(0);
+  });
+
+  it("auto-resolves recovery actions across multiple blocked transitions of the same source (RUAAAAA-1931 safety net)", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const svc = issueService(db);
+
+    // First stranded recovery, then blocked-transition resolves it.
+    const action1 = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `auto-clear-blocked-multi-1:${sourceIssueId}`,
+      evidence: { sourceIssueId },
+      nextAction: "Pick up the stranded issue and continue.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    await svc.update(sourceIssueId, { status: "blocked", actorAgentId: managerId });
+    const [afterFirstBlock] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action1.id));
+    expect(afterFirstBlock?.status).toBe("resolved");
+
+    // Reopen, then create a second stranded recovery, then block again.
+    await svc.update(sourceIssueId, { status: "in_progress", actorAgentId: managerId });
+    const action2 = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "successful_run_missing_issue_disposition",
+      fingerprint: `auto-clear-blocked-multi-2:${sourceIssueId}`,
+      evidence: { sourceIssueId },
+      nextAction: "Choose a valid issue disposition.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    await svc.update(sourceIssueId, { status: "blocked", actorAgentId: managerId });
+    const [afterSecondBlock] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action2.id));
+    expect(afterSecondBlock?.status).toBe("resolved");
+    expect(afterSecondBlock?.outcome).toBe("restored");
+    expect(afterSecondBlock?.resolutionNote).toMatch(/blocked/);
+
+    // Both actions are resolved; no active recovery remains.
+    const allRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, sourceIssueId),
+        ),
+      );
+    expect(allRows).toHaveLength(2);
+    for (const row of allRows) {
+      expect(row.status).toBe("resolved");
+      expect(row.outcome).toBe("restored");
+      expect(row.resolutionNote).toMatch(/Auto-cleared by source issue status transition/);
+      expect(row.resolutionNote).toMatch(/blocked/);
+    }
+    const stillActive = await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId);
+    expect(stillActive).toBeNull();
+  });
+
+  it("does NOT auto-resolve active recovery actions when the source transitions to blocked without an explicit actor (RUAAAAA-1931 safety net)", async () => {
+    // The recovery system itself transitions sources to `blocked` as part of
+    // its own workflow (see `escalateStrandedAssignedIssue` in
+    // `services/recovery/service.ts`) and does NOT pass an `actorAgentId` or
+    // `actorUserId`. The 1931 safety net must NOT fire in those internal
+    // transitions, otherwise it would erase the recovery the system just
+    // created and prevent the recovery owner from ever being woken.
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `auto-clear-blocked-no-actor:${sourceIssueId}`,
+      evidence: { sourceIssueId },
+      nextAction: "Pick up the stranded issue and continue.",
+      wakePolicy: { type: "wake_owner" },
+    });
+
+    // No `actorAgentId` / `actorUserId` — this mimics the recovery system's
+    // internal blocked transition.
+    const updated = await issueService(db).update(sourceIssueId, {
+      status: "blocked",
+    });
+    expect(updated?.status).toBe("blocked");
+
+    // Recovery must still be active — the safety net should not have fired.
+    const [stillActive] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(stillActive?.status).toBe("active");
+    expect(stillActive?.resolvedAt).toBeNull();
+
+    // And no `auto_clear_on_blocked_status` activity log was written.
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, sourceIssueId));
+    const autoClearLog = activityRows.find(
+      (row) => row.action === "issue.recovery_action_resolved"
+        && (row.details as Record<string, unknown> | null)?.source === "auto_clear_on_blocked_status",
+    );
+    expect(autoClearLog).toBeUndefined();
+  });
+
+  it("uses the terminal-status branch (not the blocked branch) when a blocked source transitions to done, and does not double-resolve (RUAAAAA-1931 safety net)", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `auto-clear-blocked-then-done:${sourceIssueId}`,
+      evidence: { sourceIssueId },
+      nextAction: "Pick up the stranded issue and continue.",
+      wakePolicy: { type: "wake_owner" },
+    });
+
+    // in_progress -> blocked resolves the action via the 1931 branch.
+    await issueService(db).update(sourceIssueId, {
+      status: "blocked",
+      actorAgentId: managerId,
+    });
+    const [afterBlock] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(afterBlock?.status).toBe("resolved");
+    const blockResolvedAt = afterBlock?.resolvedAt;
+    expect(blockResolvedAt).toBeTruthy();
+
+    // blocked -> done: the recovery is already resolved, so this must be a
+    // no-op. The 1928 terminal branch's UPDATE has no matching row (status
+    // already 'resolved', not 'active'/'escalated'), so no second resolution
+    // is written and `resolvedAt` does not change.
+    await issueService(db).update(sourceIssueId, {
+      status: "done",
+      actorAgentId: managerId,
+    });
+    const [afterDone] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(afterDone?.status).toBe("resolved");
+    expect(afterDone?.resolvedAt?.getTime()).toBe(blockResolvedAt!.getTime());
+    expect(afterDone?.resolutionNote).toMatch(/blocked/);
+    expect(afterDone?.resolutionNote).not.toMatch(/done/);
+
+    // Exactly one auto-clear activity log was written, and it is the
+    // blocked-source variant — not a terminal one.
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, sourceIssueId));
+    const autoClearLogs = activityRows.filter(
+      (row) => row.action === "issue.recovery_action_resolved",
+    );
+    expect(autoClearLogs).toHaveLength(1);
+    const details = autoClearLogs[0]!.details as Record<string, unknown>;
+    expect(details.source).toBe("auto_clear_on_blocked_status");
+    expect(details.sourceIssueStatus).toBe("blocked");
+  });
+
+  // RUAAAAA-2100 — extend the 1928/1931 safety net to also auto-resolve
+  // active recovery actions on an `in_review` source transition. The
+  // originating investigation (RUAAAAA-2098) found that when a source
+  // issue is intentionally reconciled to `in_review` (rather than done,
+  // cancelled, or blocked), the recovery action stays active forever and
+  // keeps waking the recovery owner. The fix mirrors the 1931 shape: gate
+  // on an explicit operator actor (so internal recovery system flows that
+  // don't pass an actor cannot accidentally erase the recovery they just
+  // created), and emit a distinct `auto_clear_on_in_review_status`
+  // activity log entry so dashboards can tell the three branches apart.
+
+  it("auto-resolves stranded_assigned_issue when the source issue transitions to in_review (RUAAAAA-2100 safety net)", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `auto-clear-in-review-stranded:${sourceIssueId}`,
+      evidence: { sourceIssueId },
+      nextAction: "Pick up the stranded issue and continue.",
+      wakePolicy: { type: "wake_owner" },
+    });
+
+    const updated = await issueService(db).update(sourceIssueId, {
+      status: "in_review",
+      actorAgentId: managerId,
+    });
+    expect(updated?.status).toBe("in_review");
+
+    const [cleared] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(cleared?.status).toBe("resolved");
+    expect(cleared?.outcome).toBe("restored");
+    expect(cleared?.resolutionNote).toMatch(/Auto-cleared by source issue status transition/);
+    expect(cleared?.resolutionNote).toMatch(/RUAAAAA-2100/);
+    expect(cleared?.resolvedAt).toBeTruthy();
+
+    const active = await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId);
+    expect(active).toBeNull();
+
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, sourceIssueId));
+    const autoClearLog = activityRows.find(
+      (row) => row.action === "issue.recovery_action_resolved"
+        && (row.details as Record<string, unknown> | null)?.source === "auto_clear_on_in_review_status",
+    );
+    expect(autoClearLog).toBeTruthy();
+    expect((autoClearLog!.details as Record<string, unknown>)).toMatchObject({
+      source: "auto_clear_on_in_review_status",
+      outcome: "restored",
+      sourceIssueStatus: "in_review",
+      previousStatus: "in_progress",
+    });
+  });
+
+  it("auto-resolves missing_disposition when the source issue transitions to in_review (RUAAAAA-2100 safety net)", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "successful_run_missing_issue_disposition",
+      fingerprint: `auto-clear-in-review-missing-disp:${sourceIssueId}`,
+      evidence: { sourceIssueId },
+      nextAction: "Choose a valid issue disposition.",
+      wakePolicy: { type: "wake_owner" },
+    });
+
+    const updated = await issueService(db).update(sourceIssueId, {
+      status: "in_review",
+      actorAgentId: managerId,
+    });
+    expect(updated?.status).toBe("in_review");
+
+    const [cleared] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(cleared?.status).toBe("resolved");
+    expect(cleared?.outcome).toBe("restored");
+    expect(cleared?.resolutionNote).toMatch(/RUAAAAA-2100/);
+
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, sourceIssueId));
+    const autoClearLog = activityRows.find(
+      (row) => row.action === "issue.recovery_action_resolved"
+        && (row.details as Record<string, unknown> | null)?.source === "auto_clear_on_in_review_status",
+    );
+    expect(autoClearLog).toBeTruthy();
+  });
+
+  it("auto-resolves active recovery actions on blocked -> in_review transition (RUAAAAA-2100 safety net)", async () => {
+    // Integration shape: an issue moves from `blocked` (where 1931 already
+    // resolved a recovery, but the issue was then re-blocked by a fresh
+    // stranded action) forward to `in_review` to acknowledge the work.
+    // The 2100 branch must fire and resolve the new recovery action.
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `auto-clear-in-review-from-blocked:${sourceIssueId}`,
+      evidence: { sourceIssueId },
+      nextAction: "Pick up the stranded issue and continue.",
+      wakePolicy: { type: "wake_owner" },
+    });
+
+    // Force the source to blocked first (operator-actor).
+    await issueService(db).update(sourceIssueId, {
+      status: "blocked",
+      actorAgentId: managerId,
+    });
+    const [afterBlock] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(afterBlock?.status).toBe("resolved");
+
+    // Now create a fresh stranded recovery (simulating the work coming back
+    // stranded after the operator unblocked) and transition to in_review.
+    const freshAction = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "successful_run_missing_issue_disposition",
+      fingerprint: `auto-clear-in-review-from-blocked-2:${sourceIssueId}`,
+      evidence: { sourceIssueId },
+      nextAction: "Choose a valid issue disposition.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    const reopened = await issueService(db).update(sourceIssueId, {
+      status: "in_review",
+      actorAgentId: managerId,
+    });
+    expect(reopened?.status).toBe("in_review");
+
+    const [afterReview] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, freshAction.id));
+    expect(afterReview?.status).toBe("resolved");
+    expect(afterReview?.outcome).toBe("restored");
+    expect(afterReview?.resolutionNote).toMatch(/RUAAAAA-2100/);
+
+    const active = await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId);
+    expect(active).toBeNull();
+  });
+
+  it("does NOT auto-resolve active recovery actions on a in_review transition without an explicit operator actor (RUAAAAA-2100 safety net)", async () => {
+    // The 2100 branch is gated on an explicit operator actor, matching the
+    // 1931 defensive gate. No current server path transitions a source to
+    // `in_review` without an actor, but the gate ensures no future internal
+    // flow can accidentally erase the recovery it just created.
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `auto-clear-in-review-no-actor:${sourceIssueId}`,
+      evidence: { sourceIssueId },
+      nextAction: "Pick up the stranded issue and continue.",
+      wakePolicy: { type: "wake_owner" },
+    });
+
+    // No `actorAgentId` / `actorUserId` — this mimics the recovery
+    // system's hypothetical internal in_review transition.
+    const updated = await issueService(db).update(sourceIssueId, {
+      status: "in_review",
+    });
+    expect(updated?.status).toBe("in_review");
+
+    const [stillActive] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(stillActive?.status).toBe("active");
+    expect(stillActive?.resolvedAt).toBeNull();
+
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, sourceIssueId));
+    const autoClearLog = activityRows.find(
+      (row) => row.action === "issue.recovery_action_resolved"
+        && (row.details as Record<string, unknown> | null)?.source === "auto_clear_on_in_review_status",
+    );
+    expect(autoClearLog).toBeUndefined();
+  });
+
+  it("is a no-op when an already-in_review source is re-PATCHed to in_review (RUAAAAA-2100 safety net)", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `auto-clear-in-review-idempotent:${sourceIssueId}`,
+      evidence: { sourceIssueId },
+      nextAction: "Pick up the stranded issue and continue.",
+      wakePolicy: { type: "wake_owner" },
+    });
+
+    // First transition: in_progress -> in_review resolves the action.
+    await issueService(db).update(sourceIssueId, {
+      status: "in_review",
+      actorAgentId: managerId,
+    });
+    const [afterFirst] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(afterFirst?.status).toBe("resolved");
+    const firstResolvedAt = afterFirst?.resolvedAt;
+    expect(firstResolvedAt).toBeTruthy();
+
+    // Second update with the same status: must not throw, must not mutate
+    // the already-resolved row, must not emit a fresh activity log.
+    const afterSecond = await issueService(db).update(sourceIssueId, {
+      status: "in_review",
+      actorAgentId: managerId,
+    });
+    expect(afterSecond?.status).toBe("in_review");
+
+    const [afterSecondRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(afterSecondRow?.status).toBe("resolved");
+    expect(afterSecondRow?.resolvedAt?.getTime()).toBe(firstResolvedAt!.getTime());
+  });
+
+  it("uses the blocked branch (not the in_review branch) when a blocked source transitions to in_review after a prior blocked-clear, and does not double-resolve (RUAAAAA-2100 safety net)", async () => {
+    // Edge case: 1931 cleared a recovery on the first blocked transition,
+    // then the source moves blocked -> in_review. The 2100 branch should
+    // be a no-op (the recovery is already resolved; no new active action
+    // exists at the moment of the transition).
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `auto-clear-in-review-after-blocked:${sourceIssueId}`,
+      evidence: { sourceIssueId },
+      nextAction: "Pick up the stranded issue and continue.",
+      wakePolicy: { type: "wake_owner" },
+    });
+
+    // in_progress -> blocked (1931 clears the action)
+    await issueService(db).update(sourceIssueId, {
+      status: "blocked",
+      actorAgentId: managerId,
+    });
+    const [afterBlock] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(afterBlock?.status).toBe("resolved");
+    const blockResolvedAt = afterBlock?.resolvedAt;
+    expect(blockResolvedAt).toBeTruthy();
+
+    // blocked -> in_review: the recovery is already resolved, so 2100 must
+    // be a no-op. No new activity log entry is written because the
+    // resolver's UPDATE has no matching row (status already 'resolved').
+    await issueService(db).update(sourceIssueId, {
+      status: "in_review",
+      actorAgentId: managerId,
+    });
+    const [afterReview] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(afterReview?.status).toBe("resolved");
+    expect(afterReview?.resolvedAt?.getTime()).toBe(blockResolvedAt!.getTime());
+    expect(afterReview?.resolutionNote).toMatch(/blocked/);
+    expect(afterReview?.resolutionNote).not.toMatch(/in_review/);
+
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, sourceIssueId));
+    const autoClearLogs = activityRows.filter(
+      (row) => row.action === "issue.recovery_action_resolved",
+    );
+    expect(autoClearLogs).toHaveLength(1);
+    const details = autoClearLogs[0]!.details as Record<string, unknown>;
+    expect(details.source).toBe("auto_clear_on_blocked_status");
+    expect(details.sourceIssueStatus).toBe("blocked");
   });
 });
