@@ -2102,6 +2102,115 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   /**
+   * Cycle-1 auto-clear guard: detect durable progress on a `timed_out`
+   * continuation retry BEFORE the recovery action is created. The
+   * 2072 cycle-2+ guard (`tryAutoClearTimedOutStrandedAssignedContinuation`
+   * above) requires an existing active recovery action of kind
+   * `stranded_assigned_issue`, which means cycle 1 always slipped
+   * through and force-blocked the source issue even when the timed-out
+   * run had already produced durable progress (open child issues,
+   * comments, or work products). After escalation created the recovery
+   * action, the cycle-2+ guard was never re-invoked, so the false
+   * positive persisted.
+   *
+   * This guard runs in the same reconciliation branch as the cycle-2+
+   * guard, but it runs FIRST (so it has a chance to skip escalation
+   * entirely on cycle 1) and it uses `ensureSourceScopedStrandedRecoveryAction`
+   * to materialize the recovery action (so the audit log has a
+   * consistent shape with cycle-2+ auto-clears) before immediately
+   * resolving it with outcome=continuing. The ensure call is idempotent
+   * (upsert by fingerprint) so if a prior cycle somehow already created
+   * the action, this becomes a no-op ensure followed by the same
+   * resolveActiveForIssue call.
+   *
+   * Mirrors `tryAutoClearMissingDispositionContinuation` so the two
+   * cycle-1 auto-clear guards stay structurally identical.
+   *
+   * Reference: RUAAAAA-2184 — observed 2026-06-24 on RUAAAAA-2169
+   * where a run timed out 6 seconds after posting 2 durable comments
+   * (full path + identity analysis, disposition refresh), the recovery
+   * sweep force-blocked the source issue with a `stranded_assigned_issue`
+   * action, and the cycle-2+ guard could not fire because no recovery
+   * action had existed at cycle-1 evidence-check time.
+   */
+  async function tryCycle1AutoClearTimedOutStrandedAssignedContinuation(input: {
+    issue: typeof issues.$inferSelect;
+    latestRun: LatestIssueRun;
+  }): Promise<Awaited<ReturnType<typeof recoveryActionsSvc.resolveActiveForIssue>> | null> {
+    // Only relevant for the cycle-1 case: timed_out run, in_progress
+    // issue, no escalation has happened yet. Anything else falls
+    // through to the cycle-2+ guard or escalation.
+    if (input.latestRun?.status !== "timed_out") return null;
+    if (input.issue.status !== "in_progress") return null;
+
+    const detection = await detectValidTimedOutContinuationPath({
+      issue: input.issue,
+      latestRun: input.latestRun,
+    });
+    if (!detection.hasContinuation) return null;
+
+    const signalLabel =
+      detection.signal === "open_child_issues"
+        ? `${detection.openChildIssueIds?.length ?? 0} open child issue(s) (delegated follow-up landed before timeout)`
+        : detection.signal === "issue_comments_landed"
+        ? `${detection.commentIds?.length ?? 0} issue comment(s) landed before timeout`
+        : `${detection.workProductIds?.length ?? 0} work product(s) landed before timeout`;
+    const resolutionNote = [
+      "Auto-cleared by reconciliation cycle 1: timed-out continuation retry recorded durable progress on the source issue.",
+      `Run \`${detection.correctiveRunId}\` produced ${signalLabel}.`,
+      "The 300s openclaw_gateway wait-timeout fired AFTER durable writes had already landed;",
+      "the source issue is still advancing and the recovery action was triggered by run-finalization ordering, not a real stall.",
+    ].join(" ");
+
+    // Materialize the recovery action so the audit log has a consistent
+    // shape with cycle-2+ auto-clears. The ensure call is idempotent
+    // (upsert by fingerprint), so if a prior cycle already created the
+    // action this is a no-op.
+    const action = await ensureSourceScopedStrandedRecoveryAction({
+      issue: input.issue,
+      previousStatus: "in_progress",
+      latestRun: input.latestRun,
+      recoveryCause: "stranded_assigned_issue",
+    });
+
+    const resolved = await recoveryActionsSvc.resolveActiveForIssue({
+      companyId: input.issue.companyId,
+      sourceIssueId: input.issue.id,
+      actionId: action.id,
+      status: "resolved",
+      outcome: "continuing",
+      resolutionNote,
+    });
+    if (!resolved) return null;
+
+    await logActivity(db, {
+      companyId: input.issue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: detection.correctiveRunId,
+      action: "issue.recovery_action_auto_cleared",
+      entityType: "issue",
+      entityId: input.issue.id,
+      details: {
+        identifier: input.issue.identifier,
+        recoveryActionId: resolved.id,
+        recoveryCause: "stranded_assigned_issue",
+        outcome: "continuing",
+        continuationSignal: detection.signal,
+        correctiveRunId: detection.correctiveRunId,
+        openChildIssueIds: detection.openChildIssueIds ?? null,
+        commentIds: detection.commentIds ?? null,
+        workProductIds: detection.workProductIds ?? null,
+        cycle: 1,
+        source: "recovery.reconcile_timed_out_continuation_auto_clear",
+      },
+    });
+
+    return resolved;
+  }
+
+  /**
    * Auto-clear a `missing_disposition` recovery action when the source issue
    * has a valid in_progress continuation path. This is the fix for the
    * repeated-recovery-wake loop where a successful corrective handoff run
@@ -2601,14 +2710,33 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
       if (didAutomaticRecoveryFail(latestRun, "issue_continuation_needed")) {
-        // Auto-clear guard: a `timed_out` continuation retry that landed
-        // durable progress before the openclaw_gateway wait-timeout fired
-        // is not a real stall. The recovery action was triggered by
-        // run-finalization ordering, not by the source issue actually
-        // failing. This is the fix for the false-positive recovery churn
-        // observed on RUAAAAA-2061 (2026-06-22) where a long-running Lead
-        // run kept timing out at 300s AFTER child issues and progress
-        // comments had already landed.
+        // Cycle-1 auto-clear: a `timed_out` continuation retry that
+        // landed durable progress BEFORE the openclaw_gateway
+        // wait-timeout fired is not a real stall. The evidence check
+        // runs before the recovery action is created, so a fresh
+        // reconciliation cycle with no pre-existing action still has
+        // a chance to skip escalation. This is the fix for the
+        // false-positive recovery churn observed on RUAAAAA-2169
+        // (2026-06-24) where the 2072 cycle-2+ guard could not fire
+        // because the recovery action had not existed at the moment
+        // the cycle-1 evidence check would have run.
+        const cycle1AutoCleared = await tryCycle1AutoClearTimedOutStrandedAssignedContinuation({
+          issue,
+          latestRun,
+        });
+        if (cycle1AutoCleared) {
+          result.successfulRunHandoffAutoCleared += 1;
+          result.issueIds.push(issue.id);
+          continue;
+        }
+
+        // Cycle-2+ auto-clear: an existing active recovery action of
+        // kind stranded_assigned_issue + a fresh timed_out run with
+        // durable progress resolves the action with outcome=continuing.
+        // This is the 2072 path and is preserved here for backward
+        // compatibility — if the cycle-1 guard is somehow bypassed
+        // (e.g. a manually-created action between cycles), this
+        // guard still cleans up.
         const timedOutAutoCleared = await tryAutoClearTimedOutStrandedAssignedContinuation({
           issue,
           latestRun,

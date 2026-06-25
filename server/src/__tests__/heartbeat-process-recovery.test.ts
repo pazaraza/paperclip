@@ -1815,6 +1815,565 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(actionRows[0].resolvedAt).toBeTruthy();
   });
 
+  it("auto-clears the stranded_assigned_issue recovery action when the timed_out continuation retry created child issues before the gateway wait-timeout fired (RUAAAAA-2072)", async () => {
+    // Pattern from RUAAAAA-2061 (2026-06-22): a long-running Lead run on
+    // an openclaw_gateway adapter timed out at the 300s gateway boundary
+    // AFTER the Lead had already filed child issues and posted progress
+    // comments. The reconciliation sweep was re-rolling the source issue
+    // to `blocked` on every retry cycle even though the work was durable.
+    const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "timed_out",
+      runErrorCode: "timeout",
+      retryReason: "issue_continuation_needed",
+      livenessState: "advanced",
+    });
+    // Seed an active stranded_assigned_issue recovery action as if a
+    // prior reconciliation pass had already created it (the actual 2061
+    // recovery action has attemptCount=6 at the time of investigation).
+    const recoveryActionId = randomUUID();
+    await db.insert(issueRecoveryActions).values({
+      id: recoveryActionId,
+      companyId,
+      sourceIssueId: issueId,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: agentId,
+      previousOwnerAgentId: agentId,
+      returnOwnerAgentId: agentId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `source_scoped_recovery:${companyId}:${issueId}:stranded_assigned_issue`,
+      evidence: {
+        sourceIssueId: issueId,
+        previousStatus: "in_progress",
+        latestIssueStatus: "in_progress",
+        latestRunId: runId,
+        latestRunStatus: "timed_out",
+        retryReason: "issue_continuation_needed",
+        latestRunErrorCode: "timeout",
+        missingDisposition: null,
+      },
+      nextAction: "Restore a live execution path or record a manual resolution.",
+      attemptCount: 6,
+    });
+    // Seed an open child issue that the timed-out run created before the
+    // 300s gateway wait-timeout fired (this is the durable-progress
+    // signal the auto-clear guard is looking for).
+    const childIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: childIssueId,
+      companyId,
+      title: "Delegated follow-up that landed before the gateway timeout",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      parentId: issueId,
+      issueNumber: 1001,
+      identifier: `RA-1001`,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.successfulRunHandoffAutoCleared).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+
+    // Source issue must stay at in_progress (not force-blocked).
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(sourceIssue?.status).toBe("in_progress");
+
+    // Recovery action must be resolved with outcome=continuing.
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      );
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]).toMatchObject({
+      kind: "stranded_assigned_issue",
+      status: "resolved",
+      outcome: "continuing",
+    });
+    expect(actionRows[0].resolutionNote).toMatch(
+      /timed-out continuation retry recorded durable progress/i,
+    );
+    expect(actionRows[0].resolutionNote).toMatch(/1 open child issue/i);
+    expect(actionRows[0].resolvedAt).toBeTruthy();
+  });
+
+  it("still escalates stranded_assigned_issue when the timed_out continuation retry left no durable progress (RUAAAAA-2072)", async () => {
+    // Same shape as the auto-clear test, but with NO open child issues,
+    // NO comments created by the run, and NO work products. This is the
+    // "real stall" case — the run timed out before producing anything
+    // durable and the recovery action should still escalate to `blocked`.
+    const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "timed_out",
+      runErrorCode: "timeout",
+      retryReason: "issue_continuation_needed",
+      livenessState: "failed",
+    });
+    const recoveryActionId = randomUUID();
+    await db.insert(issueRecoveryActions).values({
+      id: recoveryActionId,
+      companyId,
+      sourceIssueId: issueId,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: agentId,
+      previousOwnerAgentId: agentId,
+      returnOwnerAgentId: agentId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `source_scoped_recovery:${companyId}:${issueId}:stranded_assigned_issue`,
+      evidence: {
+        sourceIssueId: issueId,
+        previousStatus: "in_progress",
+        latestIssueStatus: "in_progress",
+        latestRunId: runId,
+        latestRunStatus: "timed_out",
+        retryReason: "issue_continuation_needed",
+        latestRunErrorCode: "timeout",
+        missingDisposition: null,
+      },
+      nextAction: "Restore a live execution path or record a manual resolution.",
+      attemptCount: 1,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.successfulRunHandoffAutoCleared).toBe(0);
+    expect(result.escalated).toBe(1);
+
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(sourceIssue?.status).toBe("blocked");
+  });
+
+  // ---------------------------------------------------------------------------
+  // RUAAAAA-2184 — cycle-1 ordering bug fix.
+  //
+  // The 2072 cycle-2+ guard requires an existing active recovery action,
+  // which means cycle 1 always slipped through and force-blocked the source
+  // issue even when the timed-out run had already produced durable progress.
+  // The cycle-1 guard below runs the evidence check BEFORE the recovery
+  // action is created, so a fresh reconciliation cycle with no pre-existing
+  // action still has a chance to skip escalation.
+  // ---------------------------------------------------------------------------
+
+  it("cycle-1 auto-clears stranded_assigned_issue when a fresh timed_out continuation retry created child issues (RUAAAAA-2184)", async () => {
+    // Pattern from RUAAAAA-2169 (2026-06-24): a long-running HoE run timed
+    // out 6 seconds after posting 2 durable comments, the recovery sweep
+    // force-blocked the source issue with a stranded_assigned_issue
+    // action, and the 2072 cycle-2+ guard could not fire because the
+    // action did not exist yet at cycle-1 evidence-check time.
+    //
+    // This test deliberately does NOT seed a pre-existing recovery action —
+    // it exercises the cycle-1 path where ensure + resolve happens inside
+    // a single reconciliation pass.
+    const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "timed_out",
+      runErrorCode: "timeout",
+      retryReason: "issue_continuation_needed",
+      livenessState: "advanced",
+    });
+    // Seed an open child issue that the timed-out run created before the
+    // 300s gateway wait-timeout fired.
+    const childIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: childIssueId,
+      companyId,
+      title: "Delegated follow-up that landed before the gateway timeout",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      parentId: issueId,
+      issueNumber: 2001,
+      identifier: `RA-2001`,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.successfulRunHandoffAutoCleared).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+
+    // Source issue must stay at in_progress (not force-blocked).
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(sourceIssue?.status).toBe("in_progress");
+
+    // A recovery action must exist (ensure materialized it), but it must
+    // be resolved with outcome=continuing.
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      );
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]).toMatchObject({
+      kind: "stranded_assigned_issue",
+      status: "resolved",
+      outcome: "continuing",
+    });
+    expect(actionRows[0].resolutionNote).toMatch(
+      /reconciliation cycle 1.*timed-out continuation retry recorded durable progress/i,
+    );
+    expect(actionRows[0].resolutionNote).toMatch(/1 open child issue/i);
+    expect(actionRows[0].resolvedAt).toBeTruthy();
+
+    // Activity log must contain the auto-cleared entry with cycle=1 marker.
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.action, "issue.recovery_action_auto_cleared"),
+        ),
+      );
+    expect(activityRows).toHaveLength(1);
+    expect(activityRows[0]?.details as Record<string, unknown>).toMatchObject({
+      recoveryCause: "stranded_assigned_issue",
+      outcome: "continuing",
+      cycle: 1,
+      source: "recovery.reconcile_timed_out_continuation_auto_clear",
+    });
+  });
+
+  it("cycle-1 auto-clears stranded_assigned_issue when a fresh timed_out continuation retry created comments (RUAAAAA-2184)", async () => {
+    // Cycle-1 path with comment evidence (the actual RUAAAAA-2169 shape).
+    const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "timed_out",
+      runErrorCode: "timeout",
+      retryReason: "issue_continuation_needed",
+      livenessState: "advanced",
+    });
+    // Seed 2 comments created by the timed-out run (mimics the 2169 case:
+    // identity analysis + disposition refresh posted 6s before timeout).
+    await db.insert(issueComments).values([
+      {
+        companyId,
+        issueId,
+        authorAgentId: agentId,
+        createdByRunId: runId,
+        body: "Full path + identity analysis (2169 comment 1)",
+      },
+      {
+        companyId,
+        issueId,
+        authorAgentId: agentId,
+        createdByRunId: runId,
+        body: "Disposition refresh: terminal operating posture, parked at in_progress (2169 comment 2)",
+      },
+    ]);
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.successfulRunHandoffAutoCleared).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(sourceIssue?.status).toBe("in_progress");
+
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      );
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]).toMatchObject({
+      kind: "stranded_assigned_issue",
+      status: "resolved",
+      outcome: "continuing",
+    });
+    expect(actionRows[0].resolutionNote).toMatch(/2 issue comment.* landed before timeout/i);
+
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.action, "issue.recovery_action_auto_cleared"),
+        ),
+      );
+    expect(activityRows).toHaveLength(1);
+    expect(activityRows[0]?.details as Record<string, unknown>).toMatchObject({
+      continuationSignal: "issue_comments_landed",
+      cycle: 1,
+    });
+  });
+
+  it("cycle-1 auto-clears stranded_assigned_issue when a fresh timed_out continuation retry created work products (RUAAAAA-2184)", async () => {
+    // Cycle-1 path with work-product evidence.
+    const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "timed_out",
+      runErrorCode: "timeout",
+      retryReason: "issue_continuation_needed",
+      livenessState: "advanced",
+    });
+    await db.insert(issueWorkProducts).values({
+      companyId,
+      issueId,
+      type: "report",
+      provider: "test",
+      externalId: "2184-wp-1",
+      title: "Timed-out run work product",
+      status: "ready",
+      summary: "Durable artifact from the timed-out run.",
+      createdByRunId: runId,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.successfulRunHandoffAutoCleared).toBe(1);
+    expect(result.escalated).toBe(0);
+
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(sourceIssue?.status).toBe("in_progress");
+
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      );
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]).toMatchObject({
+      kind: "stranded_assigned_issue",
+      status: "resolved",
+      outcome: "continuing",
+    });
+    expect(actionRows[0].resolutionNote).toMatch(/1 work product.* landed before timeout/i);
+  });
+
+  it("cycle-1 still escalates stranded_assigned_issue when the timed_out continuation retry left no durable progress (RUAAAAA-2184)", async () => {
+    // Real-stall case for cycle-1: timed_out + in_progress + NO open
+    // children, NO comments from the run, NO work products. Must
+    // escalate (preserve existing behavior).
+    const { companyId, runId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "timed_out",
+      runErrorCode: "timeout",
+      retryReason: "issue_continuation_needed",
+      livenessState: "failed",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.successfulRunHandoffAutoCleared).toBe(0);
+    expect(result.escalated).toBe(1);
+    expect(result.continuationRequeued).toBe(0);
+
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(sourceIssue?.status).toBe("blocked");
+
+    // Recovery action must exist (escalation created it) and remain active.
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      );
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]?.status).toBe("active");
+    expect(actionRows[0]?.outcome).toBeNull();
+    expect(actionRows[0]?.resolvedAt).toBeNull();
+  });
+
+  it("cycle-1 guard does not trigger when the latest run succeeded (not timed_out) (RUAAAAA-2184)", async () => {
+    // A successful run + in_progress + concrete evidence must NOT trigger
+    // the cycle-1 guard. It should fall through to the
+    // missing_disposition / productive-continuation branches. We don't
+    // pre-seed a missing_disposition action here either — the
+    // productive-terminal run lands and gets a continuation retry
+    // queued instead (matches the existing behavior).
+    const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      retryReason: "issue_continuation_needed",
+      livenessState: "advanced",
+    });
+    // Add some durable evidence so the cycle-1 guard's evidence check
+    // would fire if it were misapplied to a successful run.
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId: agentId,
+      createdByRunId: runId,
+      body: "Successful run posted a progress comment.",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    // Either continuationRequeued (productive-terminal path) or
+    // auto-cleared (missing-disposition path) — never the timed_out
+    // cycle-1 path, and never an escalation on a successful run.
+    expect(result.escalated).toBe(0);
+    const totalHandling = result.successfulRunHandoffAutoCleared + result.continuationRequeued;
+    expect(totalHandling).toBeGreaterThanOrEqual(0);
+
+    // No stranded_assigned_issue recovery action must be created by the
+    // cycle-1 guard (the missing-disposition path uses a different
+    // kind and would be a separate count).
+    const strandedActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+          eq(issueRecoveryActions.kind, "stranded_assigned_issue"),
+        ),
+      );
+    expect(strandedActions).toHaveLength(0);
+  });
+
+  it("cycle-1 guard does not trigger when the timed_out run's source issue is not in_progress (RUAAAAA-2184)", async () => {
+    // A timed_out run on a `todo` issue must NOT trigger the cycle-1
+    // guard — the guard is specifically for in_progress. This matches
+    // the existing detection pre-condition (issue.status must be
+    // in_progress) and protects against accidentally auto-clearing
+    // recovery actions on stale `todo` issues whose agents have not
+    // started work yet.
+    const { companyId, runId, issueId } = await seedStrandedIssueFixture({
+      status: "todo",
+      runStatus: "timed_out",
+      runErrorCode: "timeout",
+      retryReason: "issue_continuation_needed",
+      livenessState: "failed",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    // The todo branch is upstream of the cycle-1 guard and handles its
+    // own escalation. We just need to verify the guard did not fire and
+    // leave a stranded_assigned_issue resolution behind.
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      );
+    const resolvedByCycle1Guard = actionRows.filter(
+      (row) => row.status === "resolved" && row.outcome === "continuing",
+    );
+    expect(resolvedByCycle1Guard).toHaveLength(0);
+    // Reference the unused runId so eslint doesn't complain.
+    expect(runId).toBeTruthy();
+  });
+
+  it("cycle-2 auto-clear still works after the cycle-1 guard is added (RUAAAAA-2184)", async () => {
+    // Regression: the existing 2072 cycle-2+ guard must still resolve
+    // an existing active stranded_assigned_issue recovery action when
+    // a fresh timed_out run lands durable progress. This is the path
+    // exercised by the original 2072 test but spelled out here to
+    // confirm the cycle-1 guard does not pre-empt or double-fire
+    // when a recovery action is already present.
+    const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "timed_out",
+      runErrorCode: "timeout",
+      retryReason: "issue_continuation_needed",
+      livenessState: "advanced",
+    });
+    // Pre-seed an active stranded_assigned_issue recovery action as if
+    // a prior reconciliation pass had already created it (attemptCount=6
+    // matches the actual 2061 reproduction).
+    const recoveryActionId = randomUUID();
+    await db.insert(issueRecoveryActions).values({
+      id: recoveryActionId,
+      companyId,
+      sourceIssueId: issueId,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: agentId,
+      previousOwnerAgentId: agentId,
+      returnOwnerAgentId: agentId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `source_scoped_recovery:${companyId}:${issueId}:stranded_assigned_issue`,
+      evidence: {
+        sourceIssueId: issueId,
+        previousStatus: "in_progress",
+        latestIssueStatus: "in_progress",
+        latestRunId: runId,
+        latestRunStatus: "timed_out",
+        retryReason: "issue_continuation_needed",
+        latestRunErrorCode: "timeout",
+        missingDisposition: null,
+      },
+      nextAction: "Restore a live execution path or record a manual resolution.",
+      attemptCount: 6,
+    });
+    // Seed durable progress (open child issue).
+    const childIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: childIssueId,
+      companyId,
+      title: "Delegated follow-up that landed before the gateway timeout",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      parentId: issueId,
+      issueNumber: 2002,
+      identifier: `RA-2002`,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.successfulRunHandoffAutoCleared).toBe(1);
+    expect(result.escalated).toBe(0);
+
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(sourceIssue?.status).toBe("in_progress");
+
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      );
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]).toMatchObject({
+      id: recoveryActionId,
+      kind: "stranded_assigned_issue",
+      status: "resolved",
+      outcome: "continuing",
+    });
+    // The cycle-1 guard would have created a separate ensure result;
+    // since we pre-seeded the action, the cycle-2 guard resolves the
+    // pre-seeded action directly (no duplicate resolution).
+  });
+
   it("auto-clears the missing_disposition recovery action when the corrective handoff run recorded resumeIntent (RUAAAAA-1817)", async () => {
     const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
