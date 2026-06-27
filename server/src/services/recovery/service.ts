@@ -2211,6 +2211,245 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   /**
+   * Detect whether an `in_progress` source issue has a live continuation
+   * path recorded as a pending `issueThreadInteractions` row with
+   * `continuationPolicy = wake_assignee`. This is the 2253 detector:
+   * even when the latest run completes `succeeded` and the issue status
+   * correctly stays `in_progress` (because the issue is in coordination
+   * phase, awaiting the user/board/CEO), the recovery service should
+   * NOT treat the issue as stranded.
+   *
+   * Live continuation paths include (all 3 kinds in
+   * `ISSUE_THREAD_INTERACTION_KINDS`):
+   *
+   * - `ask_user_questions` (the RUAAAAA-1509/2135 case — Board/CEO Path
+   *   A/B/C decision pending)
+   * - `request_confirmation` (pending plan or implementation confirmation
+   *   awaiting board approval)
+   * - `suggest_tasks` (board has been asked to approve delegated tasks
+   *   before Engineering creates them)
+   *
+   * Future continuation path kinds added to `ISSUE_THREAD_INTERACTION_KINDS`
+   * are picked up automatically because the detector does not constrain
+   * on `kind`. The only signal we require is `status = pending` and
+   * `continuationPolicy = wake_assignee` so the recovery service treats
+   * the interaction as a live execution path that wakes the assignee on
+   * resolution.
+   *
+   * Returns the active interaction row, or null if none is present.
+   */
+  async function detectSucceededLiveContinuationPath(input: {
+    issue: typeof issues.$inferSelect;
+  }): Promise<{
+    id: string;
+    kind: string;
+    title: string | null;
+    summary: string | null;
+    createdAt: Date;
+  } | null> {
+    if (input.issue.status !== "in_progress") return null;
+    const [interaction] = await db
+      .select({
+        id: issueThreadInteractions.id,
+        kind: issueThreadInteractions.kind,
+        title: issueThreadInteractions.title,
+        summary: issueThreadInteractions.summary,
+        createdAt: issueThreadInteractions.createdAt,
+      })
+      .from(issueThreadInteractions)
+      .where(
+        and(
+          eq(issueThreadInteractions.companyId, input.issue.companyId),
+          eq(issueThreadInteractions.issueId, input.issue.id),
+          eq(issueThreadInteractions.status, "pending"),
+          eq(issueThreadInteractions.continuationPolicy, "wake_assignee"),
+        ),
+      )
+      .orderBy(desc(issueThreadInteractions.createdAt))
+      .limit(1);
+    return interaction ?? null;
+  }
+
+  /**
+   * Cycle-2+ auto-clear guard: resolve an existing active
+   * `stranded_assigned_issue` recovery action when the source issue is
+   * `in_progress` with a live continuation path recorded by a pending
+   * `issueThreadInteractions` row with `continuationPolicy = wake_assignee`.
+   * The latest run completed `succeeded` (the run was a healthy state
+   * verification / continuation-maintenance pass, not a real stall) and
+   * the issue correctly stays `in_progress` because it is awaiting the
+   * user/board/CEO answer.
+   *
+   * This is the 2253 fix. Mirrors `tryAutoClearTimedOutStrandedAssignedContinuation`
+   * (2072 cycle-2+ guard) but for the `succeeded` case. The cycle-1
+   * sibling `tryCycle1AutoClearSucceededLiveContinuation` runs in the
+   * same reconciliation branch BEFORE escalation so a fresh
+   * succeeded-with-live-continuation cycle never creates the recovery
+   * action in the first place; this cycle-2+ guard is the safety net
+   * for the narrow case where a previous cycle's escalation somehow
+   * slipped through (e.g. the interaction was created between cycles).
+   *
+   * Reference: RUAAAAA-2253 — observed 2026-06-27 on RUAAAAA-1509
+   * where a healthy state-verification run completed succeeded at
+   * 16:22:02Z and the recovery sweep force-blocked 1509 with a
+   * `stranded_assigned_issue` action 6s later (16:22:08Z), waking
+   * the owner with `wake_reason: source_scoped_recovery_action`,
+   * even though 1509 was correctly `in_progress` because of the
+   * pending `ask_user_questions 8405cf78-02e4-4905-87aa-23c3a84f45c3`
+   * (re-issued under RUAAAAA-2135, `continuationPolicy: wake_assignee`).
+   */
+  async function tryAutoClearSucceededLiveContinuation(input: {
+    issue: typeof issues.$inferSelect;
+    latestRun: LatestIssueRun;
+  }): Promise<Awaited<ReturnType<typeof recoveryActionsSvc.resolveActiveForIssue>> | null> {
+    if (input.latestRun?.status !== "succeeded") return null;
+    if (input.issue.status !== "in_progress") return null;
+
+    const interaction = await detectSucceededLiveContinuationPath({ issue: input.issue });
+    if (!interaction) return null;
+
+    const active = await recoveryActionsSvc.getActiveForIssue(
+      input.issue.companyId,
+      input.issue.id,
+    );
+    if (!active || active.kind !== "stranded_assigned_issue") return null;
+    if (active.status !== "active" && active.status !== "escalated") return null;
+
+    const resolutionNote = [
+      "Auto-cleared by reconciliation: source issue is in_progress with a live continuation path recorded by",
+      `${interaction.kind} \`${interaction.id}\` (continuationPolicy=wake_assignee).`,
+      `Run \`${input.latestRun.id}\` succeeded without changing issue status because the issue correctly`,
+      "stays in_progress while awaiting the continuation path's resolution.",
+    ].join(" ");
+
+    const resolved = await recoveryActionsSvc.resolveActiveForIssue({
+      companyId: input.issue.companyId,
+      sourceIssueId: input.issue.id,
+      actionId: active.id,
+      status: "resolved",
+      outcome: "continuing",
+      resolutionNote,
+    });
+    if (!resolved) return null;
+
+    await logActivity(db, {
+      companyId: input.issue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: input.latestRun.id,
+      action: "issue.recovery_action_auto_cleared",
+      entityType: "issue",
+      entityId: input.issue.id,
+      details: {
+        identifier: input.issue.identifier,
+        recoveryActionId: resolved.id,
+        recoveryCause: "stranded_assigned_issue",
+        outcome: "continuing",
+        continuationSignal: interaction.kind,
+        interactionId: interaction.id,
+        correctiveRunId: input.latestRun.id,
+        source: "recovery.reconcile_succeeded_live_continuation_auto_clear",
+      },
+    });
+
+    return resolved;
+  }
+
+  /**
+   * Cycle-1 auto-clear guard: detect a live continuation path BEFORE the
+   * recovery action is created. The 2253 cycle-2+ guard
+   * (`tryAutoClearSucceededLiveContinuation` above) requires an existing
+   * active recovery action of kind `stranded_assigned_issue`, which means
+   * cycle 1 always slipped through and force-blocked the source issue
+   * even when a successful run had landed on an issue with a pending
+   * `ask_user_questions` / `request_confirmation` / `suggest_tasks`
+   * interaction with `continuationPolicy = wake_assignee`.
+   *
+   * This guard runs in the same reconciliation branch as the cycle-2+
+   * guard, but it runs FIRST (so it has a chance to skip escalation
+   * entirely on cycle 1) and it uses
+   * `ensureSourceScopedStrandedRecoveryAction` to materialize the recovery
+   * action (so the audit log has a consistent shape with cycle-2+
+   * auto-clears) before immediately resolving it with
+   * `outcome = continuing`. The ensure call is idempotent (upsert by
+   * fingerprint) so if a prior cycle somehow already created the action
+   * this becomes a no-op ensure followed by the same
+   * `resolveActiveForIssue` call.
+   *
+   * Mirrors `tryCycle1AutoClearTimedOutStrandedAssignedContinuation` so
+   * the two cycle-1 auto-clear guards stay structurally identical.
+   *
+   * Reference: RUAAAAA-2253 — observed 2026-06-27 on RUAAAAA-1509
+   * (see the cycle-2+ guard doc comment for the full reproduction).
+   */
+  async function tryCycle1AutoClearSucceededLiveContinuation(input: {
+    issue: typeof issues.$inferSelect;
+    latestRun: LatestIssueRun;
+  }): Promise<Awaited<ReturnType<typeof recoveryActionsSvc.resolveActiveForIssue>> | null> {
+    // Only relevant for the cycle-1 case: succeeded run, in_progress
+    // issue, no escalation has happened yet. Anything else falls
+    // through to the cycle-2+ guard or escalation.
+    if (input.latestRun?.status !== "succeeded") return null;
+    if (input.issue.status !== "in_progress") return null;
+
+    const interaction = await detectSucceededLiveContinuationPath({ issue: input.issue });
+    if (!interaction) return null;
+
+    // Materialize the recovery action so the audit log has a consistent
+    // shape with cycle-2+ auto-clears. The ensure call is idempotent
+    // (upsert by fingerprint), so if a prior cycle already created the
+    // action this is a no-op.
+    const action = await ensureSourceScopedStrandedRecoveryAction({
+      issue: input.issue,
+      previousStatus: "in_progress",
+      latestRun: input.latestRun,
+      recoveryCause: "stranded_assigned_issue",
+    });
+
+    const resolutionNote = [
+      "Auto-cleared by reconciliation cycle 1: source issue is in_progress with a live continuation path recorded by",
+      `${interaction.kind} \`${interaction.id}\` (continuationPolicy=wake_assignee).`,
+      `Run \`${input.latestRun.id}\` succeeded without changing issue status because the issue correctly`,
+      "stays in_progress while awaiting the continuation path's resolution.",
+    ].join(" ");
+
+    const resolved = await recoveryActionsSvc.resolveActiveForIssue({
+      companyId: input.issue.companyId,
+      sourceIssueId: input.issue.id,
+      actionId: action.id,
+      status: "resolved",
+      outcome: "continuing",
+      resolutionNote,
+    });
+    if (!resolved) return null;
+
+    await logActivity(db, {
+      companyId: input.issue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: input.latestRun.id,
+      action: "issue.recovery_action_auto_cleared",
+      entityType: "issue",
+      entityId: input.issue.id,
+      details: {
+        identifier: input.issue.identifier,
+        recoveryActionId: resolved.id,
+        recoveryCause: "stranded_assigned_issue",
+        outcome: "continuing",
+        continuationSignal: interaction.kind,
+        interactionId: interaction.id,
+        correctiveRunId: input.latestRun.id,
+        cycle: 1,
+        source: "recovery.reconcile_succeeded_live_continuation_auto_clear",
+      },
+    });
+
+    return resolved;
+  }
+
+  /**
    * Auto-clear a `missing_disposition` recovery action when the source issue
    * has a valid in_progress continuation path. This is the fix for the
    * repeated-recovery-wake loop where a successful corrective handoff run
@@ -2657,6 +2896,40 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
 
         if (isRepeatedProductiveContinuationRecovery(successfulRun)) {
+          // Cycle-2+ auto-clear guard (2253): if the source issue is
+          // in_progress with a live continuation path recorded by a
+          // pending issueThreadInteraction with continuationPolicy =
+          // wake_assignee (ask_user_questions, request_confirmation,
+          // suggest_tasks), resolve any existing stranded_assigned_issue
+          // action with outcome=continuing rather than force-blocking the
+          // source on every retry cycle. The interaction is the live
+          // execution path; the run correctly maintained state.
+          const liveContinuationCycle2 = await tryAutoClearSucceededLiveContinuation({
+            issue,
+            latestRun: successfulRun,
+          });
+          if (liveContinuationCycle2) {
+            result.successfulRunHandoffAutoCleared += 1;
+            result.issueIds.push(issue.id);
+            continue;
+          }
+
+          // Cycle-1 auto-clear guard (2253): same detection as above,
+          // but runs BEFORE escalation so a fresh succeeded run with a
+          // live continuation path never creates a stranded action in
+          // the first place. The ensure call is idempotent so if the
+          // cycle-2+ guard somehow didn't fire this is a no-op ensure
+          // followed by the same resolve.
+          const liveContinuationCycle1 = await tryCycle1AutoClearSucceededLiveContinuation({
+            issue,
+            latestRun: successfulRun,
+          });
+          if (liveContinuationCycle1) {
+            result.successfulRunHandoffAutoCleared += 1;
+            result.issueIds.push(issue.id);
+            continue;
+          }
+
           // Auto-clear guard: if the source issue is in_progress with a valid
           // continuation path, resolve the recovery action with outcome=continuing
           // rather than force-blocking the source on every retry cycle.

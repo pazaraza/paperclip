@@ -22,6 +22,7 @@ import {
   issueDocuments,
   issueRecoveryActions,
   issueRelations,
+  issueThreadInteractions,
   issueTreeHoldMembers,
   issueTreeHolds,
   issueWorkProducts,
@@ -330,6 +331,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await db.delete(documents);
     await db.delete(issueRelations);
     await db.delete(issueRecoveryActions);
+    await db.delete(issueThreadInteractions);
     await db.delete(issueTreeHoldMembers);
     await db.delete(issueTreeHolds);
     for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -2372,6 +2374,435 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // The cycle-1 guard would have created a separate ensure result;
     // since we pre-seeded the action, the cycle-2 guard resolves the
     // pre-seeded action directly (no duplicate resolution).
+  });
+
+  // RUAAAAA-2253 — succeeded-with-live-continuation auto-clear.
+  // The recovery service's `escalateStrandedAssignedIssue` path was
+  // creating false-positive stranded_assigned_issue actions on issues
+  // that were correctly `in_progress` because of an active
+  // ask_user_questions / request_confirmation / suggest_tasks
+  // interaction with `continuationPolicy = wake_assignee`. The latest
+  // run had completed `succeeded` (a healthy state-verification /
+  // continuation-maintenance pass) and the issue correctly stayed
+  // `in_progress` because it was in coordination phase, awaiting the
+  // user/board/CEO answer. The new auto-clear guards mirror the 2072 /
+  // 2184 cycle-1 + cycle-2+ pattern but for the succeeded case.
+
+  it("cycle-1 auto-clears stranded_assigned_issue when a fresh succeeded continuation retry landed on an in_progress issue with a pending ask_user_questions (RUAAAAA-2253)", async () => {
+    // Reproduction: source issue is `in_progress` with the live
+    // continuation path = pending ask_user_questions with
+    // `continuationPolicy = wake_assignee` (the RUAAAAA-1509/2135
+    // case). The latest run completed succeeded (a healthy
+    // state-verification pass; the issue correctly stays
+    // `in_progress` because the ask_user_questions is the live
+    // execution path). Without the 2253 guard this would escalate
+    // with kind `stranded_assigned_issue` and wake the owner with
+    // `wake_reason: source_scoped_recovery_action`.
+    const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      retryReason: "issue_continuation_needed",
+      runSource: "issue.productive_terminal_continuation_recovery",
+      livenessState: "advanced",
+    });
+    // Seed the live continuation path: pending ask_user_questions
+    // with `continuationPolicy = wake_assignee`. Mirrors the 1509
+    // reproduction where the question was re-issued under RUAAAAA-2135
+    // (2026-06-23) and is still pending.
+    const interactionId = randomUUID();
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId,
+      companyId,
+      issueId,
+      kind: "ask_user_questions",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      title: "ruah.dev public-edge: choose Path A / B / C",
+      summary: "Awaiting board decision on which path to take to restore the public edge.",
+      payload: {
+        questions: [
+          {
+            id: "q1",
+            question: "Which path should we take?",
+            header: "Path",
+            options: [
+              { label: "Path A", description: "Re-point DNS to a new origin." },
+              { label: "Path B", description: "Restore from edge backup." },
+              { label: "Path C", description: "Re-deploy Godines web app on the active edge." },
+            ],
+            multiSelect: false,
+          },
+        ],
+      },
+      createdByAgentId: agentId,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    // The cycle-1 guard must have fired and prevented the escalation.
+    expect(result.successfulRunHandoffAutoCleared).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+
+    // Source issue must stay at in_progress (not force-blocked).
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(sourceIssue?.status).toBe("in_progress");
+
+    // A recovery action must exist (cycle-1 guard materialized it) and
+    // be resolved with outcome=continuing.
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      );
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]).toMatchObject({
+      kind: "stranded_assigned_issue",
+      status: "resolved",
+      outcome: "continuing",
+    });
+    expect(actionRows[0].resolutionNote).toMatch(
+      /live continuation path recorded by ask_user_questions/i,
+    );
+    expect(actionRows[0].resolutionNote).toMatch(
+      new RegExp(`\\\`${interactionId}\\\``),
+    );
+    expect(actionRows[0].resolvedAt).toBeTruthy();
+
+    // Activity log must contain the auto-cleared entry with cycle=1.
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.action, "issue.recovery_action_auto_cleared"),
+        ),
+      );
+    expect(activityRows).toHaveLength(1);
+    expect(activityRows[0]?.details as Record<string, unknown>).toMatchObject({
+      recoveryCause: "stranded_assigned_issue",
+      outcome: "continuing",
+      continuationSignal: "ask_user_questions",
+      interactionId,
+      cycle: 1,
+      source: "recovery.reconcile_succeeded_live_continuation_auto_clear",
+    });
+  });
+
+  it("cycle-1 auto-clear fires for pending request_confirmation wake_assignee interactions (RUAAAAA-2253)", async () => {
+    // Same shape as the ask_user_questions test but with
+    // request_confirmation — the guard must work for any of the
+    // three ISSUE_THREAD_INTERACTION_KINDS, not just one.
+    const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      retryReason: "issue_continuation_needed",
+      runSource: "issue.productive_terminal_continuation_recovery",
+      livenessState: "advanced",
+    });
+    const interactionId = randomUUID();
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId,
+      companyId,
+      issueId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      title: "Confirm implementation plan before RUAAAAA-2253 lands",
+      summary: "Awaiting board approval of the auto-clear plan.",
+      payload: {
+        target: { kind: "plan", revisionId: "rev-2253" },
+        prompt: "Approve the 2253 auto-clear pattern?",
+      },
+      createdByAgentId: agentId,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.successfulRunHandoffAutoCleared).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(sourceIssue?.status).toBe("in_progress");
+
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      );
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]).toMatchObject({
+      kind: "stranded_assigned_issue",
+      status: "resolved",
+      outcome: "continuing",
+    });
+    expect(actionRows[0].resolutionNote).toMatch(
+      /live continuation path recorded by request_confirmation/i,
+    );
+
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.action, "issue.recovery_action_auto_cleared"),
+        ),
+      );
+    expect(activityRows).toHaveLength(1);
+    expect(activityRows[0]?.details as Record<string, unknown>).toMatchObject({
+      continuationSignal: "request_confirmation",
+      interactionId,
+      cycle: 1,
+    });
+  });
+
+  it("cycle-1 guard does not fire when the succeeded run's source issue has no pending interaction (RUAAAAA-2253)", async () => {
+    // Negative case: same shape as the ask_user_questions test but
+    // without a pending issueThreadInteraction. The 2253 guard must
+    // not fire and the existing escalation behavior must be preserved
+    // (this matches the actual 3532 "blocks stranded in-progress work
+    // after a productive continuation retry was already used" test
+    // pattern at the field level).
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      retryReason: "issue_continuation_needed",
+      runSource: "issue.productive_terminal_continuation_recovery",
+      livenessState: "advanced",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(1);
+    expect(result.successfulRunHandoffAutoCleared).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+
+    // Source issue must be force-blocked (existing behavior preserved
+    // when no live continuation path is present).
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(sourceIssue?.status).toBe("blocked");
+
+    // A stranded_assigned_issue recovery action must exist and be
+    // active (not auto-cleared).
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      );
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]).toMatchObject({
+      kind: "stranded_assigned_issue",
+      status: "active",
+    });
+    expect(actionRows[0].outcome).toBeNull();
+    expect(actionRows[0].resolvedAt).toBeNull();
+
+    // No auto-cleared activity log entry must be written.
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.action, "issue.recovery_action_auto_cleared"),
+        ),
+      );
+    expect(activityRows).toHaveLength(0);
+
+    // Reference the unused agentId / runId so eslint doesn't complain.
+    expect(agentId).toBeTruthy();
+    expect(runId).toBeTruthy();
+  });
+
+  it("cycle-1 guard does not fire when the pending interaction has continuationPolicy = wake_assignee_on_accept (RUAAAAA-2253)", async () => {
+    // Defensive coverage: wake_assignee_on_accept does NOT count as a
+    // live continuation path for the 2253 guard because the wake only
+    // fires on acceptance, not on the pending interaction. The guard
+    // must still escalate in that case.
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      retryReason: "issue_continuation_needed",
+      runSource: "issue.productive_terminal_continuation_recovery",
+      livenessState: "advanced",
+    });
+    await db.insert(issueThreadInteractions).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee_on_accept",
+      title: "Plan requires explicit accept before resuming",
+      summary: "Engine resume is gated on board accept, not the pending state.",
+      payload: {
+        target: { kind: "plan", revisionId: "rev-2253-gated" },
+        prompt: "Accept the plan to resume the engine.",
+      },
+      createdByAgentId: agentId,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(1);
+    expect(result.successfulRunHandoffAutoCleared).toBe(0);
+
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(sourceIssue?.status).toBe("blocked");
+
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      );
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]).toMatchObject({
+      kind: "stranded_assigned_issue",
+      status: "active",
+    });
+
+    expect(agentId).toBeTruthy();
+    expect(runId).toBeTruthy();
+  });
+
+  it("cycle-2 auto-clear resolves an existing stranded_assigned_issue when a succeeded run lands on an in_progress issue with a pending ask_user_questions (RUAAAAA-2253)", async () => {
+    // Cycle-2+ safety net: an active stranded_assigned_issue recovery
+    // action is already present (from a previous cycle's escalation
+    // that slipped through because the interaction was created in
+    // between). The cycle-2 guard must resolve it cleanly without
+    // creating a duplicate.
+    const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      retryReason: "issue_continuation_needed",
+      runSource: "issue.productive_terminal_continuation_recovery",
+      livenessState: "advanced",
+    });
+    const interactionId = randomUUID();
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId,
+      companyId,
+      issueId,
+      kind: "ask_user_questions",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      title: "ruah.dev public-edge: choose Path A / B / C",
+      summary: "Awaiting board decision on which path to take.",
+      payload: {
+        questions: [
+          {
+            id: "q1",
+            question: "Which path should we take?",
+            header: "Path",
+            options: [{ label: "Path A" }, { label: "Path B" }],
+            multiSelect: false,
+          },
+        ],
+      },
+      createdByAgentId: agentId,
+    });
+    // Pre-seed an active stranded_assigned_issue recovery action as if
+    // a prior reconciliation pass had already created it.
+    const recoveryActionId = randomUUID();
+    await db.insert(issueRecoveryActions).values({
+      id: recoveryActionId,
+      companyId,
+      sourceIssueId: issueId,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: agentId,
+      previousOwnerAgentId: agentId,
+      returnOwnerAgentId: agentId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `source_scoped_recovery:${companyId}:${issueId}:stranded_assigned_issue`,
+      evidence: {
+        sourceIssueId: issueId,
+        previousStatus: "in_progress",
+        latestIssueStatus: "in_progress",
+        latestRunId: runId,
+        latestRunStatus: "succeeded",
+        retryReason: "issue_continuation_needed",
+        latestRunErrorCode: null,
+        missingDisposition: null,
+      },
+      nextAction: "Restore a live execution path or record a manual resolution.",
+      attemptCount: 3,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.successfulRunHandoffAutoCleared).toBe(1);
+    expect(result.escalated).toBe(0);
+
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(sourceIssue?.status).toBe("in_progress");
+
+    // The pre-seeded recovery action must be resolved with
+    // outcome=continuing — and no duplicate action must be created.
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      );
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]).toMatchObject({
+      id: recoveryActionId,
+      kind: "stranded_assigned_issue",
+      status: "resolved",
+      outcome: "continuing",
+    });
+    expect(actionRows[0].resolutionNote).toMatch(
+      /live continuation path recorded by ask_user_questions/i,
+    );
+    expect(actionRows[0].resolvedAt).toBeTruthy();
+
+    // Activity log must reference the cycle-2+ source marker
+    // (NOT the cycle-1 marker).
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.action, "issue.recovery_action_auto_cleared"),
+        ),
+      );
+    expect(activityRows).toHaveLength(1);
+    expect(activityRows[0]?.details as Record<string, unknown>).toMatchObject({
+      recoveryActionId,
+      recoveryCause: "stranded_assigned_issue",
+      outcome: "continuing",
+      continuationSignal: "ask_user_questions",
+      interactionId,
+      source: "recovery.reconcile_succeeded_live_continuation_auto_clear",
+    });
+    // The cycle marker must NOT be set on cycle-2+ clears (the cycle=1
+    // marker is reserved for the cycle-1 sibling guard).
+    expect((activityRows[0]?.details as Record<string, unknown>).cycle).toBeUndefined();
   });
 
   it("auto-clears the missing_disposition recovery action when the corrective handoff run recorded resumeIntent (RUAAAAA-1817)", async () => {
