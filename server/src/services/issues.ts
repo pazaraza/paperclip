@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { and, asc, desc, eq, gt, inArray, isNull, like, lt, ne, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, like, lt, ne, not, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -113,6 +113,18 @@ function readStringFromRecord(record: unknown, key: string) {
   if (!record || typeof record !== "object") return null;
   const value = (record as Record<string, unknown>)[key];
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+/**
+ * Coerce a value into a nullable trimmed string. Returns null for null,
+ * undefined, empty strings, or non-string values. Used by the
+ * routine_recovery cross-issue auto-clear (RUAAAAA-2239) to normalize
+ * error_code / run_status before comparing across issues.
+ */
+function readNullableString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
 }
 
 function buildReusedExecutionWorkspaceConfigPatchFromIssueSettings(
@@ -1783,6 +1795,243 @@ export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
   const recoveryActionsSvc = issueRecoveryActionService(db);
+
+  // The set of heartbeat_run statuses that prove the routine re-fire's
+  // failure mode is real (and therefore comparable to a prior sibling's
+  // error code for the routine_recovery cross-issue auto-clear below).
+  // `succeeded` is handled separately as a positive outcome; only failed
+  // / cancelled / timed_out can be cross-checked against a prior error
+  // code.
+  const ROUTINE_RECOVERY_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
+
+  async function getLatestRunForIssue(
+    issueId: string,
+    companyId: string,
+    dbOrTx: any,
+  ): Promise<{
+    id: string;
+    status: string | null;
+    errorCode: string | null;
+  } | null> {
+    const row = await dbOrTx
+      .select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        errorCode: heartbeatRuns.errorCode,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+      .limit(1)
+      .then((rows: Array<{ id: string; status: string; errorCode: string | null }>) => rows[0] ?? null);
+    return row;
+  }
+
+  /**
+   * Routine_execution sibling auto-clear (RUAAAAA-2239).
+   *
+   * When a routine re-fires and the new execution issue transitions to a
+   * terminal disposition (`done` for a clean run, `in_review` for a failed
+   * run), the new run's success or different failure mode proves the cause
+   * of any prior stranded_assigned_issue force-block on a sibling
+   * routine_execution issue for the same routine is no longer reproducible.
+   * In that case, auto-resolve the recovery action on the prior sibling and
+   * transition the sibling to `done` with a recovery comment.
+   *
+   * This is a third auto-clear family that sits alongside the existing
+   * 1928/1931/2100 safety nets (operator-driven terminal/blocked/in_review
+   * transitions on the SOURCE issue) and the 2072/2184 timed_out-with-
+   * progress family (cycle-1 and cycle-2 reconciliation sweeps on the SAME
+   * issue). This family is event-driven by a SIBLING routine_execution
+   * issue's transition and walks across issue boundaries within a routine.
+   *
+   * The cause-reproducibility check is intentionally narrow:
+   *   - new run status === "succeeded" → not reproducible (auto-clear)
+   *   - new run status ∈ failed/cancelled/timed_out AND new errorCode !==
+   *     old errorCode (with null treated as a sentinel "no error code") →
+   *     not reproducible (auto-clear)
+   *   - new run status ∈ failed/cancelled/timed_out AND new errorCode ===
+   *     old errorCode → still reproducible (skip auto-clear)
+   *
+   * Returns the list of prior siblings that were auto-cleared. Each entry
+   * captures the source issue id, identifier, previous status, and the
+   * cause-comparison verdict so callers can audit-trail the resolution.
+   */
+  async function tryAutoClearStrandedRoutineExecutionSiblings(input: {
+    companyId: string;
+    routineId: string | null;
+    currentIssue: typeof issues.$inferSelect;
+    dbOrTx: any;
+  }): Promise<Array<{
+    sourceIssueId: string;
+    sourceIdentifier: string | null;
+    previousStatus: string;
+    newStatus: "done";
+    priorErrorCode: string | null;
+    newErrorCode: string | null;
+    newRunStatus: string | null;
+    recoveryActionId: string;
+  }>> {
+    const cleared: Array<{
+      sourceIssueId: string;
+      sourceIdentifier: string | null;
+      previousStatus: string;
+      newStatus: "done";
+      priorErrorCode: string | null;
+      newErrorCode: string | null;
+      newRunStatus: string | null;
+      recoveryActionId: string;
+    }> = [];
+
+    if (!input.routineId) return cleared;
+    if (input.currentIssue.status !== "done" && input.currentIssue.status !== "in_review") {
+      return cleared;
+    }
+
+    const priorSiblings = await input.dbOrTx
+      .select({
+        id: issues.id,
+        identifier: issues.identifier,
+        status: issues.status,
+        title: issues.title,
+      })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, input.companyId),
+          eq(issues.originKind, "routine_execution"),
+          eq(issues.originId, input.routineId),
+          eq(issues.status, "blocked"),
+          not(eq(issues.id, input.currentIssue.id)),
+        ),
+      );
+
+    if (priorSiblings.length === 0) return cleared;
+
+    const currentLatestRun = await getLatestRunForIssue(
+      input.currentIssue.id,
+      input.companyId,
+      input.dbOrTx,
+    );
+    const newErrorCode = readNullableString(currentLatestRun?.errorCode);
+    const newRunStatus = readNullableString(currentLatestRun?.status);
+
+    // The new run only proves the old cause is gone if it's either a clean
+    // success OR an unsuccessful terminal status whose errorCode differs
+    // from the prior sibling's. If the new run is queued / running /
+    // scheduled_retry we cannot make a reproducibility verdict yet.
+    if (
+      newRunStatus !== "succeeded" &&
+      !ROUTINE_RECOVERY_TERMINAL_STATUSES.includes(
+        newRunStatus as (typeof ROUTINE_RECOVERY_TERMINAL_STATUSES)[number],
+      )
+    ) {
+      return cleared;
+    }
+
+    for (const sibling of priorSiblings) {
+      // Read the active action outside the transaction (the
+      // issueRecoveryActionService.getActiveForIssue helper is not
+      // transaction-aware). The subsequent resolveActiveForIssue call IS
+      // transaction-aware and is idempotent (a no-op if the action was
+      // already resolved by another sweep), so a stale read here does
+      // not corrupt the audit trail.
+      const activeAction = await recoveryActionsSvc.getActiveForIssue(
+        input.companyId,
+        sibling.id,
+      );
+      if (!activeAction || activeAction.kind !== "stranded_assigned_issue") continue;
+
+      const priorLatestRun = await getLatestRunForIssue(sibling.id, input.companyId, input.dbOrTx);
+      const priorErrorCode = readNullableString(priorLatestRun?.errorCode);
+      const priorRunStatus = readNullableString(priorLatestRun?.status);
+
+      // Cause reproducibility verdict for this sibling:
+      //   - new succeeded → not reproducible (auto-clear)
+      //   - new failed AND prior errorCode matches new errorCode (including
+      //     both null) → still reproducible, skip
+      //   - new failed AND prior errorCode differs from new errorCode →
+      //     not reproducible (auto-clear)
+      const oldCauseStillReproducible =
+        newRunStatus !== "succeeded" &&
+        priorRunStatus !== "succeeded" &&
+        priorErrorCode === newErrorCode;
+      if (oldCauseStillReproducible) continue;
+
+      const verdictNote = newRunStatus === "succeeded"
+        ? `Routine re-fire ${input.currentIssue.identifier ?? input.currentIssue.id} succeeded; prior cause (errorCode=${priorErrorCode ?? "none"}, runStatus=${priorRunStatus ?? "unknown"}) no longer reproducible.`
+        : `Routine re-fire ${input.currentIssue.identifier ?? input.currentIssue.id} failed with errorCode=${newErrorCode ?? "none"} (runStatus=${newRunStatus}); prior cause (errorCode=${priorErrorCode ?? "none"}, runStatus=${priorRunStatus ?? "unknown"}) is no longer reproducible because the error code differs.`;
+
+      const resolved = await recoveryActionsSvc.resolveActiveForIssue(
+        {
+          companyId: input.companyId,
+          sourceIssueId: sibling.id,
+          status: "resolved",
+          outcome: "recovered_by_subsequent_run",
+          resolutionNote: `Auto-cleared by routine_recovery cross-issue reconciliation (RUAAAAA-2239). ${verdictNote}`,
+        },
+        input.dbOrTx,
+      );
+      if (!resolved) continue;
+
+      const now = new Date();
+      const [updatedSibling] = await input.dbOrTx
+        .update(issues)
+        .set({
+          status: "done",
+          completedAt: now,
+          updatedAt: now,
+        })
+        .where(and(eq(issues.id, sibling.id), eq(issues.status, "blocked")))
+        .returning();
+      if (!updatedSibling) continue;
+
+      await logActivity(db, {
+        companyId: input.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: currentLatestRun?.id ?? null,
+        action: "issue.recovery_action_resolved",
+        entityType: "issue",
+        entityId: sibling.id,
+        details: {
+          identifier: sibling.identifier,
+          recoveryActionId: resolved.id,
+          recoveryActionStatus: resolved.status,
+          outcome: resolved.outcome,
+          sourceIssueStatus: updatedSibling.status,
+          previousSourceIssueStatus: sibling.status,
+          source: "auto_clear_on_routine_recovery",
+          triggeringIssueId: input.currentIssue.id,
+          triggeringIssueIdentifier: input.currentIssue.identifier,
+          triggeringRoutineId: input.routineId,
+          newRunStatus,
+          newErrorCode,
+          priorErrorCode,
+          priorRunStatus,
+        },
+      });
+
+      cleared.push({
+        sourceIssueId: sibling.id,
+        sourceIdentifier: sibling.identifier,
+        previousStatus: sibling.status,
+        newStatus: "done",
+        priorErrorCode,
+        newErrorCode,
+        newRunStatus,
+        recoveryActionId: resolved.id,
+      });
+    }
+
+    return cleared;
+  }
 
   async function getIssueByUuid(id: string) {
     const row = await db
@@ -3584,6 +3833,47 @@ export function issueService(db: Db) {
               },
             });
           }
+        }
+
+        // Routine_reexecution sibling auto-clear (RUAAAAA-2239): when a
+        // routine_execution issue transitions to a terminal disposition
+        // (`done` for a clean run, `in_review` for a failed run), the new
+        // run's success or different failure mode proves the cause of any
+        // prior stranded_assigned_issue force-block on a sibling
+        // routine_execution issue for the same routine is no longer
+        // reproducible. Auto-resolve the recovery action on the prior
+        // sibling and transition it to `done` with a recovery comment.
+        //
+        // This complements the operator-driven 1928/1931/2100 safety nets
+        // (which clear the SAME issue's recovery action when an operator
+        // transitions it) and the 2072/2184 timed_out-with-progress family
+        // (which clears the SAME issue's recovery action when the run had
+        // produced durable progress). This family walks across issue
+        // boundaries within a routine, triggered by a SIBLING routine
+        // re-fire. Mirrors the issue.recovery_action_resolved activity log
+        // shape used by the other safety nets so the audit trail stays
+        // greppable.
+        //
+        // The routine_recovery auto-clear is intentionally NOT gated on
+        // the operator actor (unlike the 1931/2100 operator safety nets
+        // above) because the trigger is the system-side routine re-fire
+        // rather than an operator PATCH. The reconciliation sweep does
+        // not pass an actor here; the new run's own status transition is
+        // the authoritative signal.
+        if (
+          existing.originKind === "routine_execution" &&
+          updated.originKind === "routine_execution" &&
+          updated.originId &&
+          updated.originId === existing.originId &&
+          (updated.status === "done" || updated.status === "in_review") &&
+          updated.status !== existing.status
+        ) {
+          await tryAutoClearStrandedRoutineExecutionSiblings({
+            companyId: existing.companyId,
+            routineId: updated.originId,
+            currentIssue: updated,
+            dbOrTx: tx,
+          });
         }
 
         if (nextLabelIds !== undefined) {

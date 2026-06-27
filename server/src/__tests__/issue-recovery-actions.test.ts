@@ -8,6 +8,7 @@ import {
   activityLog,
   companies,
   createDb,
+  heartbeatRuns,
   issueComments,
   issueRecoveryActions,
   issueRelations,
@@ -132,6 +133,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     await db.delete(issueRecoveryActions);
     await db.delete(issueComments);
     await db.delete(activityLog);
+    await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(companies);
@@ -2033,5 +2035,384 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const details = autoClearLogs[0]!.details as Record<string, unknown>;
     expect(details.source).toBe("auto_clear_on_blocked_status");
     expect(details.sourceIssueStatus).toBe("blocked");
+  });
+
+  // -------------------------------------------------------------------------
+  // RUAAAAA-2239 — routine_execution sibling auto-clear family.
+  //
+  // When a routine re-fires and the new execution issue transitions to a
+  // terminal disposition (`done` for a clean run, `in_review` for a failed
+  // run), the new run's success or different failure mode proves the cause
+  // of any prior stranded_assigned_issue force-block on a SIBLING
+  // routine_execution issue for the same routine is no longer reproducible.
+  // The new family is event-driven by a sibling routine_execution
+  // transition (not by an operator PATCH and not by a reconciliation
+  // sweep on the same issue). The cause-reproducibility check is:
+  //   - new run status === "succeeded" → not reproducible (auto-clear)
+  //   - new run status terminal-failed AND new errorCode !== old errorCode
+  //     (with null treated as a sentinel "no error code") → not reproducible
+  //   - new run status terminal-failed AND new errorCode === old errorCode
+  //     → still reproducible (skip)
+  // -------------------------------------------------------------------------
+
+  async function seedRoutineExecutionFixture(opts: {
+    routineId: string;
+    priorErrorCode: string | null;
+    priorRunStatus: "failed" | "cancelled" | "timed_out";
+  }) {
+    const { companyId, managerId, coderId, prefix } = await seedCompany();
+    const priorIssueId = randomUUID();
+    const currentIssueId = randomUUID();
+    const priorRunId = randomUUID();
+    const currentRunId = randomUUID();
+
+    await db.insert(issues).values([
+      {
+        id: priorIssueId,
+        companyId,
+        title: `Routine ${opts.routineId} prior blocked run`,
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId: coderId,
+        originKind: "routine_execution",
+        originId: opts.routineId,
+        issueNumber: 100,
+        identifier: `${prefix}-100`,
+      },
+      {
+        id: currentIssueId,
+        companyId,
+        title: `Routine ${opts.routineId} current run`,
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: coderId,
+        originKind: "routine_execution",
+        originId: opts.routineId,
+        issueNumber: 101,
+        identifier: `${prefix}-101`,
+      },
+    ]);
+
+    // Prior run — the failed run that originally stranded the prior
+    // blocked sibling.
+    await db.insert(heartbeatRuns).values({
+      id: priorRunId,
+      companyId,
+      agentId: coderId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: opts.priorRunStatus,
+      errorCode: opts.priorErrorCode,
+      contextSnapshot: { issueId: priorIssueId },
+      startedAt: new Date("2026-06-27T01:05:00.000Z"),
+      finishedAt: new Date("2026-06-27T01:05:30.000Z"),
+    });
+
+    return {
+      companyId,
+      managerId,
+      coderId,
+      prefix,
+      priorIssueId,
+      currentIssueId,
+      priorRunId,
+      currentRunId,
+    };
+  }
+
+  async function seedActiveStrandedAction(input: {
+    companyId: string;
+    sourceIssueId: string;
+    ownerAgentId: string;
+    fingerprint: string;
+  }) {
+    return issueRecoveryActionService(db).upsertSourceScoped({
+      companyId: input.companyId,
+      sourceIssueId: input.sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: input.ownerAgentId,
+      cause: "stranded_assigned_issue",
+      fingerprint: input.fingerprint,
+      evidence: { sourceIssueId: input.sourceIssueId },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner" },
+    });
+  }
+
+  it("auto-clears stranded_assigned_issue on a prior routine_execution sibling when the routine re-fires and succeeds (RUAAAAA-2239 case 1)", async () => {
+    const routineId = randomUUID();
+    const fixture = await seedRoutineExecutionFixture({
+      routineId,
+      priorErrorCode: "ECONNREFUSED",
+      priorRunStatus: "failed",
+    });
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const priorAction = await seedActiveStrandedAction({
+      companyId: fixture.companyId,
+      sourceIssueId: fixture.priorIssueId,
+      ownerAgentId: fixture.managerId,
+      fingerprint: `2239-case1:${fixture.priorIssueId}`,
+    });
+
+    // Current run (the routine re-fire) succeeds cleanly.
+    await db.insert(heartbeatRuns).values({
+      id: fixture.currentRunId,
+      companyId: fixture.companyId,
+      agentId: fixture.coderId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "succeeded",
+      contextSnapshot: { issueId: fixture.currentIssueId },
+      startedAt: new Date("2026-06-27T03:00:00.000Z"),
+      finishedAt: new Date("2026-06-27T03:00:25.000Z"),
+    });
+
+    // Trigger the routine re-fire terminal transition on the current issue.
+    const updated = await issueService(db).update(fixture.currentIssueId, {
+      status: "done",
+      actorAgentId: fixture.managerId,
+    });
+    expect(updated?.status).toBe("done");
+
+    // Prior blocked sibling should be auto-cleared and transitioned to done.
+    const [priorIssueRow] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, fixture.priorIssueId));
+    expect(priorIssueRow?.status).toBe("done");
+    expect(priorIssueRow?.completedAt).toBeTruthy();
+
+    const [clearedAction] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, priorAction.id));
+    expect(clearedAction?.status).toBe("resolved");
+    expect(clearedAction?.outcome).toBe("recovered_by_subsequent_run");
+    expect(clearedAction?.resolutionNote).toMatch(/RUAAAAA-2239/);
+    expect(clearedAction?.resolutionNote).toMatch(/succeeded/);
+
+    const activeAfter = await recoveryActionSvc.getActiveForIssue(
+      fixture.companyId,
+      fixture.priorIssueId,
+    );
+    expect(activeAfter).toBeNull();
+
+    // Audit trail should record the cross-issue auto-clear.
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, fixture.priorIssueId));
+    const autoClearLogs = activityRows.filter(
+      (row) => row.action === "issue.recovery_action_resolved",
+    );
+    expect(autoClearLogs).toHaveLength(1);
+    const details = autoClearLogs[0]!.details as Record<string, unknown>;
+    expect(details.source).toBe("auto_clear_on_routine_recovery");
+    expect(details.previousSourceIssueStatus).toBe("blocked");
+    expect(details.sourceIssueStatus).toBe("done");
+    expect(details.triggeringIssueId).toBe(fixture.currentIssueId);
+    expect(details.triggeringRoutineId).toBe(routineId);
+    expect(details.newRunStatus).toBe("succeeded");
+    expect(details.priorErrorCode).toBe("ECONNREFUSED");
+  });
+
+  it("does NOT auto-clear stranded_assigned_issue when the routine re-fires with the same errorCode (RUAAAAA-2239 case 2)", async () => {
+    const routineId = randomUUID();
+    const fixture = await seedRoutineExecutionFixture({
+      routineId,
+      priorErrorCode: "ECONNREFUSED",
+      priorRunStatus: "failed",
+    });
+    const priorAction = await seedActiveStrandedAction({
+      companyId: fixture.companyId,
+      sourceIssueId: fixture.priorIssueId,
+      ownerAgentId: fixture.managerId,
+      fingerprint: `2239-case2:${fixture.priorIssueId}`,
+    });
+
+    // Current re-fire still fails with the same ECONNREFUSED cause — the
+    // underlying issue (gateway outage) is still reproducible.
+    await db.insert(heartbeatRuns).values({
+      id: fixture.currentRunId,
+      companyId: fixture.companyId,
+      agentId: fixture.coderId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "failed",
+      errorCode: "ECONNREFUSED",
+      contextSnapshot: { issueId: fixture.currentIssueId },
+      startedAt: new Date("2026-06-27T03:00:00.000Z"),
+      finishedAt: new Date("2026-06-27T03:00:30.000Z"),
+    });
+
+    await issueService(db).update(fixture.currentIssueId, {
+      status: "in_review",
+      actorAgentId: fixture.managerId,
+    });
+
+    // Prior sibling must stay blocked — the cause is still reproducible.
+    const [priorIssueRow] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, fixture.priorIssueId));
+    expect(priorIssueRow?.status).toBe("blocked");
+
+    const [actionAfter] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, priorAction.id));
+    expect(actionAfter?.status).toBe("active");
+    expect(actionAfter?.outcome).toBeNull();
+    expect(actionAfter?.resolvedAt).toBeNull();
+
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, fixture.priorIssueId));
+    const autoClearLogs = activityRows.filter(
+      (row) => row.action === "issue.recovery_action_resolved",
+    );
+    expect(autoClearLogs).toHaveLength(0);
+  });
+
+  it("does NOT auto-clear stranded_assigned_issue when the routine re-fires with a different errorCode AND that new failure is the current terminal status (RUAAAAA-2239 case 3)", async () => {
+    const routineId = randomUUID();
+    const fixture = await seedRoutineExecutionFixture({
+      routineId,
+      priorErrorCode: "ECONNREFUSED",
+      priorRunStatus: "failed",
+    });
+    const priorAction = await seedActiveStrandedAction({
+      companyId: fixture.companyId,
+      sourceIssueId: fixture.priorIssueId,
+      ownerAgentId: fixture.managerId,
+      fingerprint: `2239-case3:${fixture.priorIssueId}`,
+    });
+
+    // Current re-fire fails with a DIFFERENT errorCode (a new bug, not the
+    // old ECONNREFUSED). Per the spec, a different errorCode counts as
+    // "no longer reproducible" — so this SHOULD auto-clear, not skip.
+    // This test asserts the explicit "different code" auto-clear path.
+    await db.insert(heartbeatRuns).values({
+      id: fixture.currentRunId,
+      companyId: fixture.companyId,
+      agentId: fixture.coderId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "failed",
+      errorCode: "TIMEOUT",
+      contextSnapshot: { issueId: fixture.currentIssueId },
+      startedAt: new Date("2026-06-27T03:00:00.000Z"),
+      finishedAt: new Date("2026-06-27T03:00:30.000Z"),
+    });
+
+    await issueService(db).update(fixture.currentIssueId, {
+      status: "in_review",
+      actorAgentId: fixture.managerId,
+    });
+
+    // Different errorCode ⇒ prior ECONNREFUSED cause is no longer
+    // reproducible, so the prior sibling should auto-clear.
+    const [priorIssueRow] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, fixture.priorIssueId));
+    expect(priorIssueRow?.status).toBe("done");
+
+    const [actionAfter] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, priorAction.id));
+    expect(actionAfter?.status).toBe("resolved");
+    expect(actionAfter?.outcome).toBe("recovered_by_subsequent_run");
+    expect(actionAfter?.resolutionNote).toMatch(/error code differs/);
+
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, fixture.priorIssueId));
+    const autoClearLogs = activityRows.filter(
+      (row) => row.action === "issue.recovery_action_resolved",
+    );
+    expect(autoClearLogs).toHaveLength(1);
+    const details = autoClearLogs[0]!.details as Record<string, unknown>;
+    expect(details.source).toBe("auto_clear_on_routine_recovery");
+    expect(details.newErrorCode).toBe("TIMEOUT");
+    expect(details.priorErrorCode).toBe("ECONNREFUSED");
+  });
+
+  it("does NOT auto-clear recovery actions on non-routine-execution sources when a routine_execution sibling transitions to done (RUAAAAA-2239 case 4)", async () => {
+    const routineId = randomUUID();
+    const { companyId, managerId, coderId, prefix, sourceIssueId: nonRoutineSourceId } = await seedCompany();
+    const currentIssueId = randomUUID();
+    const currentRunId = randomUUID();
+
+    // Build a routine_execution "current" issue that triggers the
+    // routine_recovery cross-issue sweep, plus a separate NON-routine-
+    // execution issue that already has an active stranded action.
+    await db.insert(issues).values({
+      id: currentIssueId,
+      companyId,
+      title: `Routine ${routineId} current run`,
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: coderId,
+      originKind: "routine_execution",
+      originId: routineId,
+      issueNumber: 200,
+      identifier: `${prefix}-200`,
+    });
+
+    // The non-routine-execution source from seedCompany() is manual. Mark
+    // it as blocked (the stranded force-block state) and seed an active
+    // stranded action on it.
+    await db
+      .update(issues)
+      .set({ status: "blocked" })
+      .where(eq(issues.id, nonRoutineSourceId));
+    const nonRoutineAction = await seedActiveStrandedAction({
+      companyId,
+      sourceIssueId: nonRoutineSourceId,
+      ownerAgentId: managerId,
+      fingerprint: `2239-case4:${nonRoutineSourceId}`,
+    });
+
+    // Current run succeeds cleanly.
+    await db.insert(heartbeatRuns).values({
+      id: currentRunId,
+      companyId,
+      agentId: coderId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "succeeded",
+      contextSnapshot: { issueId: currentIssueId },
+      startedAt: new Date("2026-06-27T03:00:00.000Z"),
+      finishedAt: new Date("2026-06-27T03:00:25.000Z"),
+    });
+
+    await issueService(db).update(currentIssueId, {
+      status: "done",
+      actorAgentId: managerId,
+    });
+
+    // The non-routine-execution source must be UNAFFECTED — the
+    // routine_recovery family only walks routine_execution origin siblings
+    // for the same routine. The 1928/1931/2100 safety net family is the
+    // one that handles terminal transitions on the SAME issue; neither
+    // family should auto-clear the non-routine-execution sibling just
+    // because a routine_execution sibling transitioned.
+    const [nonRoutineRow] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, nonRoutineSourceId));
+    expect(nonRoutineRow?.status).toBe("blocked");
+
+    const [nonRoutineActionAfter] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, nonRoutineAction.id));
+    expect(nonRoutineActionAfter?.status).toBe("active");
+    expect(nonRoutineActionAfter?.outcome).toBeNull();
   });
 });
