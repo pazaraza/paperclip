@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, inArray, isNull, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -67,6 +67,32 @@ export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
 const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
+
+// RUAAAAA-2377 — write-tooling failure classifier.
+//
+// Detects the churn pattern where an agent has run N consecutive times
+// against the same issue and every run failed/timed_out without
+// producing a single `issueComments.createdByRunId === run.id` or
+// `issueWorkProducts.createdByRunId === run.id` row. The agent itself
+// is not the problem in this case; the lane they were handed is not
+// writeable from their adapter (auth-tooling, wrong API base,
+// malformed token, etc.). Escalating the same agent back into the
+// next recovery sweep just churns them — RUAAAAA-2369 is the canonical
+// example: it kept getting re-blocked because every retry attempt at
+// the same retryable action produced identical silent-write-failure
+// runs. The correct routing is to escalate to the lane that owns the
+// auth/tooling (Engineering for paperclip-side tooling), not the
+// assignee.
+//
+// The threshold of 3 is the minimum needed to distinguish "agent ran
+// but the lane is broken" (≥3 consecutive zero-write runs) from a
+// single transient failure (which the existing
+// `didAutomaticRecoveryFail` branch already handles with retry+block).
+// The `agent_completed_with_zero_writes` reason is stable so the HoE
+// dashboard can filter on the recovery action `kind` field
+// (`handoff_to_engineering`).
+const WRITE_TOOLING_FAILURE_CONSECUTIVE_RUN_THRESHOLD = 3;
+const WRITE_TOOLING_FAILURE_CAUSE = "agent_completed_with_zero_writes";
 const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiveRunEvaluation;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 
@@ -92,7 +118,10 @@ type LatestIssueRun = Pick<
 > | null;
 type SuccessfulLatestIssueRun = NonNullable<LatestIssueRun> & { status: "succeeded" };
 
-type StrandedRecoveryCause = "stranded_assigned_issue" | typeof SUCCESSFUL_RUN_MISSING_STATE_REASON;
+type StrandedRecoveryCause =
+  | "stranded_assigned_issue"
+  | typeof SUCCESSFUL_RUN_MISSING_STATE_REASON
+  | typeof WRITE_TOOLING_FAILURE_CAUSE;
 
 type SuccessfulRunHandoffRecoveryEvidence = {
   sourceRunId: string | null;
@@ -1597,9 +1626,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   function strandedRecoveryActionKind(cause: StrandedRecoveryCause) {
-    return cause === SUCCESSFUL_RUN_MISSING_STATE_REASON
-      ? "missing_disposition" as const
-      : "stranded_assigned_issue" as const;
+    if (cause === SUCCESSFUL_RUN_MISSING_STATE_REASON) return "missing_disposition" as const;
+    if (cause === WRITE_TOOLING_FAILURE_CAUSE) return "handoff_to_engineering" as const;
+    return "stranded_assigned_issue" as const;
   }
 
   function strandedRecoveryActionFingerprint(input: {
@@ -2271,6 +2300,440 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   /**
+   * RUAAAAA-2377 — write-tooling failure classifier.
+   *
+   * Detects the churn pattern where the same agent has run N consecutive
+   * times against the same issue and every run failed/timed_out without
+   * producing a single `issueComments.createdByRunId === run.id` or
+   * `issueWorkProducts.createdByRunId === run.id` row. The agent itself
+   * executed (it produced a failed/timed_out terminal status, not
+   * "did nothing"), but its writes never landed on the source issue.
+   *
+   * Distinct from the existing `didAutomaticRecoveryFail` /
+   * `issue_continuation_needed` branch in two ways:
+   *
+   * 1. Productivity failure (what today escalates): the agent ran, made
+   *    no progress, and on the next sweep we either re-dispatch or
+   *    force-block the source. Escalating the same agent back into the
+   *    next sweep is the right action when the agent can be expected
+   *    to do better next time.
+   * 2. Write-tooling failure (what this classifier detects): the agent
+   *    ran, but the lane they were handed is not writeable from their
+   *    adapter. Re-dispatching the agent makes no progress because the
+   *    next run will also produce zero writes for the same reason. The
+   *    correct routing is to escalate to the lane that owns the
+   *    auth/tooling (Engineering by default for paperclip-side
+   *    tooling), not the assignee.
+   *
+   * Canonical churn pattern: RUAAAAA-2369 (2026-06-24). The same
+   * hermes_local adapter kept failing silently because the JWT path was
+   * broken in production — every retry attempt at the same retryable
+   * action produced identical silent-write-failure runs. Escalating the
+   * assignee back into the next sweep did not help; the issue had to be
+   * routed to Engineering (RUAAAAA-2374 → 2375 → 2378) before the
+   * silent-write pattern cleared.
+   *
+   * The classifier returns a stable signal so the recovery sweep can
+   * route to a different lane than the assignee. The companion helper
+   * `resolveWriteToolingFailureOwnerAgentId` picks the Engineering lane
+   * (configurable via title match on "Engineering" today; can be
+   * promoted to a per-company config field later). The companion
+   * helper `tryEscalateWriteToolingFailure` materializes the handoff
+   * recovery action and wakes the engineering owner.
+   *
+   * Threshold: `WRITE_TOOLING_FAILURE_CONSECUTIVE_RUN_THRESHOLD = 3`.
+   * Three is the minimum needed to distinguish "agent ran but the lane
+   * is broken" (≥3 consecutive zero-write failed/timed_out runs) from a
+   * single transient failure (which the existing retry+block path
+   * handles correctly).
+   */
+  async function detectAgentCompletedWithZeroWrites(input: {
+    issue: typeof issues.$inferSelect;
+    latestRun: LatestIssueRun;
+    lookbackRunLimit?: number;
+  }): Promise<
+    | { matches: false; reason: string }
+    | {
+        matches: true;
+        consecutiveZeroWriteRuns: number;
+        sampleRunIds: string[];
+        threshold: number;
+      }
+  > {
+    const limit = input.lookbackRunLimit ?? Math.max(
+      WRITE_TOOLING_FAILURE_CONSECUTIVE_RUN_THRESHOLD * 3,
+      12,
+    );
+
+    // The latest run must be in a failed-or-timed_out terminal state.
+    // Succeeded / cancelled / queued / running / scheduled_retry runs
+    // are not write-tooling failures — succeeded means writes landed,
+    // the rest means the run has not finished yet.
+    if (!input.latestRun) {
+      return { matches: false, reason: "no latest run available" };
+    }
+    if (
+      input.latestRun.status !== "failed" &&
+      input.latestRun.status !== "timed_out"
+    ) {
+      return {
+        matches: false,
+        reason: `latest run status is ${input.latestRun.status}, not failed/timed_out`,
+      };
+    }
+
+    // Pull the most recent N runs for this issue (any agent). We walk
+    // backwards from the latest failed/timed_out run and count
+    // consecutive zero-write runs. We stop counting as soon as we see a
+    // run with at least one comment or work product, because that
+    // proves the lane was writeable at that point.
+    const recentRuns = await db
+      .select({
+        id: heartbeatRuns.id,
+        agentId: heartbeatRuns.agentId,
+        status: heartbeatRuns.status,
+        startedAt: heartbeatRuns.startedAt,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, input.issue.companyId),
+          // `contextSnapshot.issueId` is the canonical pointer from a run
+          // back to its source issue (same field the existing
+          // `issueIdFromRunContext` helper uses to attach a run to an
+          // issue). We also accept `contextSnapshot.taskId` for backward
+          // compatibility with legacy runs.
+          or(
+            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${input.issue.id}`,
+            sql`${heartbeatRuns.contextSnapshot} ->> 'taskId' = ${input.issue.id}`,
+          ),
+          inArray(heartbeatRuns.status, [
+            "failed",
+            "timed_out",
+            "cancelled",
+            "succeeded",
+          ] as const),
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.startedAt))
+      .limit(limit);
+
+    if (recentRuns.length === 0) {
+      return {
+        matches: false,
+        reason: "no recent runs found in the issue context for this issue",
+      };
+    }
+
+    const sampleRunIds: string[] = [];
+    let consecutiveZeroWriteRuns = 0;
+
+    for (const run of recentRuns) {
+      // Only failed/timed_out runs count toward the consecutive
+      // counter. A succeeded run in the middle of the window proves
+      // writes were landing at that point — the failure pattern is
+      // newer than the most recent success. A cancelled run does not
+      // count either; cancellation is a deliberate stop, not a
+      // write-tooling failure.
+      if (run.status !== "failed" && run.status !== "timed_out") {
+        break;
+      }
+
+      const [commentCount] = await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.issueId, input.issue.id),
+            eq(issueComments.createdByRunId, run.id),
+          ),
+        );
+      const [workProductCount] = await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(issueWorkProducts)
+        .where(
+          and(
+            eq(issueWorkProducts.companyId, input.issue.companyId),
+            eq(issueWorkProducts.issueId, input.issue.id),
+            eq(issueWorkProducts.createdByRunId, run.id),
+          ),
+        );
+
+      const hadWrite = (commentCount?.count ?? 0) > 0 || (workProductCount?.count ?? 0) > 0;
+      if (hadWrite) {
+        // Write landed during this run — the lane was writeable at
+        // this point. The current run, if it failed, is a different
+        // failure mode (productivity, env, runtime, etc.). Stop the
+        // consecutive counter here.
+        break;
+      }
+
+      sampleRunIds.push(run.id);
+      consecutiveZeroWriteRuns += 1;
+    }
+
+    if (consecutiveZeroWriteRuns < WRITE_TOOLING_FAILURE_CONSECUTIVE_RUN_THRESHOLD) {
+      return {
+        matches: false,
+        reason: `only ${consecutiveZeroWriteRuns} consecutive zero-write failed/timed_out run(s); threshold is ${WRITE_TOOLING_FAILURE_CONSECUTIVE_RUN_THRESHOLD}`,
+      };
+    }
+
+    return {
+      matches: true,
+      consecutiveZeroWriteRuns,
+      sampleRunIds,
+      threshold: WRITE_TOOLING_FAILURE_CONSECUTIVE_RUN_THRESHOLD,
+    };
+  }
+
+  /**
+   * RUAAAAA-2377 — resolve the recovery-owner agent for a
+   * write-tooling failure. The default lane is Engineering (the lane
+   * that owns paperclip-side auth/tooling); the lookup matches on
+   * `agents.title` containing "engineering" (case-insensitive) within
+   * the same company. If no engineering owner is invokable, fall back
+   * to the existing `resolveStrandedIssueRecoveryOwnerAgentId` chain
+   * (assignee → assignee.reportsTo → creator.reportsTo → creator →
+   * cto → ceo) so the recovery action still gets a real owner.
+   *
+   * Future work: promote the "engineering lane" match to a per-company
+   * config field (`lanes.write_tooling_failure = <role|title>`) so
+   * deployments can route DevOps / SRE / Security instead of
+   * Engineering. The default today is "any agent with 'engineering' in
+   * the title" — which works for Ruah Innovations (Head of Engineering)
+   * and any other company whose engineering owner is conventionally
+   * titled.
+   */
+  async function resolveWriteToolingFailureOwnerAgentId(
+    issue: typeof issues.$inferSelect,
+  ): Promise<{ ownerAgentId: string; lane: "engineering" | "fallback_chain"; agent: typeof agents.$inferSelect } | null> {
+    const engineeringCandidates = await db
+      .select()
+      .from(agents)
+      .where(
+        and(
+          eq(agents.companyId, issue.companyId),
+          sql`lower(coalesce(${agents.title}, '')) like '%engineering%'`,
+        ),
+      )
+      .orderBy(asc(agents.createdAt));
+
+    for (const candidate of engineeringCandidates) {
+      if (!isAgentInvokable(candidate)) continue;
+      const budgetBlock = await budgets.getInvocationBlock(issue.companyId, candidate.id, {
+        issueId: issue.id,
+        projectId: issue.projectId,
+      });
+      if (budgetBlock) continue;
+      return { ownerAgentId: candidate.id, lane: "engineering", agent: candidate };
+    }
+
+    const fallbackId = await resolveStrandedIssueRecoveryOwnerAgentId(issue);
+    if (!fallbackId) return null;
+    const fallbackAgent = await getAgent(fallbackId);
+    if (!fallbackAgent) return null;
+    return { ownerAgentId: fallbackId, lane: "fallback_chain", agent: fallbackAgent };
+  }
+
+  /**
+   * RUAAAAA-2377 — materialize a `handoff_to_engineering` recovery
+   * action for a write-tooling failure. The action's `cause` field is
+   * `agent_completed_with_zero_writes` (the explicit reason the issue
+   * asks for); the `evidence` payload carries the run ids that
+   * satisfied the classifier plus the engineering lane match.
+   *
+   * Mirrors `ensureSourceScopedStrandedRecoveryAction` for the
+   * existing `stranded_assigned_issue` kind so the audit log has a
+   * consistent shape across all source-scoped recovery actions.
+   */
+  async function ensureSourceScopedWriteToolingFailureRecoveryAction(input: {
+    issue: typeof issues.$inferSelect;
+    latestRun: LatestIssueRun;
+    previousStatus: "todo" | "in_progress";
+    consecutiveZeroWriteRuns: number;
+    sampleRunIds: string[];
+    ownerAgentId: string;
+    lane: "engineering" | "fallback_chain";
+    ownerAgent: typeof agents.$inferSelect;
+  }) {
+    const now = new Date();
+    return recoveryActionsSvc.upsertSourceScoped({
+      companyId: input.issue.companyId,
+      sourceIssueId: input.issue.id,
+      kind: "handoff_to_engineering",
+      ownerType: "agent",
+      ownerAgentId: input.ownerAgentId,
+      previousOwnerAgentId: input.issue.assigneeAgentId,
+      returnOwnerAgentId: input.issue.assigneeAgentId,
+      cause: WRITE_TOOLING_FAILURE_CAUSE,
+      fingerprint: [
+        "source_scoped_write_tooling_failure",
+        input.issue.companyId,
+        input.issue.id,
+        WRITE_TOOLING_FAILURE_CAUSE,
+      ].join(":"),
+      evidence: {
+        sourceIssueId: input.issue.id,
+        sourceIdentifier: input.issue.identifier,
+        previousStatus: input.previousStatus,
+        latestIssueStatus: input.issue.status,
+        latestRunId: input.latestRun?.id ?? null,
+        latestRunStatus: input.latestRun?.status ?? null,
+        latestRunErrorCode: input.latestRun?.errorCode ?? null,
+        consecutiveZeroWriteRuns: input.consecutiveZeroWriteRuns,
+        threshold: WRITE_TOOLING_FAILURE_CONSECUTIVE_RUN_THRESHOLD,
+        sampleRunIds: input.sampleRunIds,
+        lane: input.lane,
+        ownerAgentId: input.ownerAgentId,
+        ownerAgentTitle: input.ownerAgent.title ?? null,
+        ownerAgentRole: input.ownerAgent.role ?? null,
+      },
+      nextAction: input.lane === "engineering"
+        ? "Inspect the auth/tooling surface used by the source assignee's adapter, restore write capability, then resolve this action. The source issue will stay at in_progress until this action resolves."
+        : "No engineering lane is invokable in this company; restore the assignee's write capability (auth/tooling surface, API base, token) or reassign the source issue to a lane that can write.",
+      wakePolicy: {
+        type: "wake_owner",
+        reason: "source_scoped_recovery_action",
+        ownerAgentId: input.ownerAgentId,
+      },
+      monitorPolicy: null,
+      maxAttempts: null,
+      lastAttemptAt: now,
+    });
+  }
+
+  /**
+   * RUAAAAA-2377 — escalate a write-tooling failure to the engineering
+   * lane (or fallback chain). Materializes the recovery action, sets
+   * the source issue to `blocked` with the engineering owner as the
+   * new assignee, posts a system comment naming the pattern and the
+   * unblock owner, logs the activity, and wakes the engineering owner.
+   *
+   * Mirrors `escalateStrandedAssignedIssue` for the existing
+   * `stranded_assigned_issue` cause so the board / comment / activity
+   * shape stays consistent.
+   */
+  async function escalateWriteToolingFailure(input: {
+    issue: typeof issues.$inferSelect;
+    previousStatus: "todo" | "in_progress";
+    latestRun: LatestIssueRun;
+    consecutiveZeroWriteRuns: number;
+    sampleRunIds: string[];
+  }): Promise<{ updated: typeof issues.$inferSelect | null; actionId: string | null }> {
+    const owner = await resolveWriteToolingFailureOwnerAgentId(input.issue);
+    if (!owner) return { updated: null, actionId: null };
+
+    const action = await ensureSourceScopedWriteToolingFailureRecoveryAction({
+      issue: input.issue,
+      latestRun: input.latestRun,
+      previousStatus: input.previousStatus,
+      consecutiveZeroWriteRuns: input.consecutiveZeroWriteRuns,
+      sampleRunIds: input.sampleRunIds,
+      ownerAgentId: owner.ownerAgentId,
+      lane: owner.lane,
+      ownerAgent: owner.agent,
+    });
+
+    const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
+    const updated = await issuesSvc.update(input.issue.id, {
+      status: "blocked",
+      blockedByIssueIds: blockerIds,
+      assigneeAgentId: owner.ownerAgentId,
+    });
+    if (!updated) return { updated: null, actionId: action.id };
+
+    const prefix = await getCompanyIssuePrefix(input.issue.companyId);
+    const sourceAssignee = input.issue.assigneeAgentId ? await getAgent(input.issue.assigneeAgentId) : null;
+    const laneLabel = owner.lane === "engineering" ? "Engineering" : "the fallback recovery owner chain";
+    const failureSummary = summarizeRunFailureForIssueComment(input.latestRun);
+    const ownerLink = agentUiLink(owner.agent, prefix);
+    const sourceLink = sourceAssignee
+      ? agentUiLink(sourceAssignee, prefix)
+      : "none";
+
+    const sampleRunList = input.sampleRunIds.slice(0, 3).map((id) => `\`${id}\``).join(", ");
+    const moreRuns = input.sampleRunIds.length > 3
+      ? ` (+${input.sampleRunIds.length - 3} earlier)`
+      : "";
+    const commentBody = [
+      "Paperclip detected a write-tooling failure pattern on this assigned issue:",
+      `the assignee ran ${input.consecutiveZeroWriteRuns} consecutive times (most recent: ${sampleRunList}${moreRuns}) and every run failed/timed_out without producing a single issue comment or work product on the source issue.`,
+      `Re-dispatching the assignee (\`${sourceAssignee?.name ?? input.issue.assigneeAgentId}\`) would just churn — the lane they were handed is not writeable from their adapter (auth-tooling, API base, malformed token, etc.).`,
+      `Routing the recovery action to ${laneLabel} (${ownerLink}) instead.${failureSummary ?? ""}`,
+      "",
+      `- Recovery action: \`${action.id}\``,
+      `- Recovery cause: \`${WRITE_TOOLING_FAILURE_CAUSE}\``,
+      `- Recovery kind: \`handoff_to_engineering\``,
+      `- Recovery lane: \`${owner.lane}\``,
+      `- Source assignee: ${sourceLink}`,
+      `- Consecutive zero-write failed/timed_out runs: ${input.consecutiveZeroWriteRuns} (threshold ${WRITE_TOOLING_FAILURE_CONSECUTIVE_RUN_THRESHOLD})`,
+      "- Next action: the engineering owner should inspect the auth/tooling surface, restore write capability, and resolve this action; the source issue will return to in_progress once a writeable path is restored.",
+    ].join("\n");
+
+    // Only post the system comment on the first attempt so we don't
+    // spam the issue thread on every reconciliation cycle.
+    if (action.attemptCount === 1) {
+      const escalationCommentMarker = `Recovery action: \`${action.id}\``;
+      const hasEscalationComment = await db
+        .select({ id: issueComments.id, body: issueComments.body })
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.issueId, input.issue.id),
+            eq(issueComments.authorType, "system"),
+          ),
+        )
+        .orderBy(desc(issueComments.createdAt))
+        .limit(50)
+        .then((rows) => rows.some((row) => (row.body ?? "").includes(escalationCommentMarker)));
+
+      if (!hasEscalationComment) {
+        await issuesSvc.addComment(input.issue.id, commentBody, {}, {
+          authorType: "system",
+        });
+      }
+    }
+
+    await logActivity(db, {
+      companyId: input.issue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: input.latestRun?.id ?? null,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: input.issue.id,
+      details: {
+        identifier: input.issue.identifier,
+        status: "blocked",
+        previousStatus: input.previousStatus,
+        source: "recovery.reconcile_write_tooling_failure_handoff",
+        recoveryCause: WRITE_TOOLING_FAILURE_CAUSE,
+        recoveryKind: "handoff_to_engineering",
+        recoveryLane: owner.lane,
+        recoveryActionId: action.id,
+        recoveryOwnerAgentId: action.ownerAgentId,
+        previousOwnerAgentId: input.issue.assigneeAgentId,
+        returnOwnerAgentId: action.returnOwnerAgentId,
+        consecutiveZeroWriteRuns: input.consecutiveZeroWriteRuns,
+        sampleRunIds: input.sampleRunIds,
+        threshold: WRITE_TOOLING_FAILURE_CONSECUTIVE_RUN_THRESHOLD,
+        blockerIssueIds: blockerIds,
+      },
+    });
+
+    await enqueueSourceScopedStrandedRecoveryWake({
+      action,
+      issue: input.issue,
+      latestRun: input.latestRun,
+      recoveryCause: WRITE_TOOLING_FAILURE_CAUSE,
+    });
+
+    return { updated, actionId: action.id };
+  }
+
+  /**
    * Cycle-2+ auto-clear guard: resolve an existing active
    * `stranded_assigned_issue` recovery action when the source issue is
    * `in_progress` with a live continuation path recorded by a pending
@@ -2711,6 +3174,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       successfulRunHandoffEscalated: 0,
       successfulRunHandoffAutoCleared: 0,
       escalated: 0,
+      writeToolingFailureHandoff: 0,
       skipped: 0,
       issueIds: [] as string[],
     };
@@ -2778,6 +3242,31 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
         if (latestRun.status === "succeeded") {
           result.skipped += 1;
+          continue;
+        }
+
+        // RUAAAAA-2377 — write-tooling failure classifier (todo branch).
+        // Same shape as the in_progress branch below, but earlier in the
+        // todo state machine so the engineering handoff fires before any
+        // `assignment_recovery` retry would queue the assignee again.
+        const todoWriteTooling = await detectAgentCompletedWithZeroWrites({
+          issue,
+          latestRun,
+        });
+        if (todoWriteTooling.matches) {
+          const escalated = await escalateWriteToolingFailure({
+            issue,
+            previousStatus: "todo",
+            latestRun,
+            consecutiveZeroWriteRuns: todoWriteTooling.consecutiveZeroWriteRuns,
+            sampleRunIds: todoWriteTooling.sampleRunIds,
+          });
+          if (escalated.updated) {
+            result.writeToolingFailureHandoff += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
           continue;
         }
 
@@ -2982,6 +3471,34 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
         continue;
       }
+      // RUAAAAA-2377 — write-tooling failure classifier (in_progress branch).
+      // Fires when the latest run failed/timed_out AND the issue has
+      // `WRITE_TOOLING_FAILURE_CONSECUTIVE_RUN_THRESHOLD` (3) consecutive
+      // such runs with no comments/work products on the source issue.
+      // Routes to Engineering instead of re-dispatching the assignee.
+      // Mirrors the `todo` branch check above so the same pattern is
+      // caught in both states.
+      const inProgressWriteTooling = await detectAgentCompletedWithZeroWrites({
+        issue,
+        latestRun,
+      });
+      if (inProgressWriteTooling.matches) {
+        const escalated = await escalateWriteToolingFailure({
+          issue,
+          previousStatus: "in_progress",
+          latestRun,
+          consecutiveZeroWriteRuns: inProgressWriteTooling.consecutiveZeroWriteRuns,
+          sampleRunIds: inProgressWriteTooling.sampleRunIds,
+        });
+        if (escalated.updated) {
+          result.writeToolingFailureHandoff += 1;
+          result.issueIds.push(issue.id);
+        } else {
+          result.skipped += 1;
+        }
+        continue;
+      }
+
       if (didAutomaticRecoveryFail(latestRun, "issue_continuation_needed")) {
         // Cycle-1 auto-clear: a `timed_out` continuation retry that
         // landed durable progress BEFORE the openclaw_gateway
@@ -3883,6 +4400,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     buildRunOutputSilence,
     escalateStrandedRecoveryIssueInPlace,
     escalateStrandedAssignedIssue,
+    detectAgentCompletedWithZeroWrites,
+    resolveWriteToolingFailureOwnerAgentId,
+    escalateWriteToolingFailure,
     recordWatchdogDecision,
     scanSilentActiveRuns,
     reconcileStrandedAssignedIssues,

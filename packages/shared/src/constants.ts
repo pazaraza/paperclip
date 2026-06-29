@@ -220,6 +220,7 @@ export const ISSUE_RECOVERY_ACTION_KINDS = [
   "stranded_assigned_issue",
   "active_run_watchdog",
   "issue_graph_liveness",
+  "handoff_to_engineering",
 ] as const;
 export type IssueRecoveryActionKind = (typeof ISSUE_RECOVERY_ACTION_KINDS)[number];
 

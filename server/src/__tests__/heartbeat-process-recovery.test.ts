@@ -4107,4 +4107,373 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     expect(runs).toHaveLength(1);
   });
+
+  // ---------------------------------------------------------------------------
+  // RUAAAAA-2377 — write-tooling failure classifier.
+  //
+  // Pattern: when an agent has run N consecutive times against the same issue
+  // and every run failed/timed_out without producing a single
+  // issueComments.createdByRunId === run.id or issueWorkProducts row, the
+  // lane they were handed is not writeable from their adapter. The
+  // classifier routes the recovery action to Engineering (or the fallback
+  // chain) instead of the assignee, breaking the false-positive churn
+  // pattern that motivated RUAAAAA-2369 → 2374 → 2375.
+  //
+  // Threshold: WRITE_TOOLING_FAILURE_CONSECUTIVE_RUN_THRESHOLD = 3.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Seed a fixture where the assignee has run N consecutive times against
+   * the same issue, with every run in failed/timed_out state. Optional
+   * `writeOnRunIndexes` inserts an issue comment for the indexed runs
+   * (0 = oldest, N-1 = newest) to simulate "this run landed a write" and
+   * break the consecutive-zero-write counter.
+   */
+  async function seedConsecutiveFailedRunsFixture(input: {
+    runCount: number;
+    runStatuses?: ("failed" | "timed_out")[];
+    writeOnRunIndexes?: number[];
+    engineeringAgentTitle?: string | null;
+    includeEngineeringAgent?: boolean;
+  }) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const engineeringAgentId = randomUUID();
+    const runIds: string[] = [];
+    const wakeupRequestIds: string[] = [];
+    const issueId = randomUUID();
+    const now = new Date("2026-06-15T00:00:00.000Z");
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "HermesLocalAgent",
+      role: "general",
+      status: "idle",
+      adapterType: "hermes_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    if (input.includeEngineeringAgent !== false) {
+      await db.insert(agents).values({
+        id: engineeringAgentId,
+        companyId,
+        name: "Head of Engineering",
+        role: "general",
+        title: input.engineeringAgentTitle ?? "Head of Engineering",
+        status: "idle",
+        adapterType: "openclaw_gateway",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+    }
+
+    // Insert the issue FIRST so the runs and any seeded comments can
+    // reference it without violating the issue_comments.issue_id FK.
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Source issue for write-tooling classifier test",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      assigneeUserId: null,
+      checkoutRunId: null,
+      executionRunId: null,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      startedAt: now,
+    });
+
+    for (let i = 0; i < input.runCount; i += 1) {
+      const runId = randomUUID();
+      const wakeupRequestId = randomUUID();
+      runIds.push(runId);
+      wakeupRequestIds.push(wakeupRequestId);
+      // Older runs come first (i=0 oldest), newer runs come last.
+      const runStartedAt = new Date(now.getTime() + i * 60_000);
+      const runFinishedAt = new Date(now.getTime() + i * 60_000 + 30_000);
+      const runStatus = input.runStatuses?.[i] ?? "failed";
+      const retryReason = i === 0 ? "issue_assignment_recovery" : "issue_continuation_needed";
+
+      await db.insert(agentWakeupRequests).values({
+        id: wakeupRequestId,
+        companyId,
+        agentId,
+        source: "assignment",
+        triggerDetail: "system",
+        reason: retryReason === "issue_assignment_recovery" ? "issue_assignment_recovery" : "issue_assigned",
+        payload: { issueId },
+        status: "failed",
+        runId,
+        claimedAt: runStartedAt,
+        finishedAt: runFinishedAt,
+        error: "silent write failure: PAPERCLIP_API_KEY injected JWT path returned 401 on every mutation",
+      });
+
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: runStatus,
+        wakeupRequestId,
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: retryReason === "issue_assignment_recovery" ? "issue_assignment_recovery" : "issue_assigned",
+          retryReason,
+        },
+        startedAt: runStartedAt,
+        finishedAt: runFinishedAt,
+        updatedAt: runFinishedAt,
+        errorCode: runStatus === "timed_out" ? "timeout" : "auth_silent_401",
+        error: "silent write failure: PAPERCLIP_API_KEY injected JWT path returned 401 on every mutation",
+        livenessState: null,
+      });
+
+      const writeOnThisRun = input.writeOnRunIndexes?.includes(i);
+      if (writeOnThisRun) {
+        await db.insert(issueComments).values({
+          companyId,
+          issueId,
+          authorAgentId: agentId,
+          createdByRunId: runId,
+          body: `Durable progress note from run ${runId} (index ${i}).`,
+          authorType: "agent",
+        });
+      }
+    }
+
+    // Set the most recent run as the executionRunId / checkoutRunId
+    // (so the recovery sweep finds latestRun.status === failed/timed_out).
+    await db.update(issues)
+      .set({
+        checkoutRunId: runIds[runIds.length - 1] ?? null,
+        executionRunId: runIds[runIds.length - 1] ?? null,
+      })
+      .where(eq(issues.id, issueId));
+
+    return { companyId, agentId, engineeringAgentId, runIds, wakeupRequestIds, issueId };
+  }
+
+  it("handoff_to_engineering recovery action after 3 consecutive zero-write failed runs (RUAAAAA-2377)", async () => {
+    // RUAAAAA-2369 churn pattern: hermes_local agent has run 3 times
+    // against the same issue, every run failed silently (the JWT-path
+    // 401), zero comments / work products landed. The recovery sweep
+    // must route to Engineering (the lane that owns paperclip-side
+    // auth/tooling), not the assignee.
+    const { companyId, agentId, engineeringAgentId, runIds, issueId } =
+      await seedConsecutiveFailedRunsFixture({
+        runCount: 3,
+        writeOnRunIndexes: [],
+        includeEngineeringAgent: true,
+      });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.writeToolingFailureHandoff).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.dispatchRequeued).toBe(0);
+
+    // Source issue must be flipped to blocked with the engineering
+    // owner as the new assignee.
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(sourceIssue?.status).toBe("blocked");
+    expect(sourceIssue?.assigneeAgentId).toBe(engineeringAgentId);
+
+    // A handoff_to_engineering recovery action must exist with the
+    // expected fingerprint and evidence. The cause is the stable
+    // discriminator the HoE dashboard will filter on.
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      );
+    expect(actionRows).toHaveLength(1);
+    const action = actionRows[0];
+    expect(action).toMatchObject({
+      kind: "handoff_to_engineering",
+      cause: "agent_completed_with_zero_writes",
+      ownerAgentId: engineeringAgentId,
+      previousOwnerAgentId: agentId,
+      returnOwnerAgentId: agentId,
+      status: "active",
+    });
+    const evidence = action.evidence as Record<string, unknown>;
+    expect(evidence).toMatchObject({
+      sourceIssueId: issueId,
+      previousStatus: "in_progress",
+      consecutiveZeroWriteRuns: 3,
+      threshold: 3,
+      lane: "engineering",
+      ownerAgentId: engineeringAgentId,
+    });
+    expect(evidence.sampleRunIds).toEqual(runIds.slice().reverse());
+
+    // Activity log must record the handoff with the discriminator.
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.action, "issue.updated"),
+        ),
+      );
+    const handoffActivity = activityRows.find((row) => {
+      const details = row.details as Record<string, unknown> | undefined;
+      return details?.source === "recovery.reconcile_write_tooling_failure_handoff";
+    });
+    expect(handoffActivity).toBeTruthy();
+    expect(handoffActivity?.details as Record<string, unknown>).toMatchObject({
+      status: "blocked",
+      previousStatus: "in_progress",
+      recoveryCause: "agent_completed_with_zero_writes",
+      recoveryKind: "handoff_to_engineering",
+      recoveryLane: "engineering",
+      consecutiveZeroWriteRuns: 3,
+      threshold: 3,
+    });
+  });
+
+  it("does not fire write-tooling classifier when one of the recent runs produced a comment (RUAAAAA-2377)", async () => {
+    // The third (newest) run landed a comment, so the lane was
+    // writeable at that point. The classifier must NOT fire because
+    // the consecutive-zero-write counter is only 2 (the first two),
+    // which is below the threshold of 3.
+    const { companyId, engineeringAgentId, issueId } =
+      await seedConsecutiveFailedRunsFixture({
+        runCount: 3,
+        writeOnRunIndexes: [2], // newest run produced a write
+        includeEngineeringAgent: true,
+      });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.writeToolingFailureHandoff).toBe(0);
+    expect(result.escalated).toBe(1); // falls through to existing escalation
+
+    // Source issue must stay with the assignee (the existing
+    // stranded_assigned_issue escalation reassigns to a recovery owner
+    // from the fallback chain — but Engineering must NOT be the
+    // recovery owner for this case, because the pattern didn't match).
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(sourceIssue?.status).toBe("blocked");
+    expect(sourceIssue?.assigneeAgentId).not.toBe(engineeringAgentId);
+
+    // No handoff_to_engineering action must have been created.
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      );
+    expect(actionRows.filter((row) => row.kind === "handoff_to_engineering")).toHaveLength(0);
+  });
+
+  it("does not fire write-tooling classifier when the agent ships at least one write per run (RUAAAAA-2377)", async () => {
+    // Healthy agent that writes a comment every run. Even with 5
+    // failed runs in a row, every run produced a write, so the
+    // classifier must never fire — this is a real productivity
+    // failure, not a write-tooling failure.
+    const { companyId, engineeringAgentId, issueId } =
+      await seedConsecutiveFailedRunsFixture({
+        runCount: 5,
+        writeOnRunIndexes: [0, 1, 2, 3, 4], // every run wrote a comment
+        includeEngineeringAgent: true,
+      });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.writeToolingFailureHandoff).toBe(0);
+
+    // No handoff_to_engineering action must have been created.
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      );
+    expect(actionRows.filter((row) => row.kind === "handoff_to_engineering")).toHaveLength(0);
+
+    // Engineering lane must NOT have been selected as the assignee.
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(sourceIssue?.assigneeAgentId).not.toBe(engineeringAgentId);
+  });
+
+  it("falls back to the existing recovery-owner chain when no engineering lane is invokable (RUAAAAA-2377)", async () => {
+    // Same 3 consecutive zero-write failed runs as the happy-path
+    // test, but the company has no agent with "engineering" in the
+    // title. The classifier still fires, but the owner is picked
+    // from the existing fallback chain. The assignee itself is the
+    // first invokable candidate in that chain (no manager, no cto,
+    // no ceo), so the action records lane=fallback_chain and the
+    // owner is the assignee. The source issue gets flipped to
+    // blocked so the operator notices; the recovery action text
+    // names the missing engineering lane and tells the next operator
+    // to either restore the assignee's write capability or
+    // reassign.
+    const { companyId, agentId, issueId } =
+      await seedConsecutiveFailedRunsFixture({
+        runCount: 3,
+        writeOnRunIndexes: [],
+        includeEngineeringAgent: false,
+      });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.writeToolingFailureHandoff).toBe(1);
+
+    // Source issue gets flipped to blocked (so the operator notices)
+    // and the assignee stays the assignee (the fallback chain picked
+    // the assignee because they are invokable + on budget).
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(sourceIssue?.status).toBe("blocked");
+    expect(sourceIssue?.assigneeAgentId).toBe(agentId);
+
+    // The handoff_to_engineering action is created with
+    // lane=fallback_chain so operators can still see why a
+    // write-tooling recovery action is pointing at the assignee
+    // (the engineering lane was missing).
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      );
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]).toMatchObject({
+      kind: "handoff_to_engineering",
+      cause: "agent_completed_with_zero_writes",
+      ownerAgentId: agentId,
+    });
+    expect((actionRows[0].evidence as Record<string, unknown>).lane).toBe("fallback_chain");
+  });
 });
