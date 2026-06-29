@@ -8,6 +8,103 @@ import {
   buildSandboxNpmInstallCommand,
   getAdapterSessionManagement,
 } from "@paperclipai/adapter-utils";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { logger } from "../middleware/logger.js";
+
+/**
+ * Best-effort lookup of a hermes_local agent's stored Paperclip API key.
+ *
+ * Preferred source: `agent.adapterConfig.claimedApiKeyPath` (the per-agent
+ * `paperclip-claimed-api-key.json` file the agent writes when it claims its
+ * key, generated 2026-06-27 by the per-agent keyfile migration). The
+ * `agent_api_keys` table only stores SHA-256 hashes of keys and cannot
+ * recover the plaintext, so it is not a viable source. The file path is the
+ * canonical source of truth for raw tokens today (see RUAAAAA-2375).
+ *
+ * Behaviour:
+ * - Reads + parses the JSON file at the configured path (resolving a leading
+ *   `~` against `os.homedir()`).
+ * - Returns `parsed.token` when the JSON parses and the token is a non-empty
+ *   string. Tokens are expected to start with `pcp_`; tokens that do not are
+ *   rejected so we never silently inject a malformed/JWT-shaped value.
+ * - Returns `null` (with a warn log) when the path is unset, unreadable,
+ *   malformed, or carries an invalid token. The caller is then responsible
+ *   for falling back to the local JWT path or skipping injection.
+ *
+ * The lookup is run once per `execute()` call. Cache-busting is the caller's
+ * responsibility (the run id is the natural cache key — every wake is one
+ * execute()).
+ */
+async function resolveHermesPaperclipApiKey(
+  agent: { id: string; adapterConfig?: unknown },
+  runId: string,
+): Promise<string | null> {
+  const adapterConfig =
+    agent.adapterConfig && typeof agent.adapterConfig === "object"
+      ? (agent.adapterConfig as Record<string, unknown>)
+      : null;
+  const rawPath = adapterConfig?.claimedApiKeyPath;
+  if (typeof rawPath !== "string" || rawPath.trim().length === 0) {
+    return null;
+  }
+  const trimmed = rawPath.trim();
+  let resolved: string;
+  if (trimmed === "~" || trimmed.startsWith("~/") || trimmed.startsWith("~\\")) {
+    resolved = path.join(os.homedir(), trimmed.slice(1).replace(/^[\\/]+/, ""));
+  } else {
+    resolved = trimmed;
+  }
+  let raw: string;
+  try {
+    raw = await fs.promises.readFile(resolved, "utf-8");
+  } catch (err) {
+    logger.warn(
+      { agentId: agent.id, runId, claimedApiKeyPath: resolved, err: err instanceof Error ? err.message : String(err) },
+      "[hermes_local] PAPERCLIP_API_KEY source unreadable; falling back to JWT path",
+    );
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    logger.warn(
+      { agentId: agent.id, runId, claimedApiKeyPath: resolved, err: err instanceof Error ? err.message : String(err) },
+      "[hermes_local] claimedApiKeyPath file is not valid JSON; falling back to JWT path",
+    );
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") {
+    logger.warn(
+      { agentId: agent.id, runId, claimedApiKeyPath: resolved },
+      "[hermes_local] claimedApiKeyPath JSON is not an object; falling back to JWT path",
+    );
+    return null;
+  }
+  const token = (parsed as { token?: unknown }).token;
+  if (typeof token !== "string" || token.trim().length === 0) {
+    logger.warn(
+      { agentId: agent.id, runId, claimedApiKeyPath: resolved },
+      "[hermes_local] claimedApiKeyPath JSON missing .token; falling back to JWT path",
+    );
+    return null;
+  }
+  const trimmedToken = token.trim();
+  // Defense-in-depth: the agent_api_keys table only ever stores tokens
+  // minted via server/src/services/agents.ts:createApiKey which produces
+  // `pcp_<random>` strings. Reject anything that does not match so we never
+  // silently inject a raw JWT or other unrelated value.
+  if (!trimmedToken.startsWith("pcp_")) {
+    logger.warn(
+      { agentId: agent.id, runId, claimedApiKeyPath: resolved, tokenPrefix: trimmedToken.slice(0, 4) },
+      "[hermes_local] claimedApiKeyPath token does not look like a Paperclip api key; falling back to JWT path",
+    );
+    return null;
+  }
+  return trimmedToken;
+}
 import {
   execute as acpxExecute,
   testEnvironment as acpxTestEnvironment,
@@ -407,7 +504,7 @@ const hermesLocalAdapter: ServerAdapterModule = {
   type: "hermes_local",
   execute: async (ctx) => {
     const normalizedCtx = normalizeHermesConfig(ctx);
-    if (!normalizedCtx.authToken) return executeHermesLocal(normalizedCtx);
+    if (!normalizedCtx.authToken && !normalizedCtx.agent?.id) return executeHermesLocal(normalizedCtx);
 
     const existingConfig = (normalizedCtx.agent.adapterConfig ?? {}) as Record<string, unknown>;
     const existingEnv =
@@ -427,11 +524,64 @@ const hermesLocalAdapter: ServerAdapterModule = {
       "Never use a board, browser, or local-board session for Paperclip API writes.",
     ].join("\n");
 
+    // RUAAAAA-2375: prefer the agent's stored Paperclip API key (read from the
+    // per-agent `paperclip-claimed-api-key.json` written when the agent claimed
+    // its key) over the local-agent JWT issued by `createLocalAgentJwt`. The
+    // JWT path silently fails in production — the signature verifies but the
+    // agent lookup in actorMiddleware returns null, so every route returns
+    // 401. The stored token works for both reads and writes today.
+    //
+    // Cache the lookup at run start so we only hit the filesystem once per
+    // wake even if Hermes shells out multiple Paperclip API calls.
+    //
+    // Fallback order:
+    //   1. explicit existingConfig.env.PAPERCLIP_API_KEY (operator override — never overwritten)
+    //   2. stored api_key from adapterConfig.claimedApiKeyPath  ← preferred
+    //   3. normalizedCtx.authToken (the local JWT)             ← legacy / unmigrated agents
+    //
+    // We deliberately do NOT set `supportsLocalAgentJwt: false` on the
+    // hermes_local adapter so the heartbeat path can still issue the JWT
+    // upstream; this branch only decides what we inject into the child env.
+    const runId = normalizedCtx.runId;
+    const agentId = normalizedCtx.agent?.id ?? "unknown";
+    let resolvedStoredKey: string | null = null;
+    if (!explicitApiKey) {
+      try {
+        resolvedStoredKey = await resolveHermesPaperclipApiKey(normalizedCtx.agent, runId);
+      } catch (err) {
+        // resolveHermesPaperclipApiKey already logs; swallow so we still take the JWT path.
+        resolvedStoredKey = null;
+      }
+    }
+
+    let injectedApiKey: string | null = null;
+    let injectedSource: "explicit" | "claimedApiKeyPath" | "authToken" | null = null;
+    if (explicitApiKey) {
+      // Operator-supplied takes priority; leave it alone.
+      injectedApiKey = existingEnv.PAPERCLIP_API_KEY;
+      injectedSource = "explicit";
+    } else if (resolvedStoredKey) {
+      injectedApiKey = resolvedStoredKey;
+      injectedSource = "claimedApiKeyPath";
+    } else if (normalizedCtx.authToken) {
+      injectedApiKey = normalizedCtx.authToken;
+      injectedSource = "authToken";
+      logger.warn(
+        { agentId, runId },
+        "[hermes_local] no stored api_key; falling back to local-agent JWT (broken for hermes_local — RUAAAAA-2375)",
+      );
+    } else {
+      logger.warn(
+        { agentId, runId },
+        "[hermes_local] no PAPERCLIP_API_KEY source available; child will run without one (writes will 401)",
+      );
+    }
+
     const patchedConfig: Record<string, unknown> = {
       ...existingConfig,
       env: {
         ...existingEnv,
-        ...(!explicitApiKey ? { PAPERCLIP_API_KEY: normalizedCtx.authToken } : {}),
+        ...(injectedApiKey ? { PAPERCLIP_API_KEY: injectedApiKey } : {}),
         PAPERCLIP_RUN_ID: normalizedCtx.runId,
       },
     };
@@ -441,6 +591,13 @@ const hermesLocalAdapter: ServerAdapterModule = {
     // overwriting it with only the auth guard text would strip the assigned issue/workflow instructions.
     if (promptTemplate) {
       patchedConfig.promptTemplate = `${authGuardPrompt}\n\n${promptTemplate}`;
+    }
+
+    if (injectedSource && injectedSource !== "explicit") {
+      logger.info(
+        { agentId, runId, source: injectedSource },
+        "[hermes_local] injecting PAPERCLIP_API_KEY for child process",
+      );
     }
 
     const patchedCtx = {

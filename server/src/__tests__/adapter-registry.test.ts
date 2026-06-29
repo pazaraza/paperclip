@@ -385,9 +385,12 @@ describe("server adapter registry", () => {
     expect(patchedCtx.agent.adapterConfig.env.PAPERCLIP_API_KEY).toBe("agent-run-jwt");
   });
 
-  it("passes the original Hermes context through when authToken is absent", async () => {
+  it("preserves explicit operator PAPERCLIP_API_KEY when authToken is absent (no jwt, no file lookup)", async () => {
+    // RUAAAAA-2375: when neither authToken nor claimedApiKeyPath yields a key,
+    // the operator-supplied PAPERCLIP_API_KEY (if any) MUST be preserved. We
+    // do not strip or rewrite it just because no other source is available.
     const adapter = requireServerAdapter("hermes_local");
-    const ctx = {
+    const ctx: any = {
       runId: "run-123",
       agent: {
         id: "agent-123",
@@ -413,7 +416,17 @@ describe("server adapter registry", () => {
     await adapter.execute(ctx);
 
     expect(hermesExecuteMock).toHaveBeenCalledTimes(1);
-    expect(hermesExecuteMock).toHaveBeenCalledWith(ctx);
+    const [patchedCtx] = hermesExecuteMock.mock.calls[0];
+    // Operator-supplied key is preserved verbatim and PAPERCLIP_RUN_ID is
+    // refreshed from the live run id.
+    expect(patchedCtx.agent.adapterConfig.env.PAPERCLIP_API_KEY).toBe("server-level-key");
+    expect(patchedCtx.agent.adapterConfig.env.PAPERCLIP_RUN_ID).toBe("run-123");
+    // Auth-guard prompt is still prepended because a custom promptTemplate
+    // exists, preserving the prior behaviour.
+    expect(patchedCtx.agent.adapterConfig.promptTemplate).toContain(
+      "Authorization: Bearer $PAPERCLIP_API_KEY",
+    );
+    expect(patchedCtx.agent.adapterConfig.promptTemplate).toContain("Existing prompt");
   });
 
   it("preserves an explicit Hermes Paperclip API key and does not set promptTemplate when none was configured", async () => {
