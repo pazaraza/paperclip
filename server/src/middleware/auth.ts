@@ -20,7 +20,7 @@ interface ActorMiddlewareOptions {
 
 export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHandler {
   const boardAuth = boardAuthService(db);
-  return async (req, _res, next) => {
+  return async (req, res, next) => {
     req.actor =
       opts.deploymentMode === "local_trusted"
         ? {
@@ -138,8 +138,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
     if (!key) {
       const claims = verifyLocalAgentJwt(token);
       if (!claims) {
-        next();
-        return;
+        return rejectJwtGuard(req, res, "signature", { token });
       }
 
       const agentRecord = await db
@@ -148,14 +147,28 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         .where(eq(agents.id, claims.sub))
         .then((rows) => rows[0] ?? null);
 
-      if (!agentRecord || agentRecord.companyId !== claims.company_id) {
-        next();
-        return;
+      if (!agentRecord) {
+        return rejectJwtGuard(req, res, "agent_lookup", {
+          claims,
+          agentRecord: null,
+          agentStatus: null,
+        });
+      }
+
+      if (agentRecord.companyId !== claims.company_id) {
+        return rejectJwtGuard(req, res, "company_mismatch", {
+          claims,
+          agentRecord,
+          agentStatus: agentRecord.status,
+        });
       }
 
       if (agentRecord.status === "terminated" || agentRecord.status === "pending_approval") {
-        next();
-        return;
+        return rejectJwtGuard(req, res, "status_inactive", {
+          claims,
+          agentRecord,
+          agentStatus: agentRecord.status,
+        });
       }
 
       req.actor = {
@@ -344,4 +357,45 @@ function issuePrefixForCloudStack(stackId: string): string {
 
 export function requireBoard(req: Express.Request) {
   return req.actor.type === "board";
+}
+
+export type JwtGuard = "signature" | "agent_lookup" | "company_mismatch" | "status_inactive";
+
+interface RejectJwtGuardDiagnostic {
+  claims?: unknown;
+  agentRecord?: unknown;
+  agentStatus?: string | null;
+  token?: string;
+}
+
+function rejectJwtGuard(
+  req: Request,
+  res: import("express").Response,
+  guard: JwtGuard,
+  diagnostic: RejectJwtGuardDiagnostic,
+) {
+  const runIdFromClaims =
+    diagnostic.claims && typeof diagnostic.claims === "object" && "run_id" in diagnostic.claims
+      ? (diagnostic.claims as { run_id?: unknown }).run_id
+      : undefined;
+  const body: { error: string; guard: JwtGuard; runId?: string } = {
+    error: "Unauthorized",
+    guard,
+    ...(typeof runIdFromClaims === "string" && runIdFromClaims.length > 0
+      ? { runId: runIdFromClaims }
+      : {}),
+  };
+  logger.warn(
+    {
+      guard,
+      method: req.method,
+      url: req.originalUrl,
+      runIdHeader: req.header("x-paperclip-run-id") ?? null,
+      claims: diagnostic.claims ?? null,
+      agentRecord: diagnostic.agentRecord ?? null,
+      agentStatus: diagnostic.agentStatus ?? null,
+    },
+    `JWT auth rejected: guard=${guard}`,
+  );
+  res.status(401).json(body);
 }
