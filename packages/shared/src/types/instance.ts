@@ -13,8 +13,20 @@ export interface BackupRetentionPolicy {
   monthlyMonths: (typeof MONTHLY_RETENTION_PRESETS)[number];
 }
 
+/**
+ * Default backup retention policy used when an instance has not explicitly
+ * configured one. Tuned for the default hourly backup cadence so that
+ * steady-state disk usage stays bounded at roughly ~77 files / ~26 GB at our
+ * current DB size; the previous `dailyDays: 7` default yielded ~168 hourly
+ * backups (~57 GB) and pushed the live instance into a 99% disk-fill
+ * incident (RUAAAAA-3132). The schema restricts `dailyDays` to the preset
+ * values `[3, 7, 14]`, so `3` is the smallest defensible default. Bumping
+ * this back up without an explicit override and an updated CI guard in
+ * `packages/shared/src/types/instance.test.ts` will fail the build — see
+ * RUAAAAA-3133.
+ */
 export const DEFAULT_BACKUP_RETENTION: BackupRetentionPolicy = {
-  dailyDays: 7,
+  dailyDays: 3,
   weeklyWeeks: 4,
   monthlyMonths: 1,
 };
