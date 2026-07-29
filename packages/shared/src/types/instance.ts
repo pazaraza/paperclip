@@ -1,6 +1,6 @@
 import type { FeedbackDataSharingPreference } from "./feedback.js";
 
-export const DAILY_RETENTION_PRESETS = [3, 7, 14] as const;
+export const DAILY_RETENTION_PRESETS = [1, 3, 7, 14] as const;
 export const WEEKLY_RETENTION_PRESETS = [1, 2, 4] as const;
 export const MONTHLY_RETENTION_PRESETS = [1, 3, 6] as const;
 export const DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS = 24;
@@ -20,10 +20,13 @@ export interface BackupRetentionPolicy {
  * current DB size; the previous `dailyDays: 7` default yielded ~168 hourly
  * backups (~57 GB) and pushed the live instance into a 99% disk-fill
  * incident (RUAAAAA-3132). The schema restricts `dailyDays` to the preset
- * values `[3, 7, 14]`, so `3` is the smallest defensible default. Bumping
- * this back up without an explicit override and an updated CI guard in
- * `packages/shared/src/types/instance.test.ts` will fail the build — see
- * RUAAAAA-3133.
+ * values `[1, 3, 7, 14]`. `1` is the smallest defensible floor for
+ * operators on tight disks (RUAAAAA-3176 added it); we keep the default at
+ * `3` because a fresh new instance with no operator awareness of its DB
+ * growth trajectory still gets a 3-day daily tier as a safer baseline.
+ * Bumping the default back up without an explicit override and an updated
+ * CI guard in `packages/shared/src/types/instance.test.ts` will fail the
+ * build — see RUAAAAA-3133.
  */
 export const DEFAULT_BACKUP_RETENTION: BackupRetentionPolicy = {
   dailyDays: 3,
