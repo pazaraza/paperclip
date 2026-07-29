@@ -27,6 +27,30 @@ const sharedOpts = {
   singleLine: true,
 };
 
+// Log rotation policy (RUAAAAA-3192):
+// - Implemented via pino-roll transport (size-based + daily cap)
+// - Filenames follow pino-roll's `filename.date.count.extension` convention, e.g.
+//     server.2026-07-29.1.log  ← active file (today, count 1)
+//     server.2026-07-29.2.log  ← rotated today (if a second rotation happens)
+//     server.2026-07-28.1.log  ← yesterday's first
+//   With limit.count=2 + removeOtherLogFiles=true, pino-roll v4 keeps exactly
+//   `count` files on disk (1 active + 1 most-recent rotated), so the worst-case
+//   footprint is ~200 MiB at the 100 MiB size cap.
+// - The transport calls `destination.reopen(newFileName)` after flushing
+//   buffered writes, so the new active file handle is in place before the next
+//   log line — recovery from a rotated log is automatic with no process restart.
+// - `limit.removeOtherLogFiles: true` is set so legacy files (e.g. a pre-rotation
+//   `server.log` without date/count segments) are also reaped on the next
+//   rotation cycle.
+// - Override via env vars:
+//     PAPERCLIP_LOG_ROTATE_SIZE   size string (default "100m")
+//     PAPERCLIP_LOG_ROTATE_COUNT  number of files to keep (default 2)
+// NOTE: pino-roll's parseSize() treats raw numbers as MB (multiplier 1024^2),
+// so we deliberately pass the size as a string with an explicit "m" suffix to
+// avoid double-multiplication. Use the env var only with a unit ("k", "m", "g").
+const logRotateSize = process.env.PAPERCLIP_LOG_ROTATE_SIZE?.trim() || "100m";
+const logRotateCount = Number.parseInt(process.env.PAPERCLIP_LOG_ROTATE_COUNT ?? "", 10) || 2;
+
 export const logger = pino({
   level: "debug",
   redact: ["req.headers.authorization"],
@@ -38,8 +62,19 @@ export const logger = pino({
       level: "info",
     },
     {
-      target: "pino-pretty",
-      options: { ...sharedOpts, colorize: false, destination: logFile, mkdir: true },
+      target: "pino-roll",
+      options: {
+        file: logFile,
+        size: logRotateSize,
+        frequency: "daily",
+        dateFormat: "yyyy-MM-dd",
+        extension: "log",
+        mkdir: true,
+        limit: {
+          count: logRotateCount,
+          removeOtherLogFiles: true,
+        },
+      },
       level: "debug",
     },
   ],
