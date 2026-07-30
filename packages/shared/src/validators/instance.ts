@@ -5,6 +5,8 @@ import {
   WEEKLY_RETENTION_PRESETS,
   MONTHLY_RETENTION_PRESETS,
   DEFAULT_BACKUP_RETENTION,
+  DEFAULT_RUN_LOG_RETENTION,
+  RUN_LOG_RETENTION_PRESETS,
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   MAX_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -24,6 +26,21 @@ export const backupRetentionPolicySchema = z.object({
   monthlyMonths: presetSchema(MONTHLY_RETENTION_PRESETS, "monthlyMonths").default(DEFAULT_BACKUP_RETENTION.monthlyMonths),
 });
 
+/**
+ * Validator for the per-instance run-log retention policy (RUAAAAA-3219).
+ *
+ * Mirrors `backupRetentionPolicySchema`: a single preset field that the
+ * sweep in `server/src/index.ts` reads live from `instance_settings.general`
+ * (no restart). The narrow preset set keeps operators from accidentally
+ * setting `1d` (which would erase most of the recovery-service's evidence
+ * depth at the source — see `server/src/services/recovery/service.ts:809`).
+ */
+export const runLogRetentionPolicySchema = z.object({
+  retentionDays: presetSchema(RUN_LOG_RETENTION_PRESETS, "retentionDays").default(
+    DEFAULT_RUN_LOG_RETENTION.retentionDays,
+  ),
+});
+
 export const instanceGeneralSettingsSchema = z.object({
   censorUsernameInLogs: z.boolean().default(false),
   keyboardShortcuts: z.boolean().default(false),
@@ -31,6 +48,7 @@ export const instanceGeneralSettingsSchema = z.object({
     DEFAULT_FEEDBACK_DATA_SHARING_PREFERENCE,
   ),
   backupRetention: backupRetentionPolicySchema.default(DEFAULT_BACKUP_RETENTION),
+  runLogsRetention: runLogRetentionPolicySchema.default(DEFAULT_RUN_LOG_RETENTION),
 }).strict();
 
 export const patchInstanceGeneralSettingsSchema = instanceGeneralSettingsSchema.partial();

@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
   DAILY_RETENTION_PRESETS,
   DEFAULT_BACKUP_RETENTION,
+  DEFAULT_RUN_LOG_RETENTION,
   MONTHLY_RETENTION_PRESETS,
+  RUN_LOG_RETENTION_PRESETS,
   WEEKLY_RETENTION_PRESETS,
 } from "./instance.js";
 
@@ -74,5 +76,49 @@ describe("DEFAULT_BACKUP_RETENTION (RUAAAAA-3133 guard)", () => {
     // silently regressed to [3, 7, 14] and broke the live instance's ability
     // to opt into the smallest tier.
     expect(DAILY_RETENTION_PRESETS).toContain(1);
+  });
+});
+
+/**
+ * Regression guards for the default run-log retention policy.
+ *
+ * Discovered during the RUAAAAA-3219 work: before this feature the per-run
+ * ndjson tree under `instances/default/data/run-logs/<company>/<agent>/<run>.ndjson`
+ * had no retention guard at all. The RUAAAAA-3200 audit measured 4.27 GiB /
+ * 64,961 files across the 14 active companies, growing at ~25 MiB/day; left
+ * alone, the same trajectory would push the live instance into disk-pressure
+ * within ~3 months (RUAAAAA-3186 was the emergency).
+ *
+ * The intent of these tests is two-fold:
+ *
+ *  1. Pin `retentionDays` to `30` (the preset middle that yields ~1.4 GiB
+ *     steady-state at our current rate). Bumping it back up to `60`/`90`
+ *     without an explicit override and an update to this guard is a build
+ *     failure waiting to happen.
+ *  2. Pin the preset set membership so a future PR cannot silently remove
+ *     `7` (the tight-disk option) or grow the set past `90` (which would
+ *     erase the disk-pressure protection entirely for operators).
+ *
+ * If the right answer is `retentionDays > 30` for your deployment, update
+ * the comment above and link the new issue — same procedure as
+ * `DEFAULT_BACKUP_RETENTION`.
+ */
+describe("DEFAULT_RUN_LOG_RETENTION (RUAAAAA-3219 guard)", () => {
+  it("pins retentionDays to 30 (the post-3219 default; not 60, not 90)", () => {
+    expect(DEFAULT_RUN_LOG_RETENTION.retentionDays).toBe(30);
+  });
+
+  it("stays within the validator preset set", () => {
+    expect(RUN_LOG_RETENTION_PRESETS).toContain(DEFAULT_RUN_LOG_RETENTION.retentionDays);
+  });
+
+  it("caps the maximum retention at 90 days (no-shrink past 90 days guard)", () => {
+    expect(Math.max(...RUN_LOG_RETENTION_PRESETS)).toBeLessThanOrEqual(90);
+  });
+
+  it("keeps the 7-day floor in the preset set (tight-disk option)", () => {
+    // Without `7`, operators on tight disks lose the ability to opt into the
+    // smallest retention tier without a code change.
+    expect(RUN_LOG_RETENTION_PRESETS).toContain(7);
   });
 });

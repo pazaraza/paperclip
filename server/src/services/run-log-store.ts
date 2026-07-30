@@ -27,6 +27,52 @@ export interface RunLogFinalizeSummary {
   compressed: boolean;
 }
 
+export interface RunLogRetentionLimits {
+  /**
+   * Maximum age, in milliseconds, for any retained per-run ndjson file. Files
+   * strictly older than `now - retentionMs` (by mtime) are deleted.
+   *
+   * Required.
+   */
+  retentionMs: number;
+  /**
+   * Maximum number of files to delete in a single sweep. When the limit is
+   * hit the sweep returns early with `hitLimit: true` so the caller can
+   * re-schedule; this keeps a single stale run from blowing a sweep budget
+   * on a multi-million-file backlog. Pass `Infinity` (or omit) for no cap.
+   */
+  maxDeleteCount?: number;
+  /**
+   * Optional whitelist of company directories the sweep is allowed to
+   * prune. Top-level dirs in `basePath` that are NOT in this set are
+   * skipped entirely — they may be orphan external-run-id dirs from a
+   * pre-migration adapter (RUAAAAA-3200 audit) and must not be touched
+   * by an automated sweep.
+   *
+   * When omitted, the sweep prunes all well-formed `<companyId>/<agentId>/*.ndjson`
+   * files regardless of company.
+   */
+  allowedCompanyIds?: ReadonlySet<string>;
+  /**
+   * Override the wall-clock used for the cutoff. Defaults to `Date.now()`.
+   * Tests inject a fixed clock here so they don't need to backdate mtimes.
+   */
+  now?: () => number;
+}
+
+export interface RunLogRetentionResult {
+  prunedCount: number;
+  bytesReclaimed: number;
+  /** True when `maxDeleteCount` was hit and the sweep returned early. */
+  hitLimit: boolean;
+  /**
+   * Companies whose top-level dirs were skipped (not in `allowedCompanyIds`,
+   * or no longer present in the DB at sweep time). Useful for operator
+   * diagnostics; not strictly required by callers.
+   */
+  skippedCompanyDirs: string[];
+}
+
 export interface RunLogStore {
   begin(input: { companyId: string; agentId: string; runId: string }): Promise<RunLogHandle>;
   append(
@@ -35,6 +81,17 @@ export interface RunLogStore {
   ): Promise<number>;
   finalize(handle: RunLogHandle): Promise<RunLogFinalizeSummary>;
   read(handle: RunLogHandle, opts?: RunLogReadOptions): Promise<RunLogReadResult>;
+  /**
+   * Sweep the on-disk store and delete per-run ndjson files older than
+   * `limits.retentionMs`. Never touches:
+   *   - top-level dirs that aren't in `limits.allowedCompanyIds` (when provided)
+   *   - files where mtime is fresher than the cutoff
+   *   - non-`.ndjson` files (only the active store shape deletes)
+   *
+   * Returns aggregate counts; idempotent and safe to re-run. See
+   * RUAAAAA-3219.
+   */
+  pruneOlderThan(limits: RunLogRetentionLimits): Promise<RunLogRetentionResult>;
 }
 
 function safeSegments(...segments: string[]) {
@@ -48,6 +105,10 @@ function resolveWithin(basePath: string, relativePath: string) {
     throw new Error("Invalid log path");
   }
   return resolved;
+}
+
+function _createLocalFileRunLogStoreForTests(basePath: string): RunLogStore {
+  return createLocalFileRunLogStore(basePath);
 }
 
 function createLocalFileRunLogStore(basePath: string): RunLogStore {
@@ -144,6 +205,106 @@ function createLocalFileRunLogStore(basePath: string): RunLogStore {
       const limitBytes = opts?.limitBytes ?? 256_000;
       return readFileRange(absPath, offset, limitBytes);
     },
+
+    async pruneOlderThan(limits) {
+      const retentionMs = limits.retentionMs;
+      if (!Number.isFinite(retentionMs) || retentionMs <= 0) {
+        throw new Error("retentionMs must be a positive finite number");
+      }
+      const now = limits.now ?? Date.now;
+      const cutoff = now() - retentionMs;
+      const maxDeleteCount = limits.maxDeleteCount ?? Number.POSITIVE_INFINITY;
+      const allowedCompanyIds = limits.allowedCompanyIds ?? null;
+
+      let prunedCount = 0;
+      let bytesReclaimed = 0;
+      let hitLimit = false;
+      const skippedCompanyDirs: string[] = [];
+
+      let topLevelEntries: import("node:fs").Dirent[];
+      try {
+        topLevelEntries = await fs.readdir(basePath, { withFileTypes: true });
+      } catch (err: any) {
+        if (err && err.code === "ENOENT") {
+          // Store directory doesn't exist yet (fresh instance): no-op.
+          return { prunedCount: 0, bytesReclaimed: 0, hitLimit: false, skippedCompanyDirs };
+        }
+        throw err;
+      }
+
+      outer: for (const topLevel of topLevelEntries) {
+        if (!topLevel.isDirectory()) continue;
+        const companyDirName = topLevel.name;
+        const companyDirAbs = resolveWithin(basePath, companyDirName);
+
+        // Per-company scope guard — when an allowlist is provided we prune
+        // only those top-level dirs that look like real Paperclip companies.
+        // Without an allowlist we still walk every dir, but we never touch
+        // files that aren't shaped like `<dir>/<dir>/<file>.ndjson`.
+        if (allowedCompanyIds && !allowedCompanyIds.has(companyDirName)) {
+          skippedCompanyDirs.push(companyDirName);
+          continue;
+        }
+
+        let agentEntries: import("node:fs").Dirent[];
+        try {
+          agentEntries = await fs.readdir(companyDirAbs, { withFileTypes: true });
+        } catch {
+          continue;
+        }
+
+        for (const agentEntry of agentEntries) {
+          if (!agentEntry.isDirectory()) continue;
+          const agentDirAbs = resolveWithin(companyDirAbs, agentEntry.name);
+
+          let runEntries: import("node:fs").Dirent[];
+          try {
+            runEntries = await fs.readdir(agentDirAbs, { withFileTypes: true });
+          } catch {
+            continue;
+          }
+
+          for (const runEntry of runEntries) {
+            if (runEntry.isDirectory()) continue;
+            if (!runEntry.name.endsWith(".ndjson")) continue;
+
+            const runFileAbs = resolveWithin(agentDirAbs, runEntry.name);
+            let stat;
+            try {
+              stat = await fs.stat(runFileAbs);
+            } catch {
+              continue;
+            }
+            if (!stat.isFile()) continue;
+
+            // mtimeMs is fractional; a tiny in-band delta (files just inside
+            // the boundary) must not be deleted. Use strict `< cutoff`.
+            if (stat.mtimeMs >= cutoff) continue;
+
+            if (prunedCount >= maxDeleteCount) {
+              hitLimit = true;
+              break outer;
+            }
+
+            try {
+              await fs.unlink(runFileAbs);
+              prunedCount += 1;
+              bytesReclaimed += stat.size;
+            } catch (err: any) {
+              if (err && (err.code === "ENOENT" || err.code === "EACCES")) {
+                // Already gone (concurrent sweep) or no permission to remove:
+                // skip silently. A persistent permission issue will surface
+                // on the next sweep tick when mtime is still in the past.
+                continue;
+              }
+              throw err;
+            }
+          }
+        }
+      }
+
+      return { prunedCount, bytesReclaimed, hitLimit, skippedCompanyDirs };
+    },
   };
 }
 
@@ -154,4 +315,14 @@ export function getRunLogStore() {
   const basePath = process.env.RUN_LOG_BASE_PATH ?? path.resolve(resolvePaperclipInstanceRoot(), "data", "run-logs");
   cachedStore = createLocalFileRunLogStore(basePath);
   return cachedStore;
+}
+
+/**
+ * Test-only factory: builds a fresh `RunLogStore` rooted at `basePath` without
+ * touching the module-level cache that `getRunLogStore()` returns. Used by
+ * `server/src/__tests__/run-log-store.test.ts` to spin isolated per-test
+ * fixtures under `os.tmpdir()` and assert prune behavior deterministically.
+ */
+export function createRunLogStoreForTests(basePath: string): RunLogStore {
+  return _createLocalFileRunLogStoreForTests(basePath);
 }

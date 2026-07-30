@@ -3,6 +3,22 @@ import type { FeedbackDataSharingPreference } from "./feedback.js";
 export const DAILY_RETENTION_PRESETS = [1, 3, 7, 14] as const;
 export const WEEKLY_RETENTION_PRESETS = [1, 2, 4] as const;
 export const MONTHLY_RETENTION_PRESETS = [1, 3, 6] as const;
+
+/**
+ * Run-log retention presets (in days).
+ *
+ * The default hourly cadence produces ~400 Paperclip runs/day ≈ ~25 MiB/day;
+ * without an active retention guard the per-run ndjson tree accumulates
+ * without bound (RUAAAAA-3200 audit measured 4.27 GiB / 64,961 files across
+ * 14 active companies at the time the feature was proposed). The preset set
+ * is intentionally narrow so operators trade off disk usage against
+ * recovery-service evidence depth (recovery reads the per-run logs via
+ * `server/src/services/recovery/service.ts:809` to auto-clear stranded runs).
+ *
+ * Allowed values: 7, 14, 30, 60, 90. The 30d default is a balanced middle
+ * (≈1.4 GiB steady-state at our current run rate) — see RUAAAAA-3219.
+ */
+export const RUN_LOG_RETENTION_PRESETS = [7, 14, 30, 60, 90] as const;
 export const DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS = 24;
 export const MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS = 1;
 export const MAX_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS = 24 * 30;
@@ -34,11 +50,32 @@ export const DEFAULT_BACKUP_RETENTION: BackupRetentionPolicy = {
   monthlyMonths: 1,
 };
 
+export interface RunLogRetentionPolicy {
+  retentionDays: (typeof RUN_LOG_RETENTION_PRESETS)[number];
+}
+
+/**
+ * Default run-log retention policy used when an instance has not explicitly
+ * configured one. Tuned for the default Paperclip run cadence so the per-run
+ * ndjson tree stays bounded — see RUAAAAA-3219. The previous behavior was no
+ * guard at all, which let the on-disk accumulator grow toward ~3 months
+ * before hitting disk-pressure (RUAAAAA-3200 audit). The schema restricts
+ * `retentionDays` to the preset values `[7, 14, 30, 60, 90]`; `30` is the
+ * balanced middle (≈1.4 GiB steady-state at our current ~25 MiB/day rate).
+ * Bumping the default back up without an explicit override and an updated
+ * CI guard in `packages/shared/src/types/instance.test.ts` will fail the
+ * build — see RUAAAAA-3219.
+ */
+export const DEFAULT_RUN_LOG_RETENTION: RunLogRetentionPolicy = {
+  retentionDays: 30,
+};
+
 export interface InstanceGeneralSettings {
   censorUsernameInLogs: boolean;
   keyboardShortcuts: boolean;
   feedbackDataSharingPreference: FeedbackDataSharingPreference;
   backupRetention: BackupRetentionPolicy;
+  runLogsRetention: RunLogRetentionPolicy;
 }
 
 export interface InstanceExperimentalSettings {
