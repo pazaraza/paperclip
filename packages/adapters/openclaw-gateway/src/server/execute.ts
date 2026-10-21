@@ -52,6 +52,7 @@ type GatewayResponseFrame = {
   error?: {
     code?: unknown;
     message?: unknown;
+    details?: unknown;
   };
 };
 
@@ -72,6 +73,16 @@ type PendingRequest = {
 type GatewayResponseError = Error & {
   gatewayCode?: string;
   gatewayDetails?: Record<string, unknown>;
+  /**
+   * Postgres-specific conflict identity promoted out of `gatewayDetails` by
+   * `handleMessage` (RUAAAAA-5209). Present only when both a 5-digit SQLSTATE
+   * `code` and a `constraint` name were recoverable from the error frame, so
+   * `isRoutineExecutionOpenConflict` can recognise a real constraint
+   * violation that travelled through the gateway instead of falling back to
+   * 'generic wake error'.
+   */
+  postgresCode?: string;
+  postgresConstraint?: string;
 };
 
 type GatewayClientOptions = {
@@ -796,7 +807,7 @@ function isEventFrame(value: unknown): value is GatewayEventFrame {
   return Boolean(record && record.type === "event" && typeof record.event === "string");
 }
 
-class GatewayWsClient {
+export class GatewayWsClient {
   private ws: WebSocket | null = null;
   private pending = new Map<string, PendingRequest>();
   private challengePromise: Promise<string>;
@@ -980,6 +991,18 @@ class GatewayWsClient {
     const details = asRecord(errorRecord?.details);
     if (code) err.gatewayCode = code;
     if (details) err.gatewayDetails = details;
+
+    // RUAAAAA-5209: promote the postgres (SQLSTATE, constraint) pair out of
+    // `details` onto the thrown error so the server-side
+    // `isRoutineExecutionOpenConflict` can recognise the contention even when
+    // it arrived inside a gateway JSON-RPC error frame. Both fields must be
+    // present; a bare SQLSTATE without a constraint name is not actionable.
+    const postgres = extractPostgresConflictInfo(errorRecord?.details);
+    if (postgres.code && postgres.constraint) {
+      err.postgresCode = postgres.code;
+      err.postgresConstraint = postgres.constraint;
+    }
+
     pending.reject(err);
   }
 }

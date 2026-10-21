@@ -28,11 +28,28 @@ export interface IssueAssignmentWakeupDeps {
  * already exists, so the new INSERT/UPDATE cannot claim the slot. The
  * assignee is NOT at fault — it is a legitimate "another issue is already
  * being executed for this routine" outcome. See RUAAAAA-5205.
+ *
+ * Two shapes are accepted, checked in order:
+ *   1. top-level `code` + `constraint` (direct driver throw, Drizzle).
+ *   2. `postgresCode` + `postgresConstraint` (RUAAAAA-5209) — the pair after
+ *      the OpenClaw gateway adapter promoted it out of the JSON-RPC error
+ *      frame's `details`, where a top-level lookup would miss it.
  */
 export function isRoutineExecutionOpenConflict(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
-  const err = error as { code?: unknown; constraint?: unknown };
-  return err.code === "23505" && err.constraint === "issues_open_routine_execution_uq";
+  const err = error as {
+    code?: unknown;
+    constraint?: unknown;
+    postgresCode?: unknown;
+    postgresConstraint?: unknown;
+  };
+  if (err.code === "23505" && err.constraint === "issues_open_routine_execution_uq") {
+    return true;
+  }
+  return (
+    err.postgresCode === "23505" &&
+    err.postgresConstraint === "issues_open_routine_execution_uq"
+  );
 }
 
 /**

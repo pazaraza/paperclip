@@ -94,6 +94,43 @@ describe("issue-assignment-wakeup conflict handling (RUAAAAA-5205)", () => {
     ).toBe(true);
   });
 
+  it("recognises the gateway-surfaced postgresCode/postgresConstraint pair (RUAAAAA-5209)", () => {
+    // Shape produced by the OpenClaw gateway adapter after handleMessage
+    // promotes the pair out of the JSON-RPC error frame's `details`.
+    expect(
+      isRoutineExecutionOpenConflict({
+        message: "duplicate key value violates unique constraint",
+        gatewayCode: "unique_violation",
+        postgresCode: "23505",
+        postgresConstraint: "issues_open_routine_execution_uq",
+      }),
+    ).toBe(true);
+
+    // Wrong constraint on the prefixed pair must not match.
+    expect(
+      isRoutineExecutionOpenConflict({
+        postgresCode: "23505",
+        postgresConstraint: "agents_company_id_name_key",
+      }),
+    ).toBe(false);
+
+    // Half-populated pair must not match.
+    expect(isRoutineExecutionOpenConflict({ postgresCode: "23505" })).toBe(false);
+    expect(
+      isRoutineExecutionOpenConflict({
+        postgresConstraint: "issues_open_routine_execution_uq",
+      }),
+    ).toBe(false);
+
+    // Mismatched halves from two different errors must not match.
+    expect(
+      isRoutineExecutionOpenConflict({
+        postgresCode: "23503",
+        postgresConstraint: "issues_open_routine_execution_uq",
+      }),
+    ).toBe(false);
+  });
+
   it("persists a wake attempt without pinning the agent to status='error'", async () => {
     // Simulate the server-side wakeup rejecting with the
     // issues_open_routine_execution_uq unique-constraint failure.
