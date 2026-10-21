@@ -717,3 +717,216 @@ describe("openclaw gateway testEnvironment", () => {
     expect(result.checks.some((check) => check.code === "openclaw_gateway_url_missing")).toBe(true);
   });
 });
+
+
+async function createMockGatewayServerWithCooldown(options?: {
+  cooldownError?: string;
+  cooldownUntilIso?: string;
+  cooldownTimes?: number;
+  backoffMs?: number;
+}) {
+  const server = createServer();
+  const wss = new WebSocketServer({ server });
+
+  let agentPayload: Record<string, unknown> | null = null;
+  let cooldownCount = 0;
+  const cooldownError = options?.cooldownError ?? "Provider minimax-portal is in cooldown (billing)";
+  const cooldownUntilIso = options?.cooldownUntilIso ?? "2026-10-16T15:00:00.000Z";
+  const maxCooldownReplies = options?.cooldownTimes ?? 2;
+
+  wss.on("connection", (socket) => {
+    socket.send(
+      JSON.stringify({
+        type: "event",
+        event: "connect.challenge",
+        payload: { nonce: "nonce-123" },
+      }),
+    );
+
+    socket.on("message", (raw) => {
+      const text = Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw);
+      const frame = JSON.parse(text) as {
+        type: string;
+        id: string;
+        method: string;
+        params?: Record<string, unknown>;
+      };
+
+      if (frame.type !== "req") return;
+
+      if (frame.method === "connect") {
+        socket.send(
+          JSON.stringify({
+            type: "res",
+            id: frame.id,
+            ok: true,
+            payload: {
+              type: "hello-ok",
+              protocol: 3,
+              server: { version: "test", connId: "conn-1" },
+              features: { methods: ["connect", "agent", "agent.wait"], events: ["agent"] },
+              snapshot: { version: 1, ts: Date.now() },
+              policy: { maxPayload: 1_000_000, maxBufferedBytes: 1_000_000, tickIntervalMs: 30_000 },
+            },
+          }),
+        );
+        return;
+      }
+
+      if (frame.method === "agent") {
+        agentPayload = frame.params ?? null;
+        const runId =
+          typeof frame.params?.idempotencyKey === "string"
+            ? frame.params.idempotencyKey
+            : "run-123";
+        socket.send(
+          JSON.stringify({
+            type: "res",
+            id: frame.id,
+            ok: true,
+            payload: { runId, status: "accepted", acceptedAt: Date.now() },
+          }),
+        );
+        return;
+      }
+
+      if (frame.method === "agent.wait") {
+        if (cooldownCount < maxCooldownReplies) {
+          cooldownCount += 1;
+          socket.send(
+            JSON.stringify({
+              type: "res",
+              id: frame.id,
+              ok: true,
+              payload: {
+                runId: frame.params?.runId,
+                status: "error",
+                error: cooldownError,
+                summary: cooldownError,
+                details: { cooldownUntil: cooldownUntilIso },
+              },
+            }),
+          );
+          return;
+        }
+        socket.send(
+          JSON.stringify({
+            type: "res",
+            id: frame.id,
+            ok: true,
+            payload: {
+              runId: frame.params?.runId,
+              status: "ok",
+              startedAt: 1,
+              endedAt: 2,
+              result: { meta: { provider: "openclaw", model: "minimax-portal/MiniMax-M3" } },
+            },
+          }),
+        );
+      }
+    });
+  });
+
+  await new Promise<void>((resolve) => {
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("Failed to resolve test server address");
+  }
+
+  return {
+    url: `ws://127.0.0.1:${address.port}`,
+    getCooldownCount: () => cooldownCount,
+    close: async () => {
+      await new Promise<void>((resolve) => wss.close(() => resolve()));
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
+
+describe("openclaw gateway cooldown-aware retry/backoff (RUAAAAA-5062)", () => {
+  it("retries agent.wait after a cooldown error and reports provider cooldown in the result", async () => {
+    // Tiny backoff so the test stays fast. Slice stays < 1s if the test sets it to 0, so we cap at 1_000 minimum.
+    const gateway = await createMockGatewayServerWithCooldown({
+      cooldownError: "Provider minimax-portal is in cooldown (billing)",
+      cooldownUntilIso: "2026-10-16T15:00:00.000Z",
+      cooldownTimes: 2,
+    });
+    const logs: string[] = [];
+
+    try {
+      const result = await execute(
+        buildContext(
+          {
+            url: gateway.url,
+            headers: { "x-openclaw-token": "gateway-token" },
+            waitTimeoutMs: 30_000,
+            waitPollIntervalMs: 1_000,
+            cooldownBackoffMs: [500, 500],
+          },
+          {
+            onLog: async (_stream, chunk) => {
+              logs.push(chunk);
+            },
+          },
+        ),
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.timedOut).toBe(false);
+      expect(result.provider).toBe("openclaw");
+      expect(result.resultJson?.cooldown).toBeUndefined(); // only set on error, not on eventual ok
+      expect(gateway.getCooldownCount()).toBe(2);
+      expect(
+        logs.some((entry) =>
+          entry.includes("[openclaw-gateway] cooldown detected provider=minimax-portal"),
+        ),
+      ).toBe(true);
+    } finally {
+      await gateway.close();
+    }
+  });
+
+  it("returns openclaw_gateway_wait_cooldown when cooldown persists past all backoff attempts", async () => {
+    const gateway = await createMockGatewayServerWithCooldown({
+      cooldownError: "Provider openai is in cooldown",
+      cooldownTimes: 99,
+    });
+    const logs: string[] = [];
+
+    try {
+      const result = await execute(
+        buildContext(
+          {
+            url: gateway.url,
+            headers: { "x-openclaw-token": "gateway-token" },
+            waitTimeoutMs: 4_000,
+            waitPollIntervalMs: 1_000,
+            cooldownBackoffMs: [500, 500, 500],
+          },
+          {
+            onLog: async (_stream, chunk) => {
+              logs.push(chunk);
+            },
+          },
+        ),
+      );
+
+      // eslint-disable-next-line no-console
+      console.log("DEBUG_T2_FULL", JSON.stringify({ exitCode: result.exitCode, errorCode: result.errorCode, errorMessage: result.errorMessage, resultJsonKeys: result.resultJson ? Object.keys(result.resultJson) : [], cooldown: result.resultJson?.cooldown }, null, 2));
+      expect(result.exitCode).toBe(1);
+      expect(result.errorCode).toBe("openclaw_gateway_wait_cooldown");
+      expect(result.errorMessage).toContain("Provider");
+      const cooldown = result.resultJson?.cooldown as
+        | { provider: string; reason: string; untilIso: string; attempts: number }
+        | undefined;
+      expect(cooldown?.provider).toBe("openai");
+      expect(cooldown?.reason).toBe("provider_cooldown");
+      expect(cooldown?.attempts).toBe(3);
+    } finally {
+      await gateway.close();
+    }
+  });
+});

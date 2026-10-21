@@ -86,12 +86,115 @@ type GatewayClientRequestOptions = {
   expectFinal?: boolean;
 };
 
-const PROTOCOL_VERSION = 3;
+const PROTOCOL_VERSION = 4;
 const DEFAULT_SCOPES = ["operator.admin"];
 const DEFAULT_CLIENT_ID = "gateway-client";
 const DEFAULT_CLIENT_MODE = "backend";
 const DEFAULT_CLIENT_VERSION = "paperclip";
 const DEFAULT_ROLE = "operator";
+
+// RUAAAAA-5062: cooldown-aware retry/backoff for openclaw_gateway.
+const COOLDOWN_ERROR_PATTERNS: RegExp[] = [
+  /provider\s+([\w.-]+)\s+is in cooldown/i,
+  /provider\s+([\w.-]+)\s+is in cooldown\s*\(([^)]+)\)/i,
+  /auth profile\s+'([^']+)'\s+is temporarily unavailable/i,
+  /billing\s+cooldown\s+(?:until|expires?\s+at)\s+([\w:./+-]+)/i,
+  /(?<![\w-])cooldown(?![\w-])/i,
+];
+
+const COOLDOWN_BACKOFF_SEQUENCE_DEFAULT_MS = [30_000, 60_000, 120_000];
+const COOLDOWN_BACKOFF_MIN_MS = 100;
+const COOLDOWN_BACKOFF_MAX_MS = 10 * 60_000;
+const COOLDOWN_WAIT_SLICE_DEFAULT_MS = 30_000;
+// RUAAAAA-5199: slack slices allowed past the nominal waitTimeoutMs/sliceMs ratio so a slow-but-alive
+// gateway can still finish, while a gateway that returns `timeout` instantly can never spin forever.
+const WAIT_SLICE_OVERRUN_SLACK = 4;
+const WAIT_SLICE_MIN_SLICES = 4;
+
+export function parsePositiveInteger(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.max(0, Math.floor(value));
+  }
+  if (typeof value === "string" && value.trim().length > 0) {
+    const parsed = Number.parseInt(value.trim(), 10);
+    if (Number.isFinite(parsed)) return Math.max(0, Math.floor(parsed));
+  }
+  return null;
+}
+
+export function parseCooldownBackoffSequence(value: unknown): number[] {
+  if (Array.isArray(value)) {
+    const out = value.map(parsePositiveInteger).filter((n): n is number => n !== null && n >= COOLDOWN_BACKOFF_MIN_MS);
+    return out.length > 0 ? out.map((n) => Math.min(n, COOLDOWN_BACKOFF_MAX_MS)) : [...COOLDOWN_BACKOFF_SEQUENCE_DEFAULT_MS];
+  }
+  if (typeof value === "string" && value.trim().length > 0) {
+    const out = value.split(",").map((s) => parsePositiveInteger(s.trim())).filter((n): n is number => n !== null && n >= COOLDOWN_BACKOFF_MIN_MS);
+    return out.length > 0 ? out.map((n) => Math.min(n, COOLDOWN_BACKOFF_MAX_MS)) : [...COOLDOWN_BACKOFF_SEQUENCE_DEFAULT_MS];
+  }
+  return [...COOLDOWN_BACKOFF_SEQUENCE_DEFAULT_MS];
+}
+
+export type WaitSliceDecision = "done" | "cooldown_check" | "error" | "unexpected";
+
+/**
+ * RUAAAAA-5199: classify one `agent.wait` slice response.
+ *
+ * A slice that reports `timeout` (or omits `status`) has simply outlived its own window while the
+ * run stayed in flight — it is NOT terminal. Only `error` and genuinely unknown statuses are
+ * terminal; the aggregate `waitTimeoutMs` budget, not an individual slice, decides a real timeout.
+ */
+export function classifyWaitSliceStatus(status: unknown): WaitSliceDecision {
+  const s = nonEmpty(typeof status === "string" ? status : undefined)?.toLowerCase() ?? "";
+  if (s === "ok") return "done";
+  if (s === "timeout" || s === "") return "cooldown_check";
+  if (s === "error") return "error";
+  return "unexpected";
+}
+
+type CooldownSignal = { detected: boolean; provider?: string; reason?: string; untilMs?: number; untilIso?: string; };
+
+export function detectCooldownSignal(messages: Array<string | null | undefined>): CooldownSignal {
+  for (const raw of messages) {
+    if (typeof raw !== "string" || raw.trim().length === 0) continue;
+    const hasInCooldown = /provider\s+[\w.-]+\s+is in cooldown/i.test(raw);
+    const hasAuthProfile = /auth profile\s+'[^']+'\s+is temporarily unavailable/i.test(raw);
+    const hasBilling = /billing\s+cooldown/i.test(raw) || /\(\s*billing\s*\)/i.test(raw);
+    const hasGenericCooldown = /(?<![\w-])cooldown(?![\w-])/i.test(raw) && /(provider|model|account)/i.test(raw);
+    if (hasInCooldown || hasAuthProfile || hasBilling || hasGenericCooldown) {
+      let provider: string | undefined;
+      const providerMatch = raw.match(/provider\s+([\w.-]+)\s+is in cooldown/i);
+      if (providerMatch) provider = providerMatch[1];
+      const profileMatch = raw.match(/auth profile\s+'([^']+)'/i);
+      if (!provider && profileMatch) provider = profileMatch[1];
+      let untilMs: number | undefined, untilIso: string | undefined;
+      const isoMatch = raw.match(/\b(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2}))\b/);
+      if (isoMatch) {
+        const parsed = Date.parse(isoMatch[1]);
+        if (Number.isFinite(parsed)) { untilMs = parsed; untilIso = new Date(parsed).toISOString(); }
+      }
+      const secondsMatch = raw.match(/in\s+(\d+)\s*seconds?/i);
+      if (!untilMs && secondsMatch) {
+        const secs = Number.parseInt(secondsMatch[1], 10);
+        if (Number.isFinite(secs)) { untilMs = Date.now() + Math.max(0, secs) * 1000; untilIso = new Date(untilMs).toISOString(); }
+      }
+      return { detected: true, provider, reason: hasAuthProfile ? "auth_profile_unavailable" : hasBilling ? "billing_cooldown" : "provider_cooldown", untilMs, untilIso };
+    }
+  }
+  return { detected: false };
+}
+
+function clampCooldownBackoffToBudget(backoffMs: number, remainingBudgetMs: number): number {
+  if (!Number.isFinite(backoffMs) || backoffMs <= 0) return 0;
+  if (remainingBudgetMs <= 0) return 0;
+  return Math.min(backoffMs, Math.max(0, remainingBudgetMs));
+}
+
+function backoffForAttempt(sequence: number[], attemptIndex: number): number {
+  if (sequence.length === 0) return COOLDOWN_BACKOFF_SEQUENCE_DEFAULT_MS[0];
+  const idx = Math.max(0, Math.min(attemptIndex, sequence.length - 1));
+  return sequence[idx];
+}
+
 
 const SENSITIVE_LOG_KEY_PATTERN =
   /(^|[_-])(auth|authorization|token|secret|password|api[_-]?key|private[_-]?key)([_-]|$)|^x-openclaw-(auth|token)$/i;
@@ -331,9 +434,9 @@ function resolvePaperclipApiUrlOverride(value: unknown): string | null {
   }
 }
 
-const DEFAULT_CLAIMED_API_KEY_PATH = "~/.openclaw/workspace/paperclip-claimed-api-key.json";
+export const DEFAULT_CLAIMED_API_KEY_PATH = '$OPENCLAW_AGENT_DIR/../paperclip-claimed-api-key.json';
 
-function resolveClaimedApiKeyPath(value: unknown): string {
+export function resolveClaimedApiKeyPath(value: unknown): string {
   return nonEmpty(value) ?? DEFAULT_CLAIMED_API_KEY_PATH;
 }
 
@@ -1338,6 +1441,26 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       );
 
       if (acceptedStatus === "error") {
+        // RUAAAAA-3922: surface the lane-saturated fail-fast signal from the gateway admission-control
+        // gate as a distinct errorCode so issue_recovery can route it into a backoff retry path
+        // instead of consuming the full 600s `waitTimeoutMs`. Saturated is retriable backpressure,
+        // NOT an abort or genuine dispatch failure.
+        if (nonEmpty(acceptedPayload?.code) === "saturated") {
+          const snapshot = asRecord(acceptedPayload?.snapshot);
+          const errorMessage =
+            nonEmpty(acceptedPayload?.summary) ??
+            lifecycleError ??
+            "OpenClaw gateway lane saturated (admission-control gate tripped)";
+          return {
+            exitCode: 1,
+            signal: null,
+            timedOut: false,
+            errorMessage,
+            errorCode: "openclaw_gateway_saturated",
+            resultJson: acceptedPayload,
+            ...(snapshot ? { errorMeta: snapshot } : {}),
+          };
+        }
         const errorMessage =
           nonEmpty(acceptedPayload?.summary) ?? lifecycleError ?? "OpenClaw gateway agent request failed";
         return {
@@ -1351,45 +1474,140 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
 
       if (acceptedStatus !== "ok") {
-        const waitPayload = await client.request<Record<string, unknown>>(
-          "agent.wait",
-          { runId: acceptedRunId, timeoutMs: waitTimeoutMs },
-          { timeoutMs: waitTimeoutMs + connectTimeoutMs },
+        // RUAAAAA-5062: poll agent.wait in slices so we can detect cooldown
+        const waitSliceMs = (function () {
+          const configured = parsePositiveInteger(ctx.config.waitPollIntervalMs);
+          if (configured !== null && configured >= 1_000) return Math.min(configured, waitTimeoutMs);
+          return COOLDOWN_WAIT_SLICE_DEFAULT_MS;
+        })();
+        const cooldownBackoffSequence = parseCooldownBackoffSequence(ctx.config.cooldownBackoffMs);
+        const waitCallTimeoutMs = waitTimeoutMs + connectTimeoutMs;
+        const waitBudgetStart = Date.now();
+        const maxSlices = Math.max(
+          WAIT_SLICE_MIN_SLICES,
+          Math.ceil(waitTimeoutMs / Math.max(1, waitSliceMs)) + WAIT_SLICE_OVERRUN_SLACK,
         );
+        let cooldownSignal: CooldownSignal | null = null;
+        let cooldownAttempts = 0;
+        let waitPayload: Record<string, unknown> | null = null;
+        let waitStatus = "";
+        let shouldRetryOnCooldown = true;
+        let sliceCount = 0;
+        let pendingSliceCount = 0;
 
-        latestResultPayload = waitPayload;
-
-        const waitStatus = nonEmpty(waitPayload?.status)?.toLowerCase() ?? "";
-        if (waitStatus === "timeout") {
-          return {
-            exitCode: 1,
-            signal: null,
-            timedOut: true,
-            errorMessage: `OpenClaw gateway run timed out after ${waitTimeoutMs}ms`,
-            errorCode: "openclaw_gateway_wait_timeout",
-            resultJson: waitPayload,
-          };
+        while (true) {
+          const elapsedMs = Date.now() - waitBudgetStart;
+          const remainingMs = waitTimeoutMs - elapsedMs;
+          if (remainingMs <= 0) { waitStatus = "timeout"; break; }
+          const sliceMs = Math.min(waitSliceMs, Math.max(1_000, remainingMs));
+          const sliceCallTimeout = Math.min(waitCallTimeoutMs, sliceMs + connectTimeoutMs);
+          let slicePayload: Record<string, unknown> | null = null;
+          let sliceTimedOut = false;
+          try {
+            slicePayload = await client.request<Record<string, unknown>>(
+              "agent.wait",
+              { runId: acceptedRunId, timeoutMs: sliceMs },
+              { timeoutMs: sliceCallTimeout },
+            );
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            const lower = msg.toLowerCase();
+            if (lower.includes("timeout")) sliceTimedOut = true;
+            slicePayload = { status: sliceTimedOut ? "timeout" : "error", error: msg };
+          }
+          waitPayload = slicePayload;
+          latestResultPayload = slicePayload;
+          sliceCount += 1;
+          const sliceStatus = nonEmpty(slicePayload?.status)?.toLowerCase() ?? "";
+          const errorText = nonEmpty(slicePayload?.error) ?? (lifecycleError ?? undefined) ?? undefined;
+          const sliceDecision = classifyWaitSliceStatus(slicePayload?.status);
+          if (sliceDecision === "done") { waitStatus = "ok"; break; }
+          const signal = detectCooldownSignal([
+            typeof errorText === "string" ? errorText : null,
+            sliceStatus === "error" ? nonEmpty(slicePayload?.summary) : null,
+            sliceStatus === "error" ? nonEmpty(asRecord(slicePayload?.details)?.message) : null,
+          ]);
+          if (signal.detected && shouldRetryOnCooldown) {
+            pendingSliceCount = 0;
+            cooldownSignal = signal;
+            const backoffSequence = cooldownBackoffSequence;
+            if (cooldownAttempts >= backoffSequence.length) {
+              shouldRetryOnCooldown = false;
+              waitStatus = "error";
+              break;
+            }
+            const backoffAttempt = cooldownAttempts;
+            const backoffMsRaw = backoffForAttempt(backoffSequence, backoffAttempt);
+            const backoffMs = clampCooldownBackoffToBudget(backoffMsRaw, remainingMs);
+            cooldownAttempts += 1;
+            await ctx.onLog("stdout",
+              `[openclaw-gateway] cooldown detected provider=${signal.provider ?? "unknown"} reason=${signal.reason ?? "unknown"} until=${signal.untilIso ?? "unknown"} backoffMs=${backoffMs} attempt=${backoffAttempt + 1}/${backoffSequence.length} budgetRemainingMs=${remainingMs}
+`);
+            if (backoffMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, backoffMs));
+            continue;
+          }
+          // RUAAAAA-5199: `timeout` (and a missing status) from agent.wait means "this slice's window
+          // closed while the run was still in flight" — it is NOT a terminal outcome. Poll the next
+          // slice and let the aggregate waitTimeoutMs budget decide the final verdict. Breaking here
+          // capped every run at COOLDOWN_WAIT_SLICE_DEFAULT_MS regardless of the configured budget,
+          // which is what produced the fleet-wide `timed_out` clears under load.
+          if (sliceStatus === "timeout" || sliceStatus === "") {
+            pendingSliceCount += 1;
+            if (sliceCount >= maxSlices || pendingSliceCount >= maxSlices) {
+              waitStatus = "timeout";
+              break;
+            }
+            await ctx.onLog(
+              "stdout",
+              `[openclaw-gateway] agent.wait slice ${sliceCount} still in flight (slice=${sliceMs}ms elapsed=${Date.now() - waitBudgetStart}ms remaining=${remainingMs}ms slices=${sliceCount}/${maxSlices}) — continuing poll\n`,
+            );
+            continue;
+          }
+          pendingSliceCount = 0;
+          if (sliceStatus === "error") { waitStatus = "error"; break; }
+          waitStatus = sliceStatus; break;
         }
 
+        const finalElapsedMs = Date.now() - waitBudgetStart;
+        if (waitStatus === "ok") {
+          // ok
+        } else if (waitStatus === "timeout") {
+          const messageParts = cooldownSignal
+            ? [
+                `OpenClaw gateway run timed out after ${waitTimeoutMs}ms while provider "${cooldownSignal.provider ?? "unknown"}" was in cooldown (${cooldownSignal.reason ?? "unknown"})`,
+                cooldownSignal.untilIso ? `cooldownUntilIso=${cooldownSignal.untilIso}` : null,
+                `cooldownAttempts=${cooldownAttempts}`,
+              ].filter((e): e is string => Boolean(e))
+            : [
+                `OpenClaw gateway run did not complete within waitTimeoutMs=${waitTimeoutMs}ms (elapsed ${finalElapsedMs}ms across ${sliceCount} polling slice(s) of ${waitSliceMs}ms; no cooldown signal in slice response or lifecycle stream)`,
+                `lastSliceStatus=${nonEmpty(asRecord(waitPayload)?.status)?.toLowerCase() ?? "none"}`,
+              ];
+          return {
+            exitCode: 1, signal: null, timedOut: true,
+            errorMessage: messageParts.join("; "),
+            errorCode: cooldownSignal ? "openclaw_gateway_wait_timeout_in_cooldown" : "openclaw_gateway_wait_timeout",
+            resultJson: {
+              ...asRecord(waitPayload),
+              ...(cooldownSignal ? { cooldown: { provider: cooldownSignal.provider ?? null, reason: cooldownSignal.reason ?? null, untilIso: cooldownSignal.untilIso ?? null, untilMs: cooldownSignal.untilMs ?? null, attempts: cooldownAttempts, backoffSequenceMs: cooldownBackoffSequence } } : {}),
+            },
+          };
+        }
         if (waitStatus === "error") {
           return {
-            exitCode: 1,
-            signal: null,
-            timedOut: false,
-            errorMessage:
-              nonEmpty(waitPayload?.error) ??
-              lifecycleError ??
-              "OpenClaw gateway run failed",
-            errorCode: "openclaw_gateway_wait_error",
-            resultJson: waitPayload,
+            exitCode: 1, signal: null, timedOut: false,
+            errorMessage: cooldownSignal
+              ? `OpenClaw gateway run in cooldown: Provider "${cooldownSignal.provider ?? "unknown"}" reason=${cooldownSignal.reason ?? "unknown"} ${cooldownSignal.untilIso ? `cooldownUntilIso=${cooldownSignal.untilIso}` : ""} cooldownAttempts=${cooldownAttempts}`
+              : nonEmpty(waitPayload?.error) ?? lifecycleError ?? "OpenClaw gateway run failed",
+            errorCode: cooldownSignal ? "openclaw_gateway_wait_cooldown" : "openclaw_gateway_wait_error",
+            resultJson: {
+              ...asRecord(waitPayload),
+              ...(cooldownSignal ? { cooldown: { provider: cooldownSignal.provider ?? null, reason: cooldownSignal.reason ?? null, untilIso: cooldownSignal.untilIso ?? null, untilMs: cooldownSignal.untilMs ?? null, attempts: cooldownAttempts, backoffSequenceMs: cooldownBackoffSequence } } : {}),
+            },
           };
         }
-
         if (waitStatus && waitStatus !== "ok") {
           return {
-            exitCode: 1,
-            signal: null,
-            timedOut: false,
+            exitCode: 1, signal: null, timedOut: false,
             errorMessage: `Unexpected OpenClaw gateway agent.wait status: ${waitStatus}`,
             errorCode: "openclaw_gateway_wait_status_unexpected",
             resultJson: waitPayload,
