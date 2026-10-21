@@ -89,7 +89,7 @@ import {
   normalizeContentType,
   SVG_CONTENT_TYPE,
 } from "../attachment-types.js";
-import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
+import { queueIssueAssignmentWakeup, recordAgentWakeAttempt, isRoutineExecutionOpenConflict } from "../services/issue-assignment-wakeup.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { executionWorkspaceService as executionWorkspaceServiceDirect } from "../services/execution-workspaces.js";
 import { feedbackService } from "../services/feedback.js";
@@ -624,6 +624,7 @@ function isExplicitResumeCapableStatus(status: string | null | undefined) {
 }
 
 function queueResolvedInteractionContinuationWakeup(input: {
+  db: Db;
   heartbeat: ReturnType<typeof heartbeatService>;
   issue: { id: string; assigneeAgentId: string | null; status: string };
   interaction: {
@@ -648,7 +649,7 @@ function queueResolvedInteractionContinuationWakeup(input: {
   if (input.interaction.status === "expired") return;
   if (!input.issue.assigneeAgentId || isClosedIssueStatus(input.issue.status)) return;
 
-  void input.heartbeat.wakeup(input.issue.assigneeAgentId, {
+  input.heartbeat.wakeup(input.issue.assigneeAgentId, {
     source: "automation",
     triggerDetail: "system",
     reason: "issue_commented",
@@ -674,12 +675,44 @@ function queueResolvedInteractionContinuationWakeup(input: {
       wakeReason: "issue_commented",
       source: input.source,
     },
-  }).catch((err) => logger.warn({
-    err,
-    issueId: input.issue.id,
-    interactionId: input.interaction.id,
-    agentId: input.issue.assigneeAgentId,
-  }, "failed to wake assignee on issue interaction resolution"));
+  }).catch(async (err) => {
+    // Persist the wake attempt on agent_runtime_state so the fleet-health
+    // watch (paperclip-agent-fleet-health.sh) can act on assignment-wake
+    // failures that left the last run path clean. Contention on
+    // issues_open_routine_execution_uq is logged at info, not warn — see
+    // RUAAAAA-5205.
+    if (input.issue.assigneeAgentId) {
+      if (isRoutineExecutionOpenConflict(err)) {
+        logger.info(
+          {
+            err,
+            issueId: input.issue.id,
+            interactionId: input.interaction.id,
+            agentId: input.issue.assigneeAgentId,
+          },
+          "skipped wake: open routine execution already exists for this routine",
+        );
+        await recordAgentWakeAttempt({
+          db: input.db,
+          agentId: input.issue.assigneeAgentId,
+          errorMessage:
+            "issues_open_routine_execution_uq: another open execution already holds the routine lock",
+        });
+        return;
+      }
+      await recordAgentWakeAttempt({
+        db: input.db,
+        agentId: input.issue.assigneeAgentId,
+        errorMessage: err instanceof Error ? err.message : String(err),
+      });
+    }
+    logger.warn({
+      err,
+      issueId: input.issue.id,
+      interactionId: input.interaction.id,
+      agentId: input.issue.assigneeAgentId,
+    }, "failed to wake assignee on issue interaction resolution");
+  });
 }
 
 function diffExecutionParticipants(
@@ -2592,6 +2625,7 @@ export function issueRoutes(
 
     void queueIssueAssignmentWakeup({
       heartbeat,
+      wakeRecorder: { db },
       issue,
       reason: "issue_assigned",
       mutation: "create",
@@ -2682,6 +2716,7 @@ export function issueRoutes(
 
     void queueIssueAssignmentWakeup({
       heartbeat,
+      wakeRecorder: { db },
       issue,
       reason: "issue_assigned",
       mutation: "create",
@@ -3727,7 +3762,30 @@ export function issueRoutes(
           requestedByActorId: actor.actorId,
           contextSnapshot: { issueId: issue.id, source: "issue.checkout" },
         })
-        .catch((err) => logger.warn({ err, issueId: issue.id }, "failed to wake assignee on issue checkout"));
+        .catch(async (err) => {
+          // Persist the wake attempt on agent_runtime_state so the
+          // fleet-health watch can act on assignment-wake failures that
+          // left the last run path clean. RUAAAAA-5205.
+          if (isRoutineExecutionOpenConflict(err)) {
+            logger.info(
+              { err, issueId: issue.id, agentId: req.body.agentId },
+              "skipped wake: open routine execution already exists for this routine",
+            );
+            await recordAgentWakeAttempt({
+              db,
+              agentId: req.body.agentId,
+              errorMessage:
+                "issues_open_routine_execution_uq: another open execution already holds the routine lock",
+            });
+            return;
+          }
+          await recordAgentWakeAttempt({
+            db,
+            agentId: req.body.agentId,
+            errorMessage: err instanceof Error ? err.message : String(err),
+          });
+          logger.warn({ err, issueId: issue.id }, "failed to wake assignee on issue checkout");
+        });
     }
 
     res.json(updated);
@@ -3984,6 +4042,7 @@ export function issueRoutes(
       for (const createdIssue of createdIssues) {
         void queueIssueAssignmentWakeup({
           heartbeat,
+          wakeRecorder: { db },
           issue: createdIssue,
           reason: "issue_assigned",
           mutation: "interaction_accept",
@@ -3994,6 +4053,7 @@ export function issueRoutes(
       }
 
       queueResolvedInteractionContinuationWakeup({
+        db,
         heartbeat,
         issue: continuationWakeIssue,
         interaction,
@@ -4050,6 +4110,7 @@ export function issueRoutes(
       });
 
       queueResolvedInteractionContinuationWakeup({
+        db,
         heartbeat,
         issue,
         interaction,
@@ -4102,6 +4163,7 @@ export function issueRoutes(
       });
 
       queueResolvedInteractionContinuationWakeup({
+        db,
         heartbeat,
         issue,
         interaction,
@@ -4154,6 +4216,7 @@ export function issueRoutes(
       });
 
       queueResolvedInteractionContinuationWakeup({
+        db,
         heartbeat,
         issue,
         interaction,

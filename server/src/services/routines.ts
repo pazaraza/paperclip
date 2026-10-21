@@ -57,6 +57,7 @@ import { getSecretProvider } from "../secrets/provider-registry.js";
 import { parseCron, validateCron } from "./cron.js";
 import { heartbeatService } from "./heartbeat.js";
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
+
 import { logActivity } from "./activity-log.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 
@@ -1288,8 +1289,13 @@ export function routineService(
         }
 
         // Keep the dispatch lock until the issue is linked to a queued heartbeat run.
+        // The wake recorder persists `last_wake_error` on agent_runtime_state when
+        // a unique-constraint contention (issues_open_routine_execution_uq) trips,
+        // so the fleet-health watch can clear agents the prior code path left stuck
+        // in status='error'. See RUAAAAA-5205.
         await queueIssueAssignmentWakeup({
           heartbeat,
+          wakeRecorder: { db },
           issue: createdIssue,
           reason: "issue_assigned",
           mutation: "create",
