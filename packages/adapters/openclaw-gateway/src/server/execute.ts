@@ -313,6 +313,51 @@ function getGatewayErrorDetails(err: unknown): Record<string, unknown> | null {
   return asRecord(candidate);
 }
 
+/**
+ * Extract a Postgres-style conflict pair (`code: "23505"` + `constraint: ...`)
+ * from a gateway error's `details` payload. The OpenClaw gateway passes
+ * Paperclip-side error metadata through the JSON-RPC error frame's
+ * `error.details` bag, so the unique-constraint identifiers we need live
+ * either at the top level of `details` or one nesting level deep.
+ *
+ * Companion to `isRoutineExecutionOpenConflict` in
+ * `server/src/services/issue-assignment-wakeup.ts`: the wakeup-recorder
+ * path recognises the contention by reading top-level `code` and
+ * `constraint` on the thrown error. The gateway's `handleResponse` does
+ * NOT promote those into the surfaced error today (it surfaces only
+ * `gatewayCode` + `gatewayDetails`), so callers that want the
+ * server-side recognition to fire have to call this helper and use the
+ * result explicitly. This helper is the regression-testable surface.
+ *
+ * Returns `{ code, constraint }`, either field being `null` if not present.
+ */
+export function extractPostgresConflictInfo(
+  errorDetails: unknown,
+): { code: string | null; constraint: string | null } {
+  const record = asRecord(errorDetails);
+  if (!record) return { code: null, constraint: null };
+
+  const topCode = nonEmpty(record.code);
+  const topConstraint = nonEmpty(record.constraint);
+  if (topCode === "23505" && topConstraint) {
+    return { code: topCode, constraint: topConstraint };
+  }
+
+  // The postgres error may be nested under a key like `pgError`, `cause`,
+  // or `error`. Look one level deep so the wake recorder can still match.
+  for (const nested of [record.pgError, record.cause, record.error, record.postgres]) {
+    const nestedRecord = asRecord(nested);
+    if (!nestedRecord) continue;
+    const code = nonEmpty(nestedRecord.code);
+    const constraint = nonEmpty(nestedRecord.constraint);
+    if (code === "23505" && constraint) {
+      return { code, constraint };
+    }
+  }
+
+  return { code: topCode, constraint: topConstraint };
+}
+
 function extractPairingRequestId(err: unknown): string | null {
   const details = getGatewayErrorDetails(err);
   const fromDetails = nonEmpty(details?.requestId);
