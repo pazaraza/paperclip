@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { classifyWaitSliceStatus, detectCooldownSignal, parseCooldownBackoffSequence, resolveSessionKey } from "./execute.js";
+import {
+  classifyWaitSliceStatus,
+  detectCooldownSignal,
+  detectWaitSliceSaturation,
+  parseCooldownBackoffSequence,
+  parseSaturatedDuration,
+  parseSaturatedMinQueuedSlices,
+  resolveSessionKey,
+} from "./execute.js";
 
 describe("resolveSessionKey", () => {
   it("prefixes run-scoped session keys with the configured agent", () => {
@@ -78,6 +86,93 @@ describe("classifyWaitSliceStatus (RUAAAAA-5199)", () => {
 
   it("surfaces genuinely unknown statuses as unexpected", () => {
     expect(classifyWaitSliceStatus("saturated")).toBe("unexpected");
+  });
+});
+
+describe("detectWaitSliceSaturation (RUAAAAA-5256)", () => {
+  it("flags a queued-but-never-started run as saturated", () => {
+    // This is the gateway's answer to an over-committed dispatch: accepted, then parked in the
+    // queue. RUAAAAA-5199 kept polling these until the 600s budget died, which is what produced
+    // the fleet-wide `timed_out` storm RUAAAAA-5256 was opened for.
+    const verdict = detectWaitSliceSaturation({
+      runId: "run-1",
+      status: "timeout",
+      timeoutPhase: "queue",
+      providerStarted: false,
+    });
+    expect(verdict.saturated).toBe(true);
+    expect(verdict.reason).toBe("queued_not_started");
+    expect(verdict.providerStarted).toBe(false);
+  });
+
+  it("flags a draining gateway that never started the run", () => {
+    const verdict = detectWaitSliceSaturation({
+      status: "timeout",
+      timeoutPhase: "gateway_draining",
+    });
+    expect(verdict.saturated).toBe(true);
+    expect(verdict.reason).toBe("gateway_draining");
+  });
+
+  it("flags a `pending` dispatch as saturated", () => {
+    const verdict = detectWaitSliceSaturation({ status: "pending", timeoutPhase: "queue" });
+    expect(verdict.saturated).toBe(true);
+    expect(verdict.reason).toBe("queued_not_started");
+  });
+
+  it("honours an explicit `code: saturated` verdict", () => {
+    const verdict = detectWaitSliceSaturation({ status: "error", code: "saturated" });
+    expect(verdict.saturated).toBe(true);
+    expect(verdict.reason).toBe("explicit_saturated");
+  });
+
+  it("REGRESSION: a slow-but-started run is NOT saturation (RUAAAAA-5199 stays intact)", () => {
+    const verdict = detectWaitSliceSaturation({ status: "timeout", providerStarted: true });
+    expect(verdict.saturated).toBe(false);
+    expect(verdict.reason).toBeNull();
+  });
+
+  it("does not fire on a bare slice timeout with no queue evidence", () => {
+    // The classic in-flight slice: no timeoutPhase, no providerStarted flag. Treating this as
+    // saturation would re-break RUAAAAA-5199 by capping every healthy run at one probe slice.
+    expect(detectWaitSliceSaturation({ status: "timeout" }).saturated).toBe(false);
+    expect(detectWaitSliceSaturation({}).saturated).toBe(false);
+    expect(detectWaitSliceSaturation(null).saturated).toBe(false);
+  });
+
+  it("does not fire on a finished run whose snapshot carries a terminal marker", () => {
+    const verdict = detectWaitSliceSaturation({
+      status: "timeout",
+      timeoutPhase: "queue",
+      endedAt: "2026-10-22T14:00:00.000Z",
+    });
+    expect(verdict.saturated).toBe(false);
+  });
+
+  it("does not fire on ok/error terminal slices", () => {
+    expect(detectWaitSliceSaturation({ status: "ok" }).saturated).toBe(false);
+    expect(detectWaitSliceSaturation({ status: "error", error: "boom" }).saturated).toBe(false);
+  });
+});
+
+describe("parseSaturatedDuration (RUAAAAA-5256)", () => {
+  it("falls back when unset and clamps into range", () => {
+    expect(parseSaturatedDuration(undefined, 5_000, 1_000, 60_000)).toBe(5_000);
+    expect(parseSaturatedDuration("2500", 5_000, 1_000, 60_000)).toBe(2_500);
+    expect(parseSaturatedDuration(10, 5_000, 1_000, 60_000)).toBe(1_000);
+    expect(parseSaturatedDuration(999_999, 5_000, 1_000, 60_000)).toBe(60_000);
+  });
+});
+
+describe("parseSaturatedMinQueuedSlices (RUAAAAA-5256)", () => {
+  it("defaults to 3 consecutive queued slices", () => {
+    expect(parseSaturatedMinQueuedSlices(undefined)).toBe(3);
+  });
+
+  it("clamps operator input to a sane window", () => {
+    expect(parseSaturatedMinQueuedSlices("1")).toBe(1);
+    expect(parseSaturatedMinQueuedSlices(0)).toBe(1);
+    expect(parseSaturatedMinQueuedSlices(500)).toBe(20);
   });
 });
 

@@ -121,6 +121,19 @@ const COOLDOWN_WAIT_SLICE_DEFAULT_MS = 30_000;
 // gateway can still finish, while a gateway that returns `timeout` instantly can never spin forever.
 const WAIT_SLICE_OVERRUN_SLACK = 4;
 const WAIT_SLICE_MIN_SLICES = 4;
+// RUAAAAA-5256: admission-control feedback. When the gateway is over-committed it ACCEPTS the
+// dispatch but never STARTS it, and every `agent.wait` slice comes back as
+// `{status:"timeout", timeoutPhase:"queue"|"gateway_draining", providerStarted:false}`.
+// RUAAAAA-5199 taught the loop to keep polling those non-terminal `timeout` slices, which is
+// correct for a slow-but-alive run and catastrophic for a queued one: every saturated dispatch
+// burned the whole `waitTimeoutMs` (600s) and then died as `timed_out`, which in turn fired a
+// `stranded_assigned_issue` recovery action. So probe the queue on a short slice while the run
+// has still never started, and give up fast with a distinct `openclaw_gateway_saturated` code.
+const SATURATED_PROBE_SLICE_DEFAULT_MS = 5_000;
+const SATURATED_PROBE_SLICE_MIN_MS = 1_000;
+const SATURATED_MIN_QUEUED_SLICES_DEFAULT = 3;
+const SATURATED_RETRY_DELAY_DEFAULT_MS = 120_000;
+const SATURATED_RETRY_DELAY_MAX_MS = 60 * 60_000;
 
 export function parsePositiveInteger(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) {
@@ -160,6 +173,66 @@ export function classifyWaitSliceStatus(status: unknown): WaitSliceDecision {
   if (s === "timeout" || s === "") return "cooldown_check";
   if (s === "error") return "error";
   return "unexpected";
+}
+
+export type WaitSliceSaturation = {
+  /** True when this payload proves the gateway accepted the run but never started it. */
+  saturated: boolean;
+  reason: "queued_not_started" | "gateway_draining" | "explicit_saturated" | null;
+  timeoutPhase: string | null;
+  providerStarted: boolean;
+  status: string | null;
+};
+
+/**
+ * RUAAAAA-5256: decide whether one `agent`/`agent.wait` payload is an admission-control signal
+ * (the gateway is saturated) rather than a merely-slow run.
+ *
+ * The gateway answers an over-committed dispatch with a queued-but-unstarted run instead of an
+ * error, so there is no failure text to grep: the only proof is `providerStarted !== true`
+ * combined with a queue/draining `timeoutPhase` (or an explicit `saturated` code). A started run
+ * — even one that outlives its slice — must keep polling, so this never fires on
+ * `providerStarted: true`, on a payload that carries `endedAt`/`stopReason`, or on a bare
+ * `status: "timeout"` with no queue evidence at all (that is the RUAAAAA-5199 slow-run case).
+ */
+export function detectWaitSliceSaturation(payload: unknown): WaitSliceSaturation {
+  const record = asRecord(payload);
+  const status = nonEmpty(record?.status)?.toLowerCase() ?? null;
+  const timeoutPhase = nonEmpty(record?.timeoutPhase)?.toLowerCase() ?? null;
+  const code = nonEmpty(record?.code)?.toLowerCase() ?? null;
+  const providerStarted = record?.providerStarted === true;
+  const finished =
+    nonEmpty(record?.endedAt) !== null ||
+    nonEmpty(record?.stopReason) !== null ||
+    status === "ok" ||
+    status === "error";
+  const base: WaitSliceSaturation = { saturated: false, reason: null, timeoutPhase, providerStarted, status };
+
+  if (code === "saturated" || status === "saturated") {
+    return { ...base, saturated: true, reason: "explicit_saturated" };
+  }
+  if (finished || providerStarted) return base;
+
+  if (status === "pending" || timeoutPhase === "queue") {
+    return { ...base, saturated: true, reason: "queued_not_started" };
+  }
+  if (timeoutPhase === "gateway_draining") {
+    return { ...base, saturated: true, reason: "gateway_draining" };
+  }
+  return base;
+}
+
+/** RUAAAAA-5256: clamp an operator-supplied saturation knob into a sane range. */
+export function parseSaturatedDuration(value: unknown, fallback: number, min: number, max: number): number {
+  const parsed = parsePositiveInteger(value);
+  if (parsed === null) return fallback;
+  return Math.max(min, Math.min(max, parsed));
+}
+
+export function parseSaturatedMinQueuedSlices(value: unknown): number {
+  const parsed = parsePositiveInteger(value);
+  if (parsed === null) return SATURATED_MIN_QUEUED_SLICES_DEFAULT;
+  return Math.max(1, Math.min(20, parsed));
 }
 
 type CooldownSignal = { detected: boolean; provider?: string; reason?: string; untilMs?: number; untilIso?: string; };
@@ -204,6 +277,53 @@ function backoffForAttempt(sequence: number[], attemptIndex: number): number {
   if (sequence.length === 0) return COOLDOWN_BACKOFF_SEQUENCE_DEFAULT_MS[0];
   const idx = Math.max(0, Math.min(attemptIndex, sequence.length - 1));
   return sequence[idx];
+}
+
+/**
+ * RUAAAAA-5256: shape the saturated verdict.
+ *
+ * `timedOut: false` is the load-bearing part — a saturated run is a real failure of *admission*,
+ * not of *execution*, and marking it `timedOut` is what produced 600s `timed_out` runs and the
+ * `stranded_assigned_issue` recovery actions that followed them. `errorFamily: transient_upstream`
+ * is what makes `issue_recovery` retry it cleanly with backoff rather than treating it as a dead
+ * agent; `retryNotBefore` supplies the floor for that backoff.
+ */
+function buildSaturatedResult(input: {
+  stage: "dispatch" | "wait";
+  reason: string;
+  payload: Record<string, unknown> | null;
+  elapsedMs: number;
+  sliceCount: number;
+  waitTimeoutMs: number;
+  retryDelayMs: number;
+}): AdapterExecutionResult {
+  const retryNotBefore = new Date(Date.now() + input.retryDelayMs).toISOString();
+  const message =
+    `OpenClaw gateway saturated: dispatch accepted but never provider-started ` +
+    `(stage=${input.stage} reason=${input.reason} elapsed=${input.elapsedMs}ms slices=${input.sliceCount} ` +
+    `waitTimeoutMs=${input.waitTimeoutMs}ms); failing fast instead of waiting out the full budget`;
+  const evidence = {
+    saturation: {
+      stage: input.stage,
+      reason: input.reason,
+      elapsedMs: input.elapsedMs,
+      sliceCount: input.sliceCount,
+      waitTimeoutMs: input.waitTimeoutMs,
+      retryDelayMs: input.retryDelayMs,
+      retryNotBefore,
+    },
+  };
+  return {
+    exitCode: 1,
+    signal: null,
+    timedOut: false,
+    errorMessage: message,
+    errorCode: "openclaw_gateway_saturated",
+    errorFamily: "transient_upstream",
+    retryNotBefore,
+    errorMeta: evidence,
+    resultJson: { ...(input.payload ?? {}), ...evidence },
+  };
 }
 
 
@@ -1291,6 +1411,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   );
 
   const sessionKeyStrategy = normalizeSessionKeyStrategy(ctx.config.sessionKeyStrategy);
+  // RUAAAAA-5256: admission-control feedback knobs. Defaults keep a saturated run under ~15s
+  // (3 x 5s probe slices) so a 600s budget is never spent on a run that never started.
+  const saturatedProbeSliceMs = parseSaturatedDuration(
+    ctx.config.saturatedProbeIntervalMs,
+    SATURATED_PROBE_SLICE_DEFAULT_MS,
+    SATURATED_PROBE_SLICE_MIN_MS,
+    Math.max(SATURATED_PROBE_SLICE_MIN_MS, waitTimeoutMs),
+  );
+  const saturatedMinQueuedSlices = parseSaturatedMinQueuedSlices(ctx.config.saturatedMinQueuedSlices);
+  const saturatedRetryDelayMs = parseSaturatedDuration(
+    ctx.config.saturatedRetryDelayMs,
+    SATURATED_RETRY_DELAY_DEFAULT_MS,
+    1_000,
+    SATURATED_RETRY_DELAY_MAX_MS,
+  );
   const configuredSessionKey = nonEmpty(ctx.config.sessionKey);
   const sessionKey = resolveSessionKey({
     strategy: sessionKeyStrategy,
@@ -1542,6 +1677,26 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
 
       if (acceptedStatus !== "ok") {
+        // RUAAAAA-5256: the gateway can accept a dispatch and immediately report that it never got
+        // a slot (admission closed / queue backpressure). That is a saturation verdict, not a run to
+        // wait on: fail fast here instead of entering the wait loop and burning `waitTimeoutMs`.
+        const acceptedSaturation = detectWaitSliceSaturation(acceptedPayload);
+        if (acceptedSaturation.saturated && acceptedSaturation.reason !== "explicit_saturated") {
+          await ctx.onLog(
+            "stdout",
+            `[openclaw-gateway] saturated at dispatch runId=${acceptedRunId} reason=${acceptedSaturation.reason} status=${acceptedSaturation.status ?? "unknown"} timeoutPhase=${acceptedSaturation.timeoutPhase ?? "none"} providerStarted=${acceptedSaturation.providerStarted}\n`,
+          );
+          return buildSaturatedResult({
+            stage: "dispatch",
+            reason: acceptedSaturation.reason ?? "queued_not_started",
+            payload: acceptedPayload,
+            elapsedMs: 0,
+            sliceCount: 0,
+            waitTimeoutMs,
+            retryDelayMs: saturatedRetryDelayMs,
+          });
+        }
+
         // RUAAAAA-5062: poll agent.wait in slices so we can detect cooldown
         const waitSliceMs = (function () {
           const configured = parsePositiveInteger(ctx.config.waitPollIntervalMs);
@@ -1562,12 +1717,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         let shouldRetryOnCooldown = true;
         let sliceCount = 0;
         let pendingSliceCount = 0;
+        // RUAAAAA-5256: saturation bookkeeping. A run that has never been provider-started and has
+        // answered N consecutive slices as queued/draining is saturated, not slow.
+        let providerEverStarted = false;
+        let queuedSliceCount = 0;
+        let saturationReason: WaitSliceSaturation["reason"] = null;
+        let firstQueuedAtMs: number | null = null;
+        let lastSaturationPayload: Record<string, unknown> | null = null;
 
         while (true) {
           const elapsedMs = Date.now() - waitBudgetStart;
           const remainingMs = waitTimeoutMs - elapsedMs;
           if (remainingMs <= 0) { waitStatus = "timeout"; break; }
-          const sliceMs = Math.min(waitSliceMs, Math.max(1_000, remainingMs));
+          // RUAAAAA-5256: probe on a short slice until the run has actually been provider-started,
+          // so saturation is visible within seconds instead of only at the end of `waitTimeoutMs`.
+          const effectiveSliceMs =
+            providerEverStarted ? waitSliceMs : Math.min(waitSliceMs, saturatedProbeSliceMs);
+          const sliceMs = Math.min(effectiveSliceMs, Math.max(1_000, remainingMs));
           const sliceCallTimeout = Math.min(waitCallTimeoutMs, sliceMs + connectTimeoutMs);
           let slicePayload: Record<string, unknown> | null = null;
           let sliceTimedOut = false;
@@ -1590,6 +1756,35 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           const errorText = nonEmpty(slicePayload?.error) ?? (lifecycleError ?? undefined) ?? undefined;
           const sliceDecision = classifyWaitSliceStatus(slicePayload?.status);
           if (sliceDecision === "done") { waitStatus = "ok"; break; }
+          // RUAAAAA-5256: admission-control verdict for this slice. A single queued slice is not
+          // enough — a run that finishes right after its slice expires can also look queued — so we
+          // require `saturatedMinQueuedSlices` consecutive answers before giving up.
+          const sliceSaturation = detectWaitSliceSaturation(slicePayload);
+          if (sliceSaturation.providerStarted) {
+            providerEverStarted = true;
+            queuedSliceCount = 0;
+            firstQueuedAtMs = null;
+            saturationReason = null;
+          } else if (sliceSaturation.saturated) {
+            queuedSliceCount += 1;
+            saturationReason = sliceSaturation.reason;
+            lastSaturationPayload = slicePayload;
+            if (firstQueuedAtMs === null) firstQueuedAtMs = Date.now();
+            await ctx.onLog(
+              "stdout",
+              `[openclaw-gateway] queued (not started) slice ${sliceCount}/${saturatedMinQueuedSlices} reason=${sliceSaturation.reason} timeoutPhase=${sliceSaturation.timeoutPhase ?? "none"} status=${sliceStatus || "none"} elapsed=${Date.now() - waitBudgetStart}ms\n`,
+            );
+            if (queuedSliceCount >= saturatedMinQueuedSlices) {
+              waitStatus = "saturated";
+              break;
+            }
+          } else if (queuedSliceCount > 0) {
+            // Evidence went away (unknown/blank status): restart the streak rather than accreting
+            // unrelated slices into a saturation verdict.
+            queuedSliceCount = 0;
+            firstQueuedAtMs = null;
+            saturationReason = null;
+          }
           const signal = detectCooldownSignal([
             typeof errorText === "string" ? errorText : null,
             sliceStatus === "error" ? nonEmpty(slicePayload?.summary) : null,
@@ -1639,6 +1834,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         const finalElapsedMs = Date.now() - waitBudgetStart;
         if (waitStatus === "ok") {
           // ok
+        } else if (waitStatus === "saturated") {
+          // RUAAAAA-5256: fail fast on admission-control backpressure. `timedOut:false` plus a
+          // saturated-specific code keeps this out of the timeout bucket, and
+          // `transient_upstream` routes it into Paperclip's bounded backoff retry
+          // (2m/10m/30m/2h) instead of the stranded-issue recovery path.
+          await ctx.onLog(
+            "stdout",
+            `[openclaw-gateway] saturated after ${finalElapsedMs}ms across ${sliceCount} slice(s); abandoning waitTimeoutMs=${waitTimeoutMs}ms budget\n`,
+          );
+          return buildSaturatedResult({
+            stage: "wait",
+            reason: saturationReason ?? "queued_not_started",
+            payload: lastSaturationPayload,
+            elapsedMs: finalElapsedMs,
+            sliceCount,
+            waitTimeoutMs,
+            retryDelayMs: saturatedRetryDelayMs,
+          });
         } else if (waitStatus === "timeout") {
           const messageParts = cooldownSignal
             ? [
