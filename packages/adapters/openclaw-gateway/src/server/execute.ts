@@ -258,6 +258,65 @@ export function parseSaturatedMinQueuedSlices(value: unknown): number {
   return Math.max(1, Math.min(20, parsed));
 }
 
+/**
+ * RUAAAAA-5310: why a `waitStatus = "timeout"` verdict was reached.
+ *
+ * `budget_exhausted` means `waitTimeoutMs` really did run out. `slice_cap_exhausted` means the
+ * loop hit `maxSlices` first — which RUAAAAA-5256's probe cadence can do several times earlier
+ * than the budget. Both return `timedOut: true` with the same message, so an operator reading
+ * `timed_out` had no way to tell a 600s budget from a 120s cap.
+ */
+export type WaitTimeoutExitReason = "budget_exhausted" | "slice_cap_exhausted";
+
+/**
+ * RUAAAAA-5310: build the wait-timeout message an operator can actually reason about.
+ *
+ * The previous template was structurally self-contradictory. It paired a real elapsed counter
+ * with the NOMINAL slice interval and nothing else:
+ *
+ *   "across 24 polling slice(s) of 30000ms"  with  "elapsed 121053ms"
+ *
+ * 24 x 30s is 720s and the elapsed is 121s, so the sentence could not be used to tell how long
+ * the adapter waited — which is the only thing it is read for. Two independent causes:
+ *
+ *  1. The slice the loop runs on is `min(waitSliceMs, saturatedProbeSliceMs)` (5s on a run that
+ *     never reported provider-started), so the reported 30s interval was never the one used.
+ *  2. Even on the nominal cadence the wall clock per slice is not `waitSliceMs`. A slice call is
+ *     bounded by `sliceMs + connectTimeoutMs` (up to 90s at defaults), so a run that overran on
+ *     one call reports fewer slices than budget/interval (18 slices across 601s).
+ *
+ * So report the MEASURED mean instead of a claimed interval: `measured x count == elapsed` holds
+ * by construction, so no future cadence change can make this message contradict itself again.
+ * The configured intervals and the cap are still reported, labelled as configuration.
+ */
+export function buildWaitTimeoutMessage(input: {
+  waitTimeoutMs: number;
+  elapsedMs: number;
+  sliceCount: number;
+  maxSlices: number;
+  nominalSliceMs: number;
+  probeSliceMs: number;
+  connectTimeoutMs: number;
+  exitReason: WaitTimeoutExitReason;
+}): string {
+  const { waitTimeoutMs, elapsedMs, sliceCount, maxSlices, nominalSliceMs, probeSliceMs, connectTimeoutMs, exitReason } = input;
+  const measuredMsPerSlice = sliceCount > 0 ? Math.round(elapsedMs / sliceCount) : elapsedMs;
+  const cadence =
+    probeSliceMs < nominalSliceMs
+      ? `${probeSliceMs}ms probe while the run has not reported provider-started / ${nominalSliceMs}ms nominal`
+      : `${nominalSliceMs}ms nominal`;
+  const why =
+    exitReason === "slice_cap_exhausted"
+      ? `hit the ${maxSlices}-slice cap before the wall-clock budget`
+      : `reached the waitTimeoutMs budget`;
+  return (
+    `OpenClaw gateway run did not complete within waitTimeoutMs=${waitTimeoutMs}ms ` +
+    `(exit=${exitReason}: ${why}; elapsed ${elapsedMs}ms across ${sliceCount} polling slice(s) ` +
+    `= ${measuredMsPerSlice}ms/slice measured; slice cadence ${cadence}, per-call ceiling ` +
+    `${nominalSliceMs + connectTimeoutMs}ms; no cooldown signal in slice response or lifecycle stream)`
+  );
+}
+
 type CooldownSignal = { detected: boolean; provider?: string; reason?: string; untilMs?: number; untilIso?: string; };
 
 export function detectCooldownSignal(messages: Array<string | null | undefined>): CooldownSignal {
@@ -1756,6 +1815,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         let saturationReason: WaitSliceSaturation["reason"] = null;
         let firstQueuedAtMs: number | null = null;
         let lastSaturationPayload: Record<string, unknown> | null = null;
+        // RUAAAAA-5310: record which of the two non-done exits fired, so the timeout message can
+        // tell a real budget exhaustion from a slice-cap exhaustion. They are both `timedOut:true`
+        // but only one of them is actually `waitTimeoutMs` running out.
+        let timeoutExitReason: WaitTimeoutExitReason = "budget_exhausted";
 
         while (true) {
           const elapsedMs = Date.now() - waitBudgetStart;
@@ -1850,6 +1913,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             pendingSliceCount += 1;
             if (sliceCount >= maxSlices || pendingSliceCount >= maxSlices) {
               waitStatus = "timeout";
+              timeoutExitReason = "slice_cap_exhausted";
               break;
             }
             await ctx.onLog(
@@ -1892,7 +1956,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                 `cooldownAttempts=${cooldownAttempts}`,
               ].filter((e): e is string => Boolean(e))
             : [
-                `OpenClaw gateway run did not complete within waitTimeoutMs=${waitTimeoutMs}ms (elapsed ${finalElapsedMs}ms across ${sliceCount} polling slice(s) of ${waitSliceMs}ms; no cooldown signal in slice response or lifecycle stream)`,
+                buildWaitTimeoutMessage({
+                  waitTimeoutMs,
+                  elapsedMs: finalElapsedMs,
+                  sliceCount,
+                  maxSlices,
+                  nominalSliceMs: waitSliceMs,
+                  probeSliceMs: saturatedProbeSliceMs,
+                  connectTimeoutMs,
+                  exitReason: timeoutExitReason,
+                }),
                 `lastSliceStatus=${nonEmpty(asRecord(waitPayload)?.status)?.toLowerCase() ?? "none"}`,
               ];
           return {

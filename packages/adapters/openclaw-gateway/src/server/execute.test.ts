@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildWaitTimeoutMessage,
   classifyWaitSliceStatus,
   detectCooldownSignal,
   detectWaitSliceSaturation,
@@ -268,5 +269,100 @@ describe("parseCooldownBackoffSequence (RUAAAAA-5062)", () => {
     const out = parseCooldownBackoffSequence([20 * 60_000, 5_000]);
     expect(out[0]).toBe(10 * 60_000);
     expect(out[1]).toBe(5_000);
+  });
+});
+
+describe("buildWaitTimeoutMessage (RUAAAAA-5310)", () => {
+  // The whole point of this issue: an operator reads this string to learn how long the adapter
+  // waited, so the numbers in it have to reconcile. Parse them back out and prove they do.
+  const parseReported = (msg: string) => {
+    const elapsed = Number(/elapsed (\d+)ms/.exec(msg)?.[1]);
+    const slices = Number(/across (\d+) polling slice\(s\)/.exec(msg)?.[1]);
+    const measured = Number(/= (\d+)ms\/slice measured/.exec(msg)?.[1]);
+    return { elapsed, slices, measured };
+  };
+
+  it("REGRESSION: the real 24-slice / 121s signature stays self-consistent (was '24 slices of 30000ms')", () => {
+    const msg = buildWaitTimeoutMessage({
+      waitTimeoutMs: 600_000,
+      elapsedMs: 121_053,
+      sliceCount: 24,
+      maxSlices: 24,
+      nominalSliceMs: 30_000,
+      probeSliceMs: 5_000,
+      connectTimeoutMs: 60_000,
+      exitReason: "slice_cap_exhausted",
+    });
+    const { elapsed, slices, measured } = parseReported(msg);
+    expect(slices).toBe(24);
+    expect(elapsed).toBe(121_053);
+    // measured x count == elapsed, to within the per-slice rounding of the quotient.
+    expect(Math.abs(measured * slices - elapsed)).toBeLessThanOrEqual(slices);
+    expect(msg).toContain("exit=slice_cap_exhausted");
+    expect(msg).toContain("24-slice cap");
+    // The nominal interval is reported as configuration, never as a per-slice claim.
+    expect(msg).not.toMatch(/polling slice\(s\) of /);
+  });
+
+  it("REGRESSION: the 18-slice / 601s overrun signature stays self-consistent", () => {
+    const msg = buildWaitTimeoutMessage({
+      waitTimeoutMs: 600_000,
+      elapsedMs: 601_203,
+      sliceCount: 18,
+      maxSlices: 24,
+      nominalSliceMs: 30_000,
+      probeSliceMs: 5_000,
+      connectTimeoutMs: 60_000,
+      exitReason: "budget_exhausted",
+    });
+    const { elapsed, slices, measured } = parseReported(msg);
+    expect(slices).toBe(18);
+    expect(elapsed).toBe(601_203);
+    expect(Math.abs(measured * slices - elapsed)).toBeLessThanOrEqual(slices);
+    expect(msg).toContain("exit=budget_exhausted");
+    expect(msg).not.toContain("slice cap");
+  });
+
+  it("distinguishes a real budget exhaustion from a cap exhaustion", () => {
+    const base = {
+      waitTimeoutMs: 600_000, elapsedMs: 600_500, sliceCount: 20, maxSlices: 124,
+      nominalSliceMs: 30_000, probeSliceMs: 5_000, connectTimeoutMs: 60_000,
+    };
+    expect(buildWaitTimeoutMessage({ ...base, exitReason: "budget_exhausted" }))
+      .toContain("reached the waitTimeoutMs budget");
+    expect(buildWaitTimeoutMessage({ ...base, exitReason: "slice_cap_exhausted" }))
+      .toContain("hit the 124-slice cap before the wall-clock budget");
+  });
+
+  it("reports the probe cadence when probe slices are shorter than nominal", () => {
+    const msg = buildWaitTimeoutMessage({
+      waitTimeoutMs: 600_000, elapsedMs: 121_053, sliceCount: 24, maxSlices: 24,
+      nominalSliceMs: 30_000, probeSliceMs: 5_000, connectTimeoutMs: 60_000,
+      exitReason: "slice_cap_exhausted",
+    });
+    expect(msg).toContain("5000ms probe");
+    expect(msg).toContain("30000ms nominal");
+    expect(msg).toContain("per-call ceiling 90000ms");
+  });
+
+  it("reports nominal-only cadence when probe slicing is not shorter", () => {
+    const msg = buildWaitTimeoutMessage({
+      waitTimeoutMs: 600_000, elapsedMs: 600_500, sliceCount: 20, maxSlices: 24,
+      nominalSliceMs: 30_000, probeSliceMs: 30_000, connectTimeoutMs: 60_000,
+      exitReason: "budget_exhausted",
+    });
+    expect(msg).toContain("30000ms nominal");
+    expect(msg).not.toContain("probe");
+  });
+
+  it("does not divide by zero when no slice completed", () => {
+    const msg = buildWaitTimeoutMessage({
+      waitTimeoutMs: 600_000, elapsedMs: 4_200, sliceCount: 0, maxSlices: 124,
+      nominalSliceMs: 30_000, probeSliceMs: 5_000, connectTimeoutMs: 60_000,
+      exitReason: "budget_exhausted",
+    });
+    expect(msg).toContain("across 0 polling slice(s)");
+    expect(msg).toContain(`= ${4_200}ms/slice measured`);
+    expect(msg).not.toContain("NaN");
   });
 });
