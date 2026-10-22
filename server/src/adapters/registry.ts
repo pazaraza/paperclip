@@ -8,6 +8,11 @@ import {
   buildSandboxNpmInstallCommand,
   getAdapterSessionManagement,
 } from "@paperclipai/adapter-utils";
+import {
+  createGuardedHermesSessionCodec,
+  isHermesSessionId,
+  sanitizeHermesExecutionResult,
+} from "./hermes-session-id.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -608,10 +613,29 @@ const hermesLocalAdapter: ServerAdapterModule = {
       },
     };
 
-    return executeHermesLocal(patchedCtx);
+    // RUAAAAA-5244: hermes' legacy stdout parser captures the next prose word
+    // after "session saved" / "session id", so ordinary output like "Session
+    // saved from the previous run" yields sessionId "from". heartbeat.ts reads
+    // adapterResult.sessionId directly (it bypasses the session codec) and
+    // writes it to agent_runtime_state.session_id, so guard it here too.
+    const hermesResult = await executeHermesLocal(patchedCtx);
+    if (typeof hermesResult?.sessionId === "string" && !isHermesSessionId(hermesResult.sessionId)) {
+      logger.warn(
+        { agentId, runId, rejectedSessionId: hermesResult.sessionId },
+        "[hermes_local] adapter reported a session id that is not a hermes session id; dropping it (RUAAAAA-5244)",
+      );
+    }
+    return sanitizeHermesExecutionResult(hermesResult);
   },
   testEnvironment: (ctx) => hermesTestEnvironment(normalizeHermesConfig(ctx) as never),
-  sessionCodec: hermesSessionCodec,
+  sessionCodec: createGuardedHermesSessionCodec(hermesSessionCodec, (rejections) => {
+    for (const rejection of rejections) {
+      logger.warn(
+        { rejectedField: rejection.field, rejectedSessionId: rejection.value },
+        "[hermes_local] refusing to persist a malformed hermes session id (RUAAAAA-5244)",
+      );
+    }
+  }),
   listSkills: hermesListSkills,
   syncSkills: hermesSyncSkills,
   models: hermesModels,
