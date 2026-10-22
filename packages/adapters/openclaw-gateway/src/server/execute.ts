@@ -119,8 +119,8 @@ const COOLDOWN_BACKOFF_MAX_MS = 10 * 60_000;
 const COOLDOWN_WAIT_SLICE_DEFAULT_MS = 30_000;
 // RUAAAAA-5199: slack slices allowed past the nominal waitTimeoutMs/sliceMs ratio so a slow-but-alive
 // gateway can still finish, while a gateway that returns `timeout` instantly can never spin forever.
-const WAIT_SLICE_OVERRUN_SLACK = 4;
-const WAIT_SLICE_MIN_SLICES = 4;
+export const WAIT_SLICE_OVERRUN_SLACK = 4;
+export const WAIT_SLICE_MIN_SLICES = 4;
 // RUAAAAA-5256: admission-control feedback. When the gateway is over-committed it ACCEPTS the
 // dispatch but never STARTS it, and every `agent.wait` slice comes back as
 // `{status:"timeout", timeoutPhase:"queue"|"gateway_draining", providerStarted:false}`.
@@ -1749,9 +1749,28 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         const cooldownBackoffSequence = parseCooldownBackoffSequence(ctx.config.cooldownBackoffMs);
         const waitCallTimeoutMs = waitTimeoutMs + connectTimeoutMs;
         const waitBudgetStart = Date.now();
+        // RUAAAAA-5299: the slice cap is an ANTI-SPIN guard, not a second time budget.
+        //
+        // It used to be derived from `waitSliceMs`, which assumes every slice consumes its whole
+        // window. A gateway that answers `agent.wait` early — exactly what RUAAAAA-5280's
+        // `gateway_draining` slices are — burns that cap long before the wall-clock budget runs out.
+        // Observed on this fleet: `waitTimeoutMs=600000` with 30s slices gave a cap of 24, and a
+        // gateway answering in ~5s per slice hit it at ~125s. The run then reported
+        //
+        //   "did not complete within waitTimeoutMs=600000ms (elapsed 125558ms across 24 slices)"
+        //
+        // which is false on its face — it never ran for 600s. Worse, it wrote a terminal `timed_out`
+        // while the session was still live, which spawned a continuation wake, which started another
+        // run, which died at ~125s the same way. A self-sustaining loop off a false budget claim.
+        //
+        // Scale the cap by the SMALLEST slice the loop can actually use, so the wall-clock budget
+        // (`remainingMs <= 0`) stays the authority on when a wait ends, and the cap only fires to
+        // stop a genuine tight spin. `minSliceMs` is the saturated-probe slice while the provider has
+        // not started and the full slice afterwards, so the cap is sized for the fast case.
+        const minSliceMs = Math.max(1, Math.min(waitSliceMs, saturatedProbeSliceMs));
         const maxSlices = Math.max(
           WAIT_SLICE_MIN_SLICES,
-          Math.ceil(waitTimeoutMs / Math.max(1, waitSliceMs)) + WAIT_SLICE_OVERRUN_SLACK,
+          Math.ceil(waitTimeoutMs / minSliceMs) + WAIT_SLICE_OVERRUN_SLACK,
         );
         let cooldownSignal: CooldownSignal | null = null;
         let cooldownAttempts = 0;
@@ -1897,6 +1916,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             liveSessionRunId: gatewayOwnedRunId,
           });
         } else if (waitStatus === "timeout") {
+          // RUAAAAA-5299: say WHY the wait ended, and never claim a budget that was not consumed.
+          // The old text hard-coded "did not complete within waitTimeoutMs=Nms" regardless of how the
+          // loop actually exited, which is how a 125s wait was reported as a 600s timeout and sent
+          // whoever read the run log hunting for a slow provider that never existed.
+          const budgetExhausted = finalElapsedMs >= waitTimeoutMs;
+          const exitReason = budgetExhausted
+            ? `time budget exhausted (waitTimeoutMs=${waitTimeoutMs}ms)`
+            : `poll-slot cap exhausted after ${sliceCount} slice(s) (maxSlices=${maxSlices}) before the ${waitTimeoutMs}ms time budget`;
           const messageParts = cooldownSignal
             ? [
                 `OpenClaw gateway run timed out after ${waitTimeoutMs}ms while provider "${cooldownSignal.provider ?? "unknown"}" was in cooldown (${cooldownSignal.reason ?? "unknown"})`,
@@ -1904,7 +1931,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                 `cooldownAttempts=${cooldownAttempts}`,
               ].filter((e): e is string => Boolean(e))
             : [
-                `OpenClaw gateway run did not complete within waitTimeoutMs=${waitTimeoutMs}ms (elapsed ${finalElapsedMs}ms across ${sliceCount} polling slice(s) of ${waitSliceMs}ms; no cooldown signal in slice response or lifecycle stream)`,
+                `OpenClaw gateway run did not complete: ${exitReason} (elapsed ${finalElapsedMs}ms across ${sliceCount} polling slice(s), requested slice ${waitSliceMs}ms; no cooldown signal in slice response or lifecycle stream)`,
                 `lastSliceStatus=${nonEmpty(asRecord(waitPayload)?.status)?.toLowerCase() ?? "none"}`,
               ];
           return {
