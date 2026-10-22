@@ -88,6 +88,11 @@ import {
   DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX,
   DEFAULT_CODEX_LOCAL_MODEL,
 } from "@paperclipai/adapter-codex-local";
+import {
+  resolveCodexCredentialScope,
+  resolveServableModel,
+  type CodexCredentialScope,
+} from "@paperclipai/adapter-codex-local/server";
 import { DEFAULT_CURSOR_LOCAL_MODEL } from "@paperclipai/adapter-cursor-local";
 import { DEFAULT_GEMINI_LOCAL_MODEL } from "@paperclipai/adapter-gemini-local";
 import { DEFAULT_OPENCODE_LOCAL_MODEL } from "@paperclipai/adapter-opencode-local";
@@ -997,10 +1002,10 @@ export function agentRoutes(
     return { ...adapterConfig, devicePrivateKeyPem: generateEd25519PrivateKeyPem() };
   }
 
-  function applyCreateDefaultsByAdapterType(
+  async function applyCreateDefaultsByAdapterType(
     adapterType: string | null | undefined,
     adapterConfig: Record<string, unknown>,
-  ): Record<string, unknown> {
+  ): Promise<Record<string, unknown>> {
     const next = { ...adapterConfig };
     if (adapterType === "acpx_local") {
       if (!asNonEmptyString(next.agent)) {
@@ -1019,7 +1024,13 @@ export function agentRoutes(
     }
     if (adapterType === "codex_local") {
       if (!asNonEmptyString(next.model)) {
-        next.model = DEFAULT_CODEX_LOCAL_MODEL;
+        // Seed a model the active credential can actually serve. The static
+        // default is API-key shaped; a ChatGPT subscription credential 400s on
+        // it, and a newly created agent would fail its very first run.
+        const scope = await resolveCodexCredentialScope().catch(
+          () => "unknown" as CodexCredentialScope,
+        );
+        next.model = resolveServableModel(DEFAULT_CODEX_LOCAL_MODEL, scope);
       }
       const hasBypassFlag =
         typeof next.dangerouslyBypassApprovalsAndSandbox === "boolean" ||
@@ -1971,7 +1982,7 @@ export function agentRoutes(
     );
     assertNoAgentAdapterConfigMutation(req, rawHireAdapterConfig);
     assertNoAgentRuntimeConfigAdapterConfigMutation(req, hireInput.runtimeConfig);
-    const requestedAdapterConfig = applyCreateDefaultsByAdapterType(
+    const requestedAdapterConfig = await applyCreateDefaultsByAdapterType(
       hireInput.adapterType,
       rawHireAdapterConfig,
     );
@@ -2157,7 +2168,7 @@ export function agentRoutes(
     );
     assertNoAgentAdapterConfigMutation(req, rawCreateAdapterConfig);
     assertNoAgentRuntimeConfigAdapterConfigMutation(req, createInput.runtimeConfig);
-    const requestedAdapterConfig = applyCreateDefaultsByAdapterType(
+    const requestedAdapterConfig = await applyCreateDefaultsByAdapterType(
       createInput.adapterType,
       rawCreateAdapterConfig,
     );
@@ -2632,7 +2643,7 @@ export function agentRoutes(
           rawEffectiveAdapterConfig,
         );
       }
-      const effectiveAdapterConfig = applyCreateDefaultsByAdapterType(
+      const effectiveAdapterConfig = await applyCreateDefaultsByAdapterType(
         requestedAdapterType,
         rawEffectiveAdapterConfig,
       );

@@ -13,6 +13,15 @@ export {
   fetchWithTimeout,
   codexHomeDir,
 } from "./quota.js";
+export {
+  applyScopeToModelProfiles,
+  classifyCodexAuthJson,
+  filterModelsForScope,
+  isModelServableForScope,
+  resolveCodexCredentialScope,
+  resolveServableModel,
+} from "./model-policy.js";
+export type { CodexCredentialScope } from "./model-policy.js";
 import type { AdapterSessionCodec } from "@paperclipai/adapter-utils";
 
 function readNonEmptyString(value: unknown): string | null {

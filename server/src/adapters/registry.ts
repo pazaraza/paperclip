@@ -201,7 +201,7 @@ import {
   agentConfigurationDoc as openclawGatewayAgentConfigurationDoc,
   models as openclawGatewayModels,
 } from "@paperclipai/adapter-openclaw-gateway";
-import { listCodexModels, refreshCodexModels } from "./codex-models.js";
+import { listCodexModels, listCodexModelProfiles, refreshCodexModels } from "./codex-models.js";
 import { listCursorModels } from "./cursor-models.js";
 import {
   execute as piExecute,
@@ -387,6 +387,7 @@ const codexLocalAdapter: ServerAdapterModule = {
   sessionManagement: getAdapterSessionManagement("codex_local") ?? undefined,
   models: codexModels,
   modelProfiles: codexModelProfiles,
+  listModelProfiles: listCodexModelProfiles,
   listModels: listCodexModels,
   refreshModels: refreshCodexModels,
   supportsLocalAgentJwt: true,

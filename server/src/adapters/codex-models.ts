@@ -1,5 +1,11 @@
 import type { AdapterModel } from "./types.js";
-import { models as codexFallbackModels } from "@paperclipai/adapter-codex-local";
+import { models as codexFallbackModels, modelProfiles as codexModelProfiles } from "@paperclipai/adapter-codex-local";
+import {
+  applyScopeToModelProfiles,
+  filterModelsForScope,
+  resolveCodexCredentialScope,
+  type CodexCredentialScope,
+} from "@paperclipai/adapter-codex-local/server";
 import { readConfigFile } from "../config-file.js";
 
 const OPENAI_MODELS_ENDPOINT = "https://api.openai.com/v1/models";
@@ -73,18 +79,24 @@ async function fetchOpenAiModels(apiKey: string): Promise<AdapterModel[]> {
 async function loadCodexModels(options?: { forceRefresh?: boolean }): Promise<AdapterModel[]> {
   const forceRefresh = options?.forceRefresh === true;
   const apiKey = resolveOpenAiApiKey();
-  const fallback = dedupeModels(codexFallbackModels);
+  // Resolve the credential scope even when an API key is present: the scope
+  // decides which models the picker offers, and it changes independently of
+  // the OpenAI API key used to discover them.
+  const scope: CodexCredentialScope = await resolveCodexCredentialScope().catch(
+    () => "unknown" as const,
+  );
+  const fallback = filterModelsForScope(dedupeModels(codexFallbackModels), scope);
   if (!apiKey) return fallback;
 
   const now = Date.now();
-  const keyFingerprint = fingerprint(apiKey);
+  const keyFingerprint = `${fingerprint(apiKey)}:${scope}`;
   if (!forceRefresh && cached && cached.keyFingerprint === keyFingerprint && cached.expiresAt > now) {
     return cached.models;
   }
 
   const fetched = await fetchOpenAiModels(apiKey);
   if (fetched.length > 0) {
-    const merged = mergedWithFallback(fetched);
+    const merged = filterModelsForScope(mergedWithFallback(fetched), scope);
     cached = {
       keyFingerprint,
       expiresAt: now + OPENAI_MODELS_CACHE_TTL_MS,
@@ -102,6 +114,21 @@ async function loadCodexModels(options?: { forceRefresh?: boolean }): Promise<Ad
 
 export async function listCodexModels(): Promise<AdapterModel[]> {
   return loadCodexModels();
+}
+
+/**
+ * Model profiles re-targeted at the active credential.
+ *
+ * The static `codex_local` profiles are API-key shaped. If a profile default is
+ * ever pointed back at a model a ChatGPT subscription credential cannot serve,
+ * this keeps the profile lane from silently re-arming the adapter: the runtime
+ * sees a servable model instead of one that 400s on every dispatch.
+ */
+export async function listCodexModelProfiles(): Promise<
+  Awaited<ReturnType<typeof applyScopeToModelProfiles>>
+> {
+  const scope = await resolveCodexCredentialScope().catch(() => "unknown" as CodexCredentialScope);
+  return applyScopeToModelProfiles(codexModelProfiles, scope);
 }
 
 export async function refreshCodexModels(): Promise<AdapterModel[]> {
