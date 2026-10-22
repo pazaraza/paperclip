@@ -97,7 +97,88 @@ type GatewayClientRequestOptions = {
   expectFinal?: boolean;
 };
 
-const PROTOCOL_VERSION = 4;
+// RUAAAAA-5246: declare a protocol RANGE, never an equality.
+//
+// The gateway admits a client when the declared range *overlaps* its current
+// protocol (`supportsCurrentProtocol = maxProtocol >= CURRENT && minProtocol <=
+// CURRENT`), so `min === max === 3` is the one shape guaranteed to break the
+// moment CURRENT moves. On 2026-10-17 the gateway restarted onto an app that
+// required protocol 4 and every openclaw_gateway agent on that instance was
+// closed with 1002 "protocol mismatch" in ~390ms, with no adapter-side error
+// surfaced to Paperclip.
+//
+// MIN is the oldest protocol whose frame shape this adapter still speaks (the
+// device-auth v3 envelope). MAX is deliberately ahead of any version this
+// adapter has run against: the gateway -- not the client -- decides what a
+// declared range means, so headroom turns a future protocol bump from
+// "fleet-wide stranding" into "a run that connects". The negotiated protocol in
+// the hello-ok payload is read back and logged so drift stays visible.
+const GATEWAY_PROTOCOL_MIN_VERSION = 3;
+const GATEWAY_PROTOCOL_MAX_VERSION = 8;
+
+export type GatewayProtocolRange = {
+  minProtocol: number;
+  maxProtocol: number;
+};
+
+export function gatewayProtocolRange(): GatewayProtocolRange {
+  return {
+    minProtocol: GATEWAY_PROTOCOL_MIN_VERSION,
+    maxProtocol: GATEWAY_PROTOCOL_MAX_VERSION,
+  };
+}
+
+export type ProtocolMismatchSignal = {
+  expectedProtocol: number | null;
+  clientMinProtocol: number | null;
+  clientMaxProtocol: number | null;
+};
+
+function finiteOrNull(value: unknown): number | null {
+  const n = asNumber(value, Number.NaN);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Recognise a gateway protocol-mismatch rejection so it is reported as
+ * `openclaw_gateway_protocol_mismatch` rather than a generic request failure.
+ *
+ * The gateway signals it two ways and the adapter can observe either: an
+ * INVALID_REQUEST response whose `details.code` is `protocol_mismatch`, or the
+ * 1002 "protocol mismatch" close that immediately follows it. The close races
+ * the response, so the message text is matched too -- that is the branch that
+ * actually won during the 2026-10-17 incident.
+ */
+export function detectProtocolMismatch(input: {
+  message?: string | null;
+  details?: unknown;
+}): ProtocolMismatchSignal | null {
+  const details = asRecord(input.details);
+  const detailCode = nonEmpty(details?.code);
+  const detailFlagged = detailCode?.toLowerCase() === "protocol_mismatch";
+  const message = (input.message ?? "").toLowerCase();
+  if (!detailFlagged && !message.includes("protocol mismatch")) return null;
+
+  return {
+    expectedProtocol: finiteOrNull(details?.expectedProtocol),
+    clientMinProtocol: finiteOrNull(details?.clientMinProtocol),
+    clientMaxProtocol: finiteOrNull(details?.clientMaxProtocol),
+  };
+}
+
+export function describeProtocolMismatch(signal: ProtocolMismatchSignal | null): string {
+  if (!signal) return "";
+  const range = `${signal.clientMinProtocol ?? "?"}-${signal.clientMaxProtocol ?? "?"}`;
+  const expected = signal.expectedProtocol ?? "unknown";
+  return (
+    `gateway rejected the adapter handshake: gateway requires protocol ${expected} but this adapter ` +
+    `declared ${range}. The adapter and gateway builds are out of step -- widen ` +
+    `GATEWAY_PROTOCOL_MIN_VERSION/GATEWAY_PROTOCOL_MAX_VERSION in ` +
+    `packages/adapters/openclaw-gateway/src/server/execute.ts, or pin the gateway app to a matching ` +
+    `build. This is not a timeout; raising waitTimeoutMs will not help.`
+  );
+}
+
 const DEFAULT_SCOPES = ["operator.admin"];
 const DEFAULT_CLIENT_ID = "gateway-client";
 const DEFAULT_CLIENT_MODE = "backend";
@@ -1042,8 +1123,7 @@ async function autoApproveDevicePairing(params: {
 
     await client.connect(
       () => ({
-        minProtocol: PROTOCOL_VERSION,
-        maxProtocol: PROTOCOL_VERSION,
+        ...gatewayProtocolRange(),
         client: {
           id: params.clientId,
           version: params.clientVersion,
@@ -1443,8 +1523,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const hello = await client.connect((nonce) => {
         const signedAtMs = Date.now();
         const connectParams: Record<string, unknown> = {
-          minProtocol: PROTOCOL_VERSION,
-          maxProtocol: PROTOCOL_VERSION,
+          ...gatewayProtocolRange(),
           client: {
             id: clientId,
             version: clientVersion,
@@ -1488,10 +1567,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         return connectParams;
       }, connectTimeoutMs);
 
+      const negotiatedProtocol = finiteOrNull(asRecord(hello)?.protocol);
+      const declaredRange = gatewayProtocolRange();
       await ctx.onLog(
         "stdout",
-        `[openclaw-gateway] connected protocol=${asNumber(asRecord(hello)?.protocol, PROTOCOL_VERSION)}\n`,
+        `[openclaw-gateway] connected protocol=${negotiatedProtocol ?? "unknown"} ` +
+          `declared=${declaredRange.minProtocol}-${declaredRange.maxProtocol}\n`,
       );
+      if (negotiatedProtocol !== null && negotiatedProtocol > declaredRange.maxProtocol) {
+        await ctx.onLog(
+          "stderr",
+          `[openclaw-gateway] negotiated protocol ${negotiatedProtocol} is newer than the declared ` +
+            `maximum ${declaredRange.maxProtocol}; upgrade the adapter before frame semantics drift\n`,
+        );
+      }
 
       const acceptedPayload = await client.request<Record<string, unknown>>("agent", agentParams, {
         timeoutMs: connectTimeoutMs,
@@ -1769,9 +1858,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         );
       }
 
+      // RUAAAAA-5246: name a protocol mismatch for what it is. Left as a
+      // generic request failure it reads like a timeout and sends the operator
+      // after waitTimeoutMs instead of after the adapter/gateway version skew.
+      const gatewayDetails = (err as GatewayResponseError).gatewayDetails ?? null;
+      const protocolMismatch = detectProtocolMismatch({ message, details: gatewayDetails });
+      const mismatchHint = describeProtocolMismatch(protocolMismatch);
+
       const detailedMessage = pairingRequired
         ? `${message}. Approve the pending device in OpenClaw (for example: openclaw devices approve --latest --url <gateway-ws-url> --token <gateway-token>) and retry. Ensure this agent has a persisted adapterConfig.devicePrivateKeyPem so approvals are reused.`
-        : message;
+        : protocolMismatch
+          ? `${message}. ${mismatchHint}`
+          : message;
 
       await ctx.onLog("stderr", `[openclaw-gateway] request failed: ${detailedMessage}\n`);
 
@@ -1780,11 +1878,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         signal: null,
         timedOut,
         errorMessage: detailedMessage,
-        errorCode: timedOut
-          ? "openclaw_gateway_timeout"
-          : pairingRequired
-            ? "openclaw_gateway_pairing_required"
-            : "openclaw_gateway_request_failed",
+        errorCode: protocolMismatch
+          ? "openclaw_gateway_protocol_mismatch"
+          : timedOut
+            ? "openclaw_gateway_timeout"
+            : pairingRequired
+              ? "openclaw_gateway_pairing_required"
+              : "openclaw_gateway_request_failed",
         resultJson: asRecord(latestResultPayload),
       };
     } finally {

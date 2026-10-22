@@ -4,6 +4,7 @@ import type {
   AdapterEnvironmentTestResult,
 } from "@paperclipai/adapter-utils";
 import { asString, parseObject } from "@paperclipai/adapter-utils/server-utils";
+import { gatewayProtocolRange } from "./execute.js";
 import { randomUUID } from "node:crypto";
 import { WebSocket } from "ws";
 
@@ -90,6 +91,8 @@ function rawDataToString(data: unknown): string {
   return String(data ?? "");
 }
 
+type ProbeOutcome = "ok" | "challenge_only" | "protocol_mismatch" | "failed";
+
 async function probeGateway(input: {
   url: string;
   headers: Record<string, string>;
@@ -97,7 +100,7 @@ async function probeGateway(input: {
   role: string;
   scopes: string[];
   timeoutMs: number;
-}): Promise<"ok" | "challenge_only" | "failed"> {
+}): Promise<ProbeOutcome> {
   return await new Promise((resolve) => {
     const ws = new WebSocket(input.url, { headers: input.headers, maxPayload: 2 * 1024 * 1024 });
     const timeout = setTimeout(() => {
@@ -111,7 +114,7 @@ async function probeGateway(input: {
 
     let completed = false;
 
-    const finish = (status: "ok" | "challenge_only" | "failed") => {
+    const finish = (status: ProbeOutcome) => {
       if (completed) return;
       completed = true;
       clearTimeout(timeout);
@@ -145,8 +148,7 @@ async function probeGateway(input: {
             id: connectId,
             method: "connect",
             params: {
-              minProtocol: 3,
-              maxProtocol: 3,
+              ...gatewayProtocolRange(),
               client: {
                 id: "gateway-client",
                 version: "paperclip-probe",
@@ -172,7 +174,11 @@ async function probeGateway(input: {
         if (event.ok === true) {
           finish("ok");
         } else {
-          finish("challenge_only");
+          // RUAAAAA-5246: a protocol mismatch is a version-skew problem, not a
+          // credentials problem. Reporting it as "challenge_only" pointed
+          // operators at auth/scopes/role for a fault those settings cannot fix.
+          const errorMessage = nonEmpty(asRecord(asRecord(event.error)?.message)) ?? "";
+          finish(errorMessage.toLowerCase().includes("protocol mismatch") ? "protocol_mismatch" : "challenge_only");
         }
       }
     });
@@ -269,6 +275,7 @@ export async function testEnvironment(
 
   if (url && (url.protocol === "ws:" || url.protocol === "wss:")) {
     try {
+      const range = gatewayProtocolRange();
       const probeResult = await probeGateway({
         url: url.toString(),
         headers,
@@ -283,6 +290,13 @@ export async function testEnvironment(
           code: "openclaw_gateway_probe_ok",
           level: "info",
           message: "Gateway connect probe succeeded.",
+        });
+      } else if (probeResult === "protocol_mismatch") {
+        checks.push({
+          code: "openclaw_gateway_probe_protocol_mismatch",
+          level: "error",
+          message: `Gateway rejected this adapter's protocol range (${range.minProtocol}-${range.maxProtocol}).`,
+          hint: "Adapter and gateway builds are out of step. Update the adapter, or pin the gateway app to a matching build.",
         });
       } else if (probeResult === "challenge_only") {
         checks.push({
