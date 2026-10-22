@@ -365,6 +365,190 @@ export function buildSaturatedResult(input: {
   };
 }
 
+/**
+ * RUAAAAA-5302: which limit ended the wait loop.
+ *
+ * RUAAAAA-5302 exists because the old timeout message could not be reconciled with itself:
+ * `elapsed 136182ms across 24 polling slice(s) of 30000ms` against a `waitTimeoutMs=600000ms`
+ * budget is arithmetically impossible in three directions at once. It was not a formatting bug —
+ * it was the visible symptom of the slice cap firing early (see the `maxSlices` comment), and it
+ * left an operator unable to tell a slow run from a stuck one. An operator reads this string to
+ * decide whether to wait or intervene, so it now names the cadence actually used and the limit
+ * actually reached instead of asserting a nominal slice that may never have been used.
+ */
+export type WaitEndReason = "budget" | "slice_cap";
+
+export function buildWaitTimeoutResult(input: {
+  payload: Record<string, unknown> | null;
+  elapsedMs: number;
+  sliceCount: number;
+  maxSlices: number;
+  waitTimeoutMs: number;
+  /** Nominal full-cadence slice. */
+  waitSliceMs: number;
+  /** Probe slice used until the run reports provider-started. */
+  probeSliceMs: number;
+  providerEverStarted: boolean;
+  endReason: WaitEndReason;
+  cooldownSignal: CooldownSignal | null;
+  cooldownAttempts: number;
+  cooldownBackoffSequenceMs: number[];
+  liveSessionRunId: string | null;
+}): AdapterExecutionResult {
+  const sessionLive = input.liveSessionRunId !== null;
+  const cooldown = input.cooldownSignal;
+  // Report the cadence the loop could actually use. Pre-provider-start slices run on
+  // `min(waitSliceMs, probeSliceMs)`; after provider-start they run on the full nominal slice.
+  const shortestSliceMs = Math.max(1, Math.min(input.waitSliceMs, input.probeSliceMs));
+  const cadence = input.providerEverStarted
+    ? `${input.waitSliceMs}ms`
+    : `${shortestSliceMs}-${input.waitSliceMs}ms probe cadence (run never reported provider-started)`;
+  // Name the limit that ended the loop. `slice_cap` reached while budget remained is exactly the
+  // truncation that produced the unreconcilable string in the first place; saying so out loud is
+  // what lets an operator tell "slow" from "cut short".
+  // Only two endings are distinguishable here. A run that ran out of budget *while sleeping
+  // through provider cooldown* also lands on `budget`, but that is already unambiguous in the
+  // message: `cooldownSignal` is set, and the message says the cooldown ended it.
+  const endedBy =
+    input.endReason === "slice_cap"
+      ? `ended when the wait slice cap (${input.maxSlices} slices) was reached after ${input.elapsedMs}ms, ` +
+        `BEFORE the ${input.waitTimeoutMs}ms budget was spent`
+      : `ended when the ${input.waitTimeoutMs}ms wait budget was spent`;
+  const messageParts = cooldown
+    ? [
+        `OpenClaw gateway run timed out after ${input.waitTimeoutMs}ms while provider "${cooldown.provider ?? "unknown"}" was in cooldown (${cooldown.reason ?? "unknown"})`,
+        cooldown.untilIso ? `cooldownUntilIso=${cooldown.untilIso}` : null,
+        `cooldownAttempts=${input.cooldownAttempts}`,
+        endedBy,
+      ].filter((e): e is string => Boolean(e))
+    : [
+        `OpenClaw gateway run did not complete within waitTimeoutMs=${input.waitTimeoutMs}ms (elapsed ${input.elapsedMs}ms across ${input.sliceCount} polling slice(s), ${cadence}; ${endedBy}; no cooldown signal in slice response or lifecycle stream)`,
+        `lastSliceStatus=${nonEmpty(asRecord(input.payload)?.status)?.toLowerCase() ?? "none"}`,
+      ];
+  // RUAAAAA-5302: an operator reading this string in the run log has to be able to tell "the
+  // session died" from "we stopped watching". `timed_out` says neither on its own, so say it here
+  // rather than making them go read `sessionLive` out of resultJson.
+  if (sessionLive) {
+    messageParts.push(`wait abandoned only, gateway session ${input.liveSessionRunId} is still live`);
+  }
+  const evidence = {
+    waitTimeout: {
+      sessionLive,
+      liveSessionRunId: input.liveSessionRunId,
+      endReason: input.endReason,
+      elapsedMs: input.elapsedMs,
+      sliceCount: input.sliceCount,
+      maxSlices: input.maxSlices,
+      waitTimeoutMs: input.waitTimeoutMs,
+      waitSliceMs: input.waitSliceMs,
+      probeSliceMs: input.probeSliceMs,
+      providerEverStarted: input.providerEverStarted,
+      budgetExhausted: input.endReason !== "slice_cap",
+      cooldownAttempts: input.cooldownAttempts,
+      cooldownBackoffSequenceMs: input.cooldownBackoffSequenceMs,
+    },
+  };
+  return {
+    exitCode: 1,
+    signal: null,
+    // RUAAAAA-5302: this stays `true`. The run genuinely did exhaust the wait budget, and the
+    // `timed_out` record is the honest history of the adapter. What was NOT true is that the
+    // session was dead — see `sessionLive`. The server consults `sessionLive` first, so the run is
+    // held non-terminal and reconciled instead of being failed and retried.
+    timedOut: true,
+    errorMessage: messageParts.join("; "),
+    errorCode: cooldown ? "openclaw_gateway_wait_timeout_in_cooldown" : "openclaw_gateway_wait_timeout",
+    sessionLive,
+    liveSessionRunId: input.liveSessionRunId,
+    errorMeta: evidence,
+    resultJson: {
+      ...asRecord(input.payload),
+      ...evidence,
+      ...(cooldown
+        ? {
+            cooldown: {
+              provider: cooldown.provider ?? null,
+              reason: cooldown.reason ?? null,
+              untilIso: cooldown.untilIso ?? null,
+              untilMs: cooldown.untilMs ?? null,
+              attempts: input.cooldownAttempts,
+              backoffSequenceMs: input.cooldownBackoffSequenceMs,
+            },
+          }
+        : {}),
+    },
+  };
+}
+
+/**
+ * RUAAAAA-5302: the exhausted-cooldown give-up.
+ *
+ * `cooldownAttempts >= backoffSequence.length` abandons a run that is sitting in *provider
+ * cooldown* — a transient state the gateway itself reported — not a run that is dead. The gateway
+ * still owns it. Writing a terminal failure here lets the bounded retry scheduler queue a retry
+ * against a run the provider is still holding, which is the RUAAAAA-5299 defect one branch over.
+ *
+ * Gated on the gateway-issued run id exactly like the saturation path: a `ctx.runId` fallback is
+ * our own bookkeeping id and says nothing about whether a provider session exists.
+ */
+export function buildCooldownExhaustedResult(input: {
+  payload: Record<string, unknown> | null;
+  waitTimeoutMs: number;
+  cooldownSignal: CooldownSignal;
+  cooldownAttempts: number;
+  cooldownBackoffSequenceMs: number[];
+  liveSessionRunId: string | null;
+}): AdapterExecutionResult {
+  const sessionLive = input.liveSessionRunId !== null;
+  const evidence = {
+    cooldownExhausted: {
+      sessionLive,
+      liveSessionRunId: input.liveSessionRunId,
+      provider: input.cooldownSignal.provider ?? null,
+      reason: input.cooldownSignal.reason ?? null,
+      untilIso: input.cooldownSignal.untilIso ?? null,
+      untilMs: input.cooldownSignal.untilMs ?? null,
+      attempts: input.cooldownAttempts,
+      backoffSequenceMs: input.cooldownBackoffSequenceMs,
+    },
+  };
+  return {
+    exitCode: 1,
+    signal: null,
+    timedOut: false,
+    errorMessage:
+      `OpenClaw gateway run in cooldown: Provider "${input.cooldownSignal.provider ?? "unknown"}" ` +
+      `reason=${input.cooldownSignal.reason ?? "unknown"} ` +
+      `${input.cooldownSignal.untilIso ? `cooldownUntilIso=${input.cooldownSignal.untilIso}` : ""} ` +
+      `cooldownAttempts=${input.cooldownAttempts} (backoff sequence exhausted against waitTimeoutMs=${input.waitTimeoutMs}ms)` +
+      (sessionLive
+        ? `; gave up waiting only, gateway session ${input.liveSessionRunId} is still live in provider cooldown`
+        : ""),
+    errorCode: "openclaw_gateway_wait_cooldown",
+    // RUAAAAA-5302: deliberately NOT `transient_upstream`, even though the saturation path uses it.
+    // That flag reroutes the run into the bounded backoff retry, which is the right treatment for a
+    // cooldown — but this path's non-live case previously went through the stranded-issue recovery
+    // route, and RUAAAAA-5294 buckets these codes. Changing retry routing is a policy call that
+    // belongs with the drain-budget decision this issue escalates, not a side effect of marking a
+    // live session. Raised there rather than smuggled in here.
+    sessionLive,
+    liveSessionRunId: input.liveSessionRunId,
+    errorMeta: evidence,
+    resultJson: {
+      ...asRecord(input.payload),
+      ...evidence,
+      cooldown: {
+        provider: input.cooldownSignal.provider ?? null,
+        reason: input.cooldownSignal.reason ?? null,
+        untilIso: input.cooldownSignal.untilIso ?? null,
+        untilMs: input.cooldownSignal.untilMs ?? null,
+        attempts: input.cooldownAttempts,
+        backoffSequenceMs: input.cooldownBackoffSequenceMs,
+      },
+    },
+  };
+}
+
 
 const SENSITIVE_LOG_KEY_PATTERN =
   /(^|[_-])(auth|authorization|token|secret|password|api[_-]?key|private[_-]?key)([_-]|$)|^x-openclaw-(auth|token)$/i;
@@ -1786,11 +1970,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         let saturationReason: WaitSliceSaturation["reason"] = null;
         let firstQueuedAtMs: number | null = null;
         let lastSaturationPayload: Record<string, unknown> | null = null;
+        // RUAAAAA-5302: which limit ended the loop, and whether the give-up was a provider-cooldown
+        // exhaustion. The old code inferred both from `waitStatus`, which conflated three distinct
+        // endings (budget spent / slice cap reached / cooldown backoff ate the budget) into one
+        // unreconcilable message, and reported `openclaw_gateway_wait_cooldown` for any `error`
+        // that happened to follow a cooldown signal — including a plain gateway-reported slice
+        // error. Track them explicitly instead of re-deriving them.
+        let waitEndReason: WaitEndReason | null = null;
+        let cooldownExhausted = false;
 
         while (true) {
           const elapsedMs = Date.now() - waitBudgetStart;
           const remainingMs = waitTimeoutMs - elapsedMs;
-          if (remainingMs <= 0) { waitStatus = "timeout"; break; }
+          if (remainingMs <= 0) { waitStatus = "timeout"; waitEndReason = "budget"; break; }
           // RUAAAAA-5256: probe on a short slice until the run has actually been provider-started,
           // so saturation is visible within seconds instead of only at the end of `waitTimeoutMs`.
           const effectiveSliceMs =
@@ -1859,6 +2051,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             if (cooldownAttempts >= backoffSequence.length) {
               shouldRetryOnCooldown = false;
               waitStatus = "error";
+              cooldownExhausted = true;
               break;
             }
             const backoffAttempt = cooldownAttempts;
@@ -1880,6 +2073,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             pendingSliceCount += 1;
             if (sliceCount >= maxSlices || pendingSliceCount >= maxSlices) {
               waitStatus = "timeout";
+              // RUAAAAA-5302: this is the truncation that made the old message unreadable — the
+              // cap can fire with budget still unspent. Say which limit ended it.
+              waitEndReason = "slice_cap";
               break;
             }
             await ctx.onLog(
@@ -1916,45 +2112,55 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             liveSessionRunId: gatewayOwnedRunId,
           });
         } else if (waitStatus === "timeout") {
-          // RUAAAAA-5299: say WHY the wait ended, and never claim a budget that was not consumed.
-          // The old text hard-coded "did not complete within waitTimeoutMs=Nms" regardless of how the
-          // loop actually exited, which is how a 125s wait was reported as a 600s timeout and sent
-          // whoever read the run log hunting for a slow provider that never existed.
-          const budgetExhausted = finalElapsedMs >= waitTimeoutMs;
-          const exitReason = budgetExhausted
-            ? `time budget exhausted (waitTimeoutMs=${waitTimeoutMs}ms)`
-            : `poll-slot cap exhausted after ${sliceCount} slice(s) (maxSlices=${maxSlices}) before the ${waitTimeoutMs}ms time budget`;
-          const messageParts = cooldownSignal
-            ? [
-                `OpenClaw gateway run timed out after ${waitTimeoutMs}ms while provider "${cooldownSignal.provider ?? "unknown"}" was in cooldown (${cooldownSignal.reason ?? "unknown"})`,
-                cooldownSignal.untilIso ? `cooldownUntilIso=${cooldownSignal.untilIso}` : null,
-                `cooldownAttempts=${cooldownAttempts}`,
-              ].filter((e): e is string => Boolean(e))
-            : [
-                `OpenClaw gateway run did not complete: ${exitReason} (elapsed ${finalElapsedMs}ms across ${sliceCount} polling slice(s), requested slice ${waitSliceMs}ms; no cooldown signal in slice response or lifecycle stream)`,
-                `lastSliceStatus=${nonEmpty(asRecord(waitPayload)?.status)?.toLowerCase() ?? "none"}`,
-              ];
-          return {
-            exitCode: 1, signal: null, timedOut: true,
-            errorMessage: messageParts.join("; "),
-            errorCode: cooldownSignal ? "openclaw_gateway_wait_timeout_in_cooldown" : "openclaw_gateway_wait_timeout",
-            resultJson: {
-              ...asRecord(waitPayload),
-              ...(cooldownSignal ? { cooldown: { provider: cooldownSignal.provider ?? null, reason: cooldownSignal.reason ?? null, untilIso: cooldownSignal.untilIso ?? null, untilMs: cooldownSignal.untilMs ?? null, attempts: cooldownAttempts, backoffSequenceMs: cooldownBackoffSequence } } : {}),
-            },
-          };
+          // RUAAAAA-5302: this is path (1) of two that used to write a terminal status over a live
+          // session. Run `0707c344` on RUAAAAA-5299 went terminal `timed_out` at 22:13:54.718Z and
+          // its session landed the full disposition 9m56s later — the adapter spent its wait
+          // budget, the gateway did not spend the session. `sessionLive` records the second fact so
+          // the server holds the run non-terminal instead of failing it and firing a stale retry.
+          //
+          // This supersedes the inline `exitReason` text from a2bd973a1d on #2, which fixed the same
+          // unreadable string. `buildWaitTimeoutResult` carries the same "say which limit ended the
+          // wait" intent, plus the slice cadence actually used and the live-session clause — and it
+          // reads `endReason` from the break site instead of inferring it from
+          // `finalElapsedMs >= waitTimeoutMs`, which is a guess that goes wrong if the last slice
+          // overshoots the budget.
+          return buildWaitTimeoutResult({
+            payload: asRecord(waitPayload),
+            elapsedMs: finalElapsedMs,
+            sliceCount,
+            maxSlices,
+            waitTimeoutMs,
+            waitSliceMs,
+            probeSliceMs: saturatedProbeSliceMs,
+            providerEverStarted,
+            endReason: waitEndReason ?? "budget",
+            cooldownSignal,
+            cooldownAttempts,
+            cooldownBackoffSequenceMs: cooldownBackoffSequence,
+            liveSessionRunId: gatewayOwnedRunId,
+          });
         }
         if (waitStatus === "error") {
+          // RUAAAAA-5302: distinguish "we gave up because the provider is in cooldown" from "the
+          // gateway reported a slice error". Only the former means the run is parked in a transient
+          // provider state the gateway still owns. `cooldownSignal` alone cannot tell them apart:
+          // a later plain `status:"error"` slice after an earlier cooldown signal satisfied the old
+          // `cooldownSignal ? wait_cooldown : wait_error` test and inherited the cooldown code.
+          if (cooldownExhausted && cooldownSignal) {
+            return buildCooldownExhaustedResult({
+              payload: asRecord(waitPayload),
+              waitTimeoutMs,
+              cooldownSignal,
+              cooldownAttempts,
+              cooldownBackoffSequenceMs: cooldownBackoffSequence,
+              liveSessionRunId: gatewayOwnedRunId,
+            });
+          }
           return {
             exitCode: 1, signal: null, timedOut: false,
-            errorMessage: cooldownSignal
-              ? `OpenClaw gateway run in cooldown: Provider "${cooldownSignal.provider ?? "unknown"}" reason=${cooldownSignal.reason ?? "unknown"} ${cooldownSignal.untilIso ? `cooldownUntilIso=${cooldownSignal.untilIso}` : ""} cooldownAttempts=${cooldownAttempts}`
-              : nonEmpty(waitPayload?.error) ?? lifecycleError ?? "OpenClaw gateway run failed",
-            errorCode: cooldownSignal ? "openclaw_gateway_wait_cooldown" : "openclaw_gateway_wait_error",
-            resultJson: {
-              ...asRecord(waitPayload),
-              ...(cooldownSignal ? { cooldown: { provider: cooldownSignal.provider ?? null, reason: cooldownSignal.reason ?? null, untilIso: cooldownSignal.untilIso ?? null, untilMs: cooldownSignal.untilMs ?? null, attempts: cooldownAttempts, backoffSequenceMs: cooldownBackoffSequence } } : {}),
-            },
+            errorMessage: nonEmpty(waitPayload?.error) ?? lifecycleError ?? "OpenClaw gateway run failed",
+            errorCode: "openclaw_gateway_wait_error",
+            resultJson: asRecord(waitPayload),
           };
         }
         if (waitStatus && waitStatus !== "ok") {
