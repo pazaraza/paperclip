@@ -6,6 +6,21 @@ import {
 } from "./heartbeat-stop-metadata.js";
 
 describe("heartbeat stop metadata", () => {
+  it("RUAAAAA-5299: a run waiting on a live session is neither completed nor adapter_failed", () => {
+    // `adapter_failed` here would be the same lie as a terminal `failed` run status: it says the
+    // adapter gave up on the work, when it gave up on the *wait* and the session carried on.
+    const metadata = buildHeartbeatRunStopMetadata({
+      adapterType: "openclaw_gateway",
+      adapterConfig: null,
+      outcome: "awaiting_session",
+      errorCode: "openclaw_gateway_saturated",
+      errorMessage: "failing fast instead of waiting out the full budget",
+    });
+
+    expect(metadata.stopReason).toBe("session_live");
+    expect(metadata.timeoutFired).toBe(false);
+  });
+
   it("keeps local coding adapters at no timeout by default", () => {
     for (const adapterType of [
       "codex_local",

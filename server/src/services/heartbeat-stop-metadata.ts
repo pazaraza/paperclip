@@ -1,4 +1,4 @@
-export type HeartbeatRunOutcome = "succeeded" | "failed" | "cancelled" | "timed_out";
+export type HeartbeatRunOutcome = "succeeded" | "failed" | "cancelled" | "timed_out" | "awaiting_session";
 
 export type HeartbeatRunStopReason =
   | "completed"
@@ -8,6 +8,9 @@ export type HeartbeatRunStopReason =
   | "paused"
   | "max_turns_exhausted"
   | "process_lost"
+  // RUAAAAA-5299: the adapter stopped *waiting* for a provider session that is still live. Not a
+  // failure and not a completion — `reconcileAwaitingSessionRuns` supplies the real terminal status.
+  | "session_live"
   | "adapter_failed";
 
 export interface HeartbeatRunTimeoutPolicy {
@@ -83,6 +86,7 @@ export function inferHeartbeatRunStopReason(input: {
   errorMessage?: string | null;
 }): HeartbeatRunStopReason {
   if (input.outcome === "succeeded") return "completed";
+  if (input.outcome === "awaiting_session") return "session_live";
   const maxTurnStopReason = normalizeMaxTurnStopReason(input.errorCode);
   if (maxTurnStopReason) return maxTurnStopReason;
   if (input.outcome === "timed_out") return "timeout";

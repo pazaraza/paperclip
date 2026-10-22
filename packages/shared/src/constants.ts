@@ -578,6 +578,10 @@ export const HEARTBEAT_RUN_STATUSES = [
   "queued",
   "scheduled_retry",
   "running",
+  // RUAAAAA-5299: NON-terminal. The adapter abandoned its wait for a provider session that is still
+  // live, so the run has no honest terminal status yet. The live session keeps the issue execution
+  // lock and `reconcileAwaitingSessionRuns` decides the eventual status from live issue state.
+  "awaiting_session",
   "succeeded",
   "failed",
   "cancelled",

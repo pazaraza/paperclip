@@ -138,6 +138,11 @@ import {
 } from "./recovery/index.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./recovery/pause-hold-guard.js";
 import {
+  AWAITING_SESSION_MAX_HOLD_MS,
+  AWAITING_SESSION_RECONCILE_GRACE_MS,
+  decideAwaitingSessionReconciliation,
+} from "./awaiting-session-reconciliation.js";
+import {
   recoveryAssigneeAdapterOverrides,
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
@@ -5507,6 +5512,163 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
+  /**
+   * RUAAAAA-5299: give `awaiting_session` runs their honest terminal status.
+   *
+   * A run that abandoned its wait for a still-live gateway session has no terminal status to write,
+   * so this pass decides it later from live issue state — never from the run row's own optimism.
+   *
+   *  - issue reached `done`/`cancelled`  => the live session landed the work; the run is reconciled
+   *    to `succeeded` and the execution lock is released. This is the RUAAAAA-5283 / RUAAAAA-5297
+   *    shape, where the session closed the issue minutes after the adapter gave up.
+   *  - issue still open inside the hold window => leave it alone. A queued session that takes ten
+   *    minutes to get a slot is normal under saturation; punishing it early is the bug being fixed.
+   *  - issue still open past the hold window => the session is presumed gone. Fail it for real and
+   *    let the normal bounded transient retry take over, so a genuinely dead run is not silenced.
+   *
+   * That last branch is the mutation test: nothing here can suppress a retry for a run whose work
+   * really is missing, because the retry is scheduled off the failure this pass writes.
+   */
+  async function reconcileAwaitingSessionRuns(now = new Date()) {
+    const graceCutoff = new Date(now.getTime() - AWAITING_SESSION_RECONCILE_GRACE_MS);
+    const candidates = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.status, "awaiting_session"),
+          lte(heartbeatRuns.updatedAt, graceCutoff),
+        ),
+      )
+      .orderBy(asc(heartbeatRuns.updatedAt))
+      .limit(50);
+
+    const reconciledAsSuperseded: string[] = [];
+    const abandonedRunIds: string[] = [];
+    let held = 0;
+
+    for (const run of candidates) {
+      const contextSnapshot = parseObject(run.contextSnapshot);
+      const issueId = readNonEmptyString(contextSnapshot.issueId);
+      const liveSessionRunId = readNonEmptyString(parseObject(run.resultJson).liveSessionRunId);
+      const issue = issueId
+        ? await db
+            .select({
+              id: issues.id,
+              status: issues.status,
+              completedAt: issues.completedAt,
+              executionRunId: issues.executionRunId,
+            })
+            .from(issues)
+            .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+            .then((rows) => rows[0] ?? null)
+        : null;
+
+      // The live session finished the work: reconcile the run to what actually happened.
+      const heldForMs = now.getTime() - new Date(run.updatedAt).getTime();
+      const decision = decideAwaitingSessionReconciliation({
+        issueStatus: issue?.status ?? null,
+        heldForMs,
+      });
+      if (decision.action === "superseded") {
+        const superseded = await setRunStatus(run.id, "succeeded", {
+          finishedAt: now,
+          error: null,
+          errorCode: null,
+          resultJson: {
+            ...parseObject(run.resultJson),
+            ruAAAAa5299Reconciliation: {
+              outcome: "superseded_by_live_session",
+              issueStatus: decision.issueStatus,
+              issueCompletedAt: issue?.completedAt ? new Date(issue.completedAt).toISOString() : null,
+              liveSessionRunId,
+              reconciledAt: now.toISOString(),
+            },
+          },
+        });
+        await setWakeupStatus(run.wakeupRequestId, "completed", {
+          finishedAt: now,
+          error: null,
+        });
+        const finalized = superseded ?? (await getRun(run.id));
+        if (finalized) {
+          await appendRunEvent(finalized, await nextRunEventSeq(finalized.id), {
+            eventType: "lifecycle",
+            stream: "system",
+            level: "info",
+            message: `awaiting_session run reconciled to succeeded: live gateway session ${liveSessionRunId ?? "unknown"} completed ${issueId} (${decision.issueStatus})`,
+            payload: {
+              issueId,
+              issueStatus: decision.issueStatus,
+              liveSessionRunId,
+            },
+          });
+          await releaseIssueExecutionAndPromote(finalized);
+        }
+        reconciledAsSuperseded.push(run.id);
+        continue;
+      }
+
+      // No live evidence yet. `updatedAt` is deliberately NOT re-stamped here: it is the anchor for
+      // the hold window, and it must keep growing so a session that never lands is eventually failed.
+      if (decision.action === "hold") {
+        held += 1;
+        continue;
+      }
+
+      const failureMessage =
+        `Live gateway session ${liveSessionRunId ?? "unknown"} did not land work on ` +
+        `${issueId ?? "no issue"} within ${AWAITING_SESSION_MAX_HOLD_MS}ms of holding the execution lock`;
+      const abandoned = await setRunStatus(run.id, "failed", {
+        finishedAt: now,
+        error: failureMessage,
+        errorCode: "openclaw_gateway_session_abandoned",
+        resultJson: {
+          ...parseObject(run.resultJson),
+          ruAAAAa5299Reconciliation: {
+            outcome: "abandoned",
+            issueId,
+            issueStatus: issue?.status ?? null,
+            liveSessionRunId,
+            heldForMs,
+            reconciledAt: now.toISOString(),
+          },
+        },
+      });
+      await setWakeupStatus(run.wakeupRequestId, "failed", {
+        finishedAt: now,
+        error: failureMessage,
+      });
+      const finalizedAbandoned = abandoned ?? (await getRun(run.id));
+      if (finalizedAbandoned) {
+        await appendRunEvent(finalizedAbandoned, await nextRunEventSeq(finalizedAbandoned.id), {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "error",
+          message: failureMessage,
+          payload: { issueId, liveSessionRunId, heldForMs },
+        });
+        await releaseIssueExecutionAndPromote(finalizedAbandoned);
+        const agent = await getAgent(run.agentId);
+        // RUAAAAA-5299: this is where a genuinely dead run still gets its retry. The guard only
+        // silences retries whose work demonstrably landed.
+        if (agent) {
+          await scheduleBoundedRetryForRun(finalizedAbandoned, agent);
+        }
+      }
+      abandonedRunIds.push(run.id);
+    }
+
+    return {
+      scanned: candidates.length,
+      superseded: reconciledAsSuperseded.length,
+      abandoned: abandonedRunIds.length,
+      held,
+      supersededRunIds: reconciledAsSuperseded,
+      abandonedRunIds,
+    };
+  }
+
   async function promoteDueScheduledRetries(now = new Date()) {
     const dueRuns = await db
       .select()
@@ -6175,7 +6337,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function finalizeAgentStatus(
     agentId: string,
-    outcome: "succeeded" | "failed" | "cancelled" | "timed_out",
+    outcome: "succeeded" | "failed" | "cancelled" | "timed_out" | "awaiting_session",
   ) {
     const existing = await getAgent(agentId);
     if (!existing) return;
@@ -6187,8 +6349,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const isFirstHeartbeat = !existing.lastHeartbeatAt;
 
     const runningCount = await countRunningRunsForAgent(agentId);
+    // RUAAAAA-5299: `awaiting_session` is not an error and not an idle finish — the agent's session
+    // is still working. Letting it fall through to "error" would put the whole fleet into a red
+    // state during exactly the saturation window it is trying to ride out.
     const nextStatus =
-      runningCount > 0
+      outcome === "awaiting_session" || runningCount > 0
         ? "running"
         : outcome === "succeeded" || outcome === "cancelled"
           ? "idle"
@@ -6228,7 +6393,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   function mergeRunStopMetadataForAgent(
     agent: Pick<typeof agents.$inferSelect, "adapterType" | "adapterConfig">,
-    outcome: "succeeded" | "failed" | "cancelled" | "timed_out",
+    outcome: "succeeded" | "failed" | "cancelled" | "timed_out" | "awaiting_session",
     options?: {
       resultJson?: Record<string, unknown> | null;
       errorCode?: string | null;
@@ -7757,10 +7922,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
       const normalizedUsage = sessionUsageResolution.normalizedUsage;
 
-      let outcome: "succeeded" | "failed" | "cancelled" | "timed_out";
+      let outcome: "succeeded" | "failed" | "cancelled" | "timed_out" | "awaiting_session";
       const latestRun = await getRun(run.id);
+      // RUAAAAA-5299: `sessionLive` outranks every terminal verdict below it. The adapter gave up
+      // its *wait*, not the session — openclaw_gateway's saturation fail-fast abandons the poll
+      // loop while the gateway keeps the run. Writing `failed` here is what produced the
+      // failed-run/done-issue mismatch on RUAAAAA-5283 and RUAAAAA-5297: the run row went terminal,
+      // the retry scheduler believed it, and the retry fired against a snapshot the live session had
+      // already moved past. A run whose session is still in flight has no terminal status yet.
+      const sessionStillLive = adapterResult.sessionLive === true;
       if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
         outcome = latestRun.status;
+      } else if (sessionStillLive && !adapterResult.timedOut) {
+        outcome = "awaiting_session";
       } else if (adapterResult.timedOut) {
         outcome = "timed_out";
       } else if ((adapterResult.exitCode ?? 0) === 0 && !adapterResult.errorMessage) {
@@ -7782,9 +7956,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ? "timeout"
           : outcome === "cancelled"
             ? (latestRun?.errorCode ?? "cancelled")
-            : outcome === "failed"
-              ? (adapterResult.errorCode ?? "adapter_failed")
-              : null;
+            : outcome === "awaiting_session"
+              ? (adapterResult.errorCode ?? "adapter_session_live")
+              : outcome === "failed"
+                ? (adapterResult.errorCode ?? "adapter_failed")
+                : null;
 
       let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
       if (handle) {
@@ -7797,13 +7973,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await flushOutputProgress({ force: true });
 
       const status =
-        outcome === "succeeded"
-          ? "succeeded"
-          : outcome === "cancelled"
-            ? "cancelled"
-            : outcome === "timed_out"
-              ? "timed_out"
-              : "failed";
+        outcome === "awaiting_session"
+          ? "awaiting_session"
+          : outcome === "succeeded"
+            ? "succeeded"
+            : outcome === "cancelled"
+              ? "cancelled"
+              : outcome === "timed_out"
+                ? "timed_out"
+                : "failed";
 
       const usageJson =
         normalizedUsage || adapterResult.costUsd != null
@@ -7848,7 +8026,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
 
       let persistedRun = await setRunStatus(run.id, status, {
-        finishedAt: new Date(),
+        // RUAAAAA-5299: an `awaiting_session` run is not finished. Stamping finishedAt would make
+        // it look terminal to every consumer that keys off that column, which is the exact lie the
+        // retry scheduler acted on.
+        ...(outcome === "awaiting_session" ? {} : { finishedAt: new Date() }),
         error: runErrorMessage,
         errorCode: runErrorCode,
         exitCode: adapterResult.exitCode,
@@ -7866,7 +8047,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         persistedRun = await classifyAndPersistRunLiveness(persistedRun, persistedResultJson) ?? persistedRun;
       }
 
-      await setWakeupStatus(run.wakeupRequestId, outcome === "succeeded" ? "completed" : status, {
+      // RUAAAAA-5299: `awaiting_session` is a run status, not a wakeup-request status. The wake was
+      // consumed and its process is gone, but the execution slot is deliberately still held, so the
+      // wakeup stays `claimed` rather than reaching a terminal wakeup state.
+      const wakeupStatus =
+        outcome === "awaiting_session"
+          ? "claimed"
+          : outcome === "succeeded"
+            ? "completed"
+            : status;
+      await setWakeupStatus(run.wakeupRequestId, wakeupStatus, {
         finishedAt: new Date(),
         error: runErrorMessage,
       });
@@ -7902,7 +8092,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             );
           }
         }
-        if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
+        if (outcome === "awaiting_session") {
+          // RUAAAAA-5299: no bounded retry. Scheduling one *is* the defect: it fires against a
+          // snapshot the still-running session has already moved past. `reconcileAwaitingSessionRuns`
+          // re-reads live issue state instead, and only schedules a retry once it has proof the
+          // live session did not land the work.
+          await appendRunEvent(livenessRun, await nextRunEventSeq(livenessRun.id), {
+            eventType: "lifecycle",
+            stream: "system",
+            level: "warn",
+            message: `Run held non-terminal (awaiting_session): gateway session ${adapterResult.liveSessionRunId ?? "unknown"} is still live; issue execution lock retained and no retry scheduled`,
+            payload: {
+              status,
+              errorCode: runErrorCode,
+              liveSessionRunId: adapterResult.liveSessionRunId ?? null,
+              issueId: issueId ?? null,
+            },
+          });
+        } else if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
           const policy = parseMaxTurnContinuationPolicy(agent);
           if (policy.enabled && policy.maxAttempts > 0) {
             await scheduleBoundedRetryForRun(livenessRun, agent, {
@@ -7926,18 +8133,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         } else if (outcome === "failed" && readTransientRecoveryContractFromRun(livenessRun)) {
           await scheduleBoundedRetryForRun(livenessRun, agent);
         }
-        const issueCommentPolicyResult = await finalizeIssueCommentPolicy(livenessRun, agent);
-        await releaseIssueExecutionAndPromote(livenessRun);
-        await handleRunLivenessContinuation(livenessRun);
-        await handleSuccessfulRunHandoff(
-          issueCommentPolicyResult.outcome === "retry_queued" || issueCommentPolicyResult.outcome === "retry_exhausted"
-            ? {
-              ...livenessRun,
-              issueCommentStatus: issueCommentPolicyResult.outcome,
-            }
-            : livenessRun,
-          agent,
-        );
+        // RUAAAAA-5299: everything below releases the issue execution lock and runs the
+        // terminal-run handoff. A run waiting on a live session must do none of it — the session
+        // still owns the issue, and releasing that lock is exactly what let the
+        // superseded-snapshot retry check the issue out from under it.
+        if (outcome === "awaiting_session") {
+          await refreshContinuationSummaryForRun(livenessRun, agent);
+        } else {
+          const issueCommentPolicyResult = await finalizeIssueCommentPolicy(livenessRun, agent);
+          await releaseIssueExecutionAndPromote(livenessRun);
+          await handleRunLivenessContinuation(livenessRun);
+          await handleSuccessfulRunHandoff(
+            issueCommentPolicyResult.outcome === "retry_queued" || issueCommentPolicyResult.outcome === "retry_exhausted"
+              ? {
+                ...livenessRun,
+                issueCommentStatus: issueCommentPolicyResult.outcome,
+              }
+              : livenessRun,
+            agent,
+          );
+        }
       }
 
       if (finalizedRun) {
@@ -9698,6 +9913,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reapOrphanedRuns,
 
     promoteDueScheduledRetries,
+    reconcileAwaitingSessionRuns,
     retryScheduledRetryNow,
 
     resumeQueuedRuns,

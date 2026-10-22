@@ -75,6 +75,25 @@ export interface AdapterExecutionResult {
   errorFamily?: AdapterExecutionErrorFamily | null;
   retryNotBefore?: string | null;
   errorMeta?: Record<string, unknown>;
+  /**
+   * RUAAAAA-5299: the adapter stopped *waiting* for a provider session that is still live.
+   *
+   * A fail-fast adapter (openclaw_gateway's saturation verdict) spends its wait budget, not the
+   * session — the gateway still owns the run and may still execute it to completion. Writing a
+   * terminal run status over a live session is a lie, and the bounded-retry scheduler acts on that
+   * lie: it queues a retry against a snapshot the run has already moved past. RUAAAAA-5283 and
+   * RUAAAAA-5297 both burned a full run on a retry for work that had already landed.
+   *
+   * When this is true the caller MUST NOT write a terminal run status for this attempt and MUST
+   * NOT queue a bounded retry against it. The live session keeps the issue's execution lock, and a
+   * reconciliation pass — not a retry — decides the run's eventual terminal status.
+   */
+  sessionLive?: boolean | null;
+  /**
+   * RUAAAAA-5299: provider-side id of the live session the adapter abandoned. Carried so
+   * reconciliation and operators can point at the exact session that outlived the run row.
+   */
+  liveSessionRunId?: string | null;
   usage?: UsageSummary;
   /**
    * Legacy single session id output. Prefer `sessionParams` + `sessionDisplayId`.

@@ -311,7 +311,7 @@ function backoffForAttempt(sequence: number[], attemptIndex: number): number {
  * is what makes `issue_recovery` retry it cleanly with backoff rather than treating it as a dead
  * agent; `retryNotBefore` supplies the floor for that backoff.
  */
-function buildSaturatedResult(input: {
+export function buildSaturatedResult(input: {
   stage: "dispatch" | "wait";
   reason: string;
   payload: Record<string, unknown> | null;
@@ -319,12 +319,24 @@ function buildSaturatedResult(input: {
   sliceCount: number;
   waitTimeoutMs: number;
   retryDelayMs: number;
+  /**
+   * RUAAAAA-5299: the gateway run id still owned by the gateway when the wait was abandoned.
+   * Non-null means the session survived this fail-fast and may still execute to completion, so the
+   * caller must not treat the run as terminally failed.
+   */
+  liveSessionRunId: string | null;
 }): AdapterExecutionResult {
   const retryNotBefore = new Date(Date.now() + input.retryDelayMs).toISOString();
+  // RUAAAAA-5299: both cited instances were `stage=wait` abandonments of a session the gateway
+  // still owned. The run row went terminal `failed` at the fail-fast while the session went on to
+  // finish the work, and the bounded retry fired against the superseded snapshot. Saying so
+  // explicitly here is what lets the server keep the run non-terminal and hold the issue lock.
+  const sessionLive = input.liveSessionRunId !== null;
   const message =
     `OpenClaw gateway saturated: dispatch accepted but never provider-started ` +
     `(stage=${input.stage} reason=${input.reason} elapsed=${input.elapsedMs}ms slices=${input.sliceCount} ` +
-    `waitTimeoutMs=${input.waitTimeoutMs}ms); failing fast instead of waiting out the full budget`;
+    `waitTimeoutMs=${input.waitTimeoutMs}ms); failing fast instead of waiting out the full budget` +
+    (sessionLive ? `; abandoned wait only, gateway session ${input.liveSessionRunId} is still live` : "");
   const evidence = {
     saturation: {
       stage: input.stage,
@@ -334,6 +346,8 @@ function buildSaturatedResult(input: {
       waitTimeoutMs: input.waitTimeoutMs,
       retryDelayMs: input.retryDelayMs,
       retryNotBefore,
+      sessionLive,
+      liveSessionRunId: input.liveSessionRunId,
     },
   };
   return {
@@ -345,6 +359,8 @@ function buildSaturatedResult(input: {
     errorFamily: "transient_upstream",
     retryNotBefore,
     errorMeta: evidence,
+    sessionLive,
+    liveSessionRunId: input.liveSessionRunId,
     resultJson: { ...(input.payload ?? {}), ...evidence },
   };
 }
@@ -1659,6 +1675,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
       const acceptedStatus = nonEmpty(acceptedPayload?.status)?.toLowerCase() ?? "";
       const acceptedRunId = nonEmpty(acceptedPayload?.runId) ?? ctx.runId;
+      // RUAAAAA-5299: distinguish a gateway-issued run id from our own Paperclip run-id fallback.
+      // Only the former is a session the gateway still owns after we stop waiting for it.
+      const gatewayOwnedRunId = nonEmpty(acceptedPayload?.runId);
       trackedRunIds.add(acceptedRunId);
 
       await ctx.onLog(
@@ -1717,6 +1736,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             sliceCount: 0,
             waitTimeoutMs,
             retryDelayMs: saturatedRetryDelayMs,
+            liveSessionRunId: gatewayOwnedRunId,
           });
         }
 
@@ -1874,6 +1894,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             sliceCount,
             waitTimeoutMs,
             retryDelayMs: saturatedRetryDelayMs,
+            liveSessionRunId: gatewayOwnedRunId,
           });
         } else if (waitStatus === "timeout") {
           const messageParts = cooldownSignal

@@ -733,6 +733,7 @@ export async function startServer(): Promise<StartedServer> {
       .reapOrphanedRuns()
       .then(() => heartbeat.promoteDueScheduledRetries())
       .then(async (promotion) => {
+        await heartbeat.reconcileAwaitingSessionRuns();
         await heartbeat.resumeQueuedRuns();
         const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
         if (
@@ -800,6 +801,7 @@ export async function startServer(): Promise<StartedServer> {
         .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
         .then(() => heartbeat.promoteDueScheduledRetries())
         .then(async (promotion) => {
+          await heartbeat.reconcileAwaitingSessionRuns();
           await heartbeat.resumeQueuedRuns();
           const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
           if (
