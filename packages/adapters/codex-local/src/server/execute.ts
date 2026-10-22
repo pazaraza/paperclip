@@ -47,6 +47,11 @@ import {
 import { pathExists, prepareManagedCodexHome, resolveManagedCodexHomeDir, resolveSharedCodexHomeDir } from "./codex-home.js";
 import { resolveCodexDesiredSkillNames } from "./skills.js";
 import { buildCodexExecArgs } from "./codex-args.js";
+import {
+  resolveCodexCredentialScope,
+  resolveServableModel,
+  type CodexCredentialScope,
+} from "./model-policy.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
@@ -283,14 +288,33 @@ export async function ensureCodexSkillsInjected(
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
-  const { runId, agent, runtime, config, context, onLog, onMeta, onSpawn, authToken } = ctx;
+  const { runId, agent, runtime, config: rawConfig, context, onLog, onMeta, onSpawn, authToken } = ctx;
 
   const promptTemplate = asString(
-    config.promptTemplate,
+    rawConfig.promptTemplate,
     DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   );
-  const command = asString(config.command, "codex");
-  const model = asString(config.model, "");
+  const command = asString(rawConfig.command, "codex");
+
+  // A ChatGPT subscription credential only serves a subset of the models an API
+  // key does. Resolve the credential scope once per run and clamp the requested
+  // model, so an agent carrying an unservable model — one created before this
+  // check existed, or one that inherited the adapter's old `cheap` default —
+  // does not 400 with "... is not supported when using Codex with a ChatGPT
+  // account". The configured value is left untouched; only this run is scoped.
+  const credentialScope = await resolveCodexCredentialScope().catch(
+    () => "unknown" as CodexCredentialScope,
+  );
+  const configuredModel = asString(rawConfig.model, "");
+  const model = resolveServableModel(configuredModel, credentialScope) ?? "";
+  const config =
+    model !== configuredModel ? { ...rawConfig, model } : rawConfig;
+  if (model !== configuredModel) {
+    await onLog(
+      "stderr",
+      `[paperclip] ChatGPT credential cannot serve model ${configuredModel || "(unset)"}; using ${model} for this run.\n`,
+    );
+  }
 
   const workspaceContext = parseObject(context.paperclipWorkspace);
   const workspaceCwd = asString(workspaceContext.cwd, "");

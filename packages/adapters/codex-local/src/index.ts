@@ -9,6 +9,29 @@ export const DEFAULT_CODEX_LOCAL_MODEL = "gpt-5.3-codex";
 export const DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX = true;
 export const CODEX_LOCAL_FAST_MODE_SUPPORTED_MODELS = ["gpt-5.4"] as const;
 
+/**
+ * Models the Codex backend only serves to API-key credentials.
+ *
+ * A ChatGPT subscription credential gets `400 invalid_request_error` —
+ * "The '<model>' model is not supported when using Codex with a ChatGPT
+ * account." — for every one of these, so they must never be seeded into an
+ * agent, offered by the picker, or reached through a model profile while a
+ * ChatGPT credential is active.
+ *
+ * Verified by live probe against a ChatGPT Pro credential on 2026-10-22.
+ */
+export const CHATGPT_ACCOUNT_UNSERVABLE_MODELS = [
+  "gpt-5.4",
+  "gpt-5.3-codex",
+  "gpt-5.3-codex-spark",
+] as const;
+
+/**
+ * Model the adapter falls back to when a ChatGPT credential is active and the
+ * requested model is one of `CHATGPT_ACCOUNT_UNSERVABLE_MODELS`.
+ */
+export const CHATGPT_ACCOUNT_DEFAULT_MODEL = "gpt-6-astra";
+
 function normalizeModelId(model: string | null | undefined): string {
   return typeof model === "string" ? model.trim() : "";
 }
@@ -35,6 +58,7 @@ export function isCodexLocalFastModeSupported(model: string | null | undefined):
 export const models = [
   { id: "gpt-5.4", label: "gpt-5.4" },
   { id: DEFAULT_CODEX_LOCAL_MODEL, label: DEFAULT_CODEX_LOCAL_MODEL },
+  { id: CHATGPT_ACCOUNT_DEFAULT_MODEL, label: CHATGPT_ACCOUNT_DEFAULT_MODEL },
   { id: "gpt-5.3-codex-spark", label: "gpt-5.3-codex-spark" },
   { id: "gpt-5", label: "gpt-5" },
   { id: "o3", label: "o3" },
@@ -49,9 +73,9 @@ export const modelProfiles: AdapterModelProfileDefinition[] = [
   {
     key: "cheap",
     label: "Cheap",
-    description: "Use the lowest-cost known Codex local model lane without changing the primary model.",
+    description: "Use the lowest-cost Codex local model lane the active credential can actually serve, without changing the primary model.",
     adapterConfig: {
-      model: "gpt-5.3-codex-spark",
+      model: CHATGPT_ACCOUNT_DEFAULT_MODEL,
       modelReasoningEffort: "low",
     },
     source: "adapter_default",

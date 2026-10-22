@@ -202,10 +202,14 @@ describe("server adapter registry", () => {
         source: "adapter_default",
       }),
     ]);
+    // `gpt-5.3-codex-spark` used to be pinned here. A ChatGPT subscription
+    // credential 400s on it ("... is not supported when using Codex with a
+    // ChatGPT account"), so every codex_local agent taking a `cheap` wake
+    // inherited a model the fleet credential cannot serve. RUAAAAA-5276.
     await expect(listAdapterModelProfiles("codex_local")).resolves.toEqual([
       expect.objectContaining({
         key: "cheap",
-        adapterConfig: expect.objectContaining({ model: "gpt-5.3-codex-spark" }),
+        adapterConfig: expect.objectContaining({ model: "gpt-6-astra" }),
         source: "adapter_default",
       }),
     ]);
