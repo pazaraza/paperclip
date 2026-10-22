@@ -2087,6 +2087,57 @@ function isHeartbeatRunTerminalStatus(
   );
 }
 
+export type HeartbeatRunOutcome = "succeeded" | "failed" | "cancelled" | "timed_out" | "awaiting_session";
+
+/**
+ * RUAAAAA-5302: the run-status precedence ladder, extracted so it can be pinned.
+ *
+ * RUAAAAA-5299 introduced `sessionLive` and this ladder's second rung, but guarded it with
+ * `&& !adapterResult.timedOut` while the comment above it claimed `sessionLive` "outranks every
+ * terminal verdict below it". The two sentences disagreed, and the code believed the guard: on the
+ * wait-stage `timeout` path — where `timedOut: true` and a live session are both true — the flag
+ * was computed and then thrown away, and the run still went terminal `timed_out`. That is the live
+ * `0707c344` incident.
+ *
+ * The precedence, highest first:
+ *   1. a terminal status already recorded on the run row (cancel/stop won the race);
+ *   2. `sessionLive` — the adapter positively asserts the provider still owns the session;
+ *   3. `timedOut`;
+ *   4. clean exit;
+ *   5. everything else is a failure.
+ *
+ * Rung 2 is unconditional on `timedOut` on purpose. For openclaw_gateway `timedOut: true` means
+ * "the adapter spent its wait budget", not "the provider session died" — those are different
+ * facts, and only the adapter knows which it is reporting. Every other adapter that sets
+ * `timedOut: true` (claude-local, codex-local, cursor-local, gemini-local, opencode-local,
+ * pi-local) never populates `sessionLive`, so their local-process timeouts are unaffected: they
+ * fall through to rung 3 exactly as before.
+ */
+export function resolveHeartbeatRunOutcome(input: {
+  adapterResult: {
+    exitCode?: number | null;
+    errorMessage?: string | null;
+    timedOut?: boolean | null;
+    sessionLive?: boolean | null;
+  };
+  latestRunStatus?: string | null;
+}): HeartbeatRunOutcome {
+  const { adapterResult } = input;
+  if (isHeartbeatRunTerminalStatus(input.latestRunStatus)) {
+    return input.latestRunStatus;
+  }
+  if (adapterResult.sessionLive === true) {
+    return "awaiting_session";
+  }
+  if (adapterResult.timedOut) {
+    return "timed_out";
+  }
+  if ((adapterResult.exitCode ?? 0) === 0 && !adapterResult.errorMessage) {
+    return "succeeded";
+  }
+  return "failed";
+}
+
 export function buildPaperclipTaskMarkdown(input: {
   issue: {
     id: string;
@@ -7922,26 +7973,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
       const normalizedUsage = sessionUsageResolution.normalizedUsage;
 
-      let outcome: "succeeded" | "failed" | "cancelled" | "timed_out" | "awaiting_session";
       const latestRun = await getRun(run.id);
-      // RUAAAAA-5299: `sessionLive` outranks every terminal verdict below it. The adapter gave up
-      // its *wait*, not the session — openclaw_gateway's saturation fail-fast abandons the poll
-      // loop while the gateway keeps the run. Writing `failed` here is what produced the
-      // failed-run/done-issue mismatch on RUAAAAA-5283 and RUAAAAA-5297: the run row went terminal,
-      // the retry scheduler believed it, and the retry fired against a snapshot the live session had
-      // already moved past. A run whose session is still in flight has no terminal status yet.
-      const sessionStillLive = adapterResult.sessionLive === true;
-      if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
-        outcome = latestRun.status;
-      } else if (sessionStillLive && !adapterResult.timedOut) {
-        outcome = "awaiting_session";
-      } else if (adapterResult.timedOut) {
-        outcome = "timed_out";
-      } else if ((adapterResult.exitCode ?? 0) === 0 && !adapterResult.errorMessage) {
-        outcome = "succeeded";
-      } else {
-        outcome = "failed";
-      }
+      const outcome = resolveHeartbeatRunOutcome({ adapterResult, latestRunStatus: latestRun?.status });
       const runErrorMessage =
         outcome === "cancelled"
           ? (latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled")
