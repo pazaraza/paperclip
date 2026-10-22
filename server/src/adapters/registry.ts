@@ -9,6 +9,7 @@ import {
   getAdapterSessionManagement,
 } from "@paperclipai/adapter-utils";
 import {
+  applyHermesSessionContentionRecovery,
   createGuardedHermesSessionCodec,
   isHermesSessionId,
   sanitizeHermesExecutionResult,
@@ -17,6 +18,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { logger } from "../middleware/logger.js";
+
+/** Upper bound on stderr kept for post-run refusal detection (RUAAAAA-5296). */
+const HERMES_STDERR_CAPTURE_LIMIT = 16 * 1024;
 
 /**
  * Best-effort lookup of a hermes_local agent's stored Paperclip API key.
@@ -606,11 +610,22 @@ const hermesLocalAdapter: ServerAdapterModule = {
       );
     }
 
+    // RUAAAAA-5296: keep a bounded copy of the child's stderr. The adapter's
+    // own parser only keeps lines matching /error|exception|traceback|failed/i,
+    // and the Hermes session-contention refusal matches none of those, so the
+    // text is invisible to the server by the time the result is returned.
+    let capturedStderr = "";
     const patchedCtx = {
       ...normalizedCtx,
       agent: {
         ...normalizedCtx.agent,
         adapterConfig: patchedConfig,
+      },
+      onLog: async (stream: "stdout" | "stderr", chunk: string) => {
+        if (stream === "stderr" && capturedStderr.length < HERMES_STDERR_CAPTURE_LIMIT) {
+          capturedStderr += chunk;
+        }
+        return normalizedCtx.onLog(stream, chunk);
       },
     };
 
@@ -626,7 +641,10 @@ const hermesLocalAdapter: ServerAdapterModule = {
         "[hermes_local] adapter reported a session id that is not a hermes session id; dropping it (RUAAAAA-5244)",
       );
     }
-    return sanitizeHermesExecutionResult(hermesResult);
+    return applyHermesSessionContentionRecovery(
+      sanitizeHermesExecutionResult(hermesResult),
+      capturedStderr,
+    );
   },
   testEnvironment: (ctx) => hermesTestEnvironment(normalizeHermesConfig(ctx) as never),
   sessionCodec: createGuardedHermesSessionCodec(hermesSessionCodec, (rejections) => {

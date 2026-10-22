@@ -113,6 +113,55 @@ type SessionIdCarrier = {
 };
 
 /**
+ * The refusal Hermes emits when the persisted session is open in an
+ * interactive terminal:
+ *
+ *   hermes-refusal-reason: SESSION_NOT_OWNED
+ *   This chat is open in another Hermes window/terminal. Use it there, or
+ *   start a new chat here.
+ *   Details: session 20261021_120843_054c18 opened by cli 7m ago.
+ */
+export const HERMES_SESSION_NOT_OWNED_PATTERN = /hermes-refusal-reason:\s*SESSION_NOT_OWNED/i;
+
+/** Distinct run error code so this is not scored as `adapter_failed`. */
+export const HERMES_SESSION_NOT_OWNED_ERROR_CODE = "session_not_owned";
+
+/** True when the captured stderr shows the session-contention refusal. */
+export function isHermesSessionNotOwned(text: string | null | undefined): boolean {
+  return typeof text === "string" && HERMES_SESSION_NOT_OWNED_PATTERN.test(text);
+}
+
+type SessionContentionCarrier = SessionIdCarrier & {
+  clearSession?: boolean;
+  errorCode?: string | null;
+};
+
+/**
+ * RUAAAAA-5296: recover from a held-session collision.
+ *
+ * `persistSession` pins each dispatch to a session id, and `hermes --resume
+ * <id>` is refused while a person holds that session interactively. The
+ * refusal carries no `session_id`, so the adapter returns no `sessionParams`;
+ * `resolveNextSessionState()` then falls back to `previousParams` and the
+ * failure path re-persists the very id that was just refused. Every later
+ * dispatch collides again — and because `parseHermesOutput` only keeps stderr
+ * lines matching /error|exception|traceback|failed/i (which the refusal matches
+ * none of), the run carries no error message and scores as `adapter_failed`.
+ *
+ * Setting `clearSession` makes `resolveNextSessionState()` return nulls so the
+ * server calls `clearTaskSessions()` and the next dispatch starts a fresh
+ * session. `errorCode` stops the derived index misreading an operator-state
+ * collision as a runtime fault.
+ */
+export function applyHermesSessionContentionRecovery<TResult extends SessionContentionCarrier>(
+  result: TResult,
+  stderr: string | null | undefined,
+): TResult {
+  if (!isHermesSessionNotOwned(stderr)) return result;
+  return { ...result, clearSession: true, errorCode: HERMES_SESSION_NOT_OWNED_ERROR_CODE };
+}
+
+/**
  * Drop a malformed session id from an adapter execution result.
  *
  * `heartbeat.ts` reads `adapterResult.sessionId` directly (it does not go
