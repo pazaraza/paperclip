@@ -181,6 +181,12 @@ export type WaitSliceSaturation = {
   reason: "queued_not_started" | "gateway_draining" | "explicit_saturated" | null;
   timeoutPhase: string | null;
   providerStarted: boolean;
+  /**
+   * RUAAAAA-5280: whether the gateway actually reported a `providerStarted` field. `queue`
+   * slices carry it; `gateway_draining` slices deliberately OMIT it. Absence means unknown,
+   * never "not started".
+   */
+  providerStartedKnown: boolean;
   status: string | null;
 };
 
@@ -200,23 +206,40 @@ export function detectWaitSliceSaturation(payload: unknown): WaitSliceSaturation
   const status = nonEmpty(record?.status)?.toLowerCase() ?? null;
   const timeoutPhase = nonEmpty(record?.timeoutPhase)?.toLowerCase() ?? null;
   const code = nonEmpty(record?.code)?.toLowerCase() ?? null;
+  const providerStartedKnown = typeof record?.providerStarted === "boolean";
   const providerStarted = record?.providerStarted === true;
   const finished =
     nonEmpty(record?.endedAt) !== null ||
     nonEmpty(record?.stopReason) !== null ||
     status === "ok" ||
     status === "error";
-  const base: WaitSliceSaturation = { saturated: false, reason: null, timeoutPhase, providerStarted, status };
+  const base: WaitSliceSaturation = {
+    saturated: false,
+    reason: null,
+    timeoutPhase,
+    providerStarted,
+    providerStartedKnown,
+    status,
+  };
 
   if (code === "saturated" || status === "saturated") {
     return { ...base, saturated: true, reason: "explicit_saturated" };
   }
   if (finished || providerStarted) return base;
 
+  // RUAAAAA-5280: `queue` genuinely means "accepted but parked" — that is the over-commit
+  // signature RUAAAAA-5256 was opened for, and it holds whether or not the flag is present.
   if (status === "pending" || timeoutPhase === "queue") {
     return { ...base, saturated: true, reason: "queued_not_started" };
   }
-  if (timeoutPhase === "gateway_draining") {
+
+  // RUAAAAA-5280: `gateway_draining` is NOT a non-start signal. The gateway only emits this
+  // phase when an active chat entry IS registered but its snapshot is not published yet
+  // (`waitForTurn`: `...activeRunRegistered ? {} : { providerStarted: false }`) — it omits the
+  // flag exactly when the run is alive. Treating the absent field as "never started" made every
+  // healthy dispatch look saturated and drove the fleet to 0% success from 20:22:44Z to 21:33Z.
+  // Require an explicit `providerStarted: false` before believing a drain.
+  if (timeoutPhase === "gateway_draining" && providerStartedKnown && !providerStarted) {
     return { ...base, saturated: true, reason: "gateway_draining" };
   }
   return base;

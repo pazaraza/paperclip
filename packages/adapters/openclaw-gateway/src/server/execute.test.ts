@@ -105,10 +105,27 @@ describe("detectWaitSliceSaturation (RUAAAAA-5256)", () => {
     expect(verdict.providerStarted).toBe(false);
   });
 
-  it("flags a draining gateway that never started the run", () => {
+  it("does NOT flag a `gateway_draining` slice that omits providerStarted (RUAAAAA-5280)", () => {
+    // Regression: the gateway omits `providerStarted` on the `gateway_draining` branch of
+    // `waitForTurn` precisely BECAUSE an active chat entry is registered and the snapshot is
+    // merely not published yet. Reading the absent flag as "never started" failed 25/25 fleet
+    // dispatches from 20:22:44Z and held the fleet at zero success. Absence is unknown, not false.
     const verdict = detectWaitSliceSaturation({
       status: "timeout",
       timeoutPhase: "gateway_draining",
+    });
+    expect(verdict.saturated).toBe(false);
+    expect(verdict.reason).toBeNull();
+    expect(verdict.providerStarted).toBe(false);
+    expect(verdict.providerStartedKnown).toBe(false);
+  });
+
+  it("still flags a drain that explicitly reports providerStarted:false", () => {
+    // The narrow, genuinely-diagnostic case the correction preserves.
+    const verdict = detectWaitSliceSaturation({
+      status: "timeout",
+      timeoutPhase: "gateway_draining",
+      providerStarted: false,
     });
     expect(verdict.saturated).toBe(true);
     expect(verdict.reason).toBe("gateway_draining");
