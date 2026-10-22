@@ -17,6 +17,88 @@ describe("runtime API discovery", () => {
     ).toBe("https://paperclip.example.com");
   });
 
+  it("prefers the concrete bind host over a stale allowedHostnames[0] (RUAAAAA-5236)", () => {
+    // Regression: the live instance binds 100.67.204.21 but listed a stale
+    // 100.92.93.56 first, so every child was launched with a dead base.
+    expect(
+      choosePrimaryRuntimeApiUrl({
+        authPublicBaseUrl: null,
+        allowedHostnames: ["100.92.93.56", "192.168.2.14", "localhost"],
+        bindHost: "100.67.204.21",
+        port: 3100,
+      }),
+    ).toBe("http://100.67.204.21:3100");
+  });
+
+  it("keeps an explicit public base URL ahead of the bind host", () => {
+    expect(
+      choosePrimaryRuntimeApiUrl({
+        authPublicBaseUrl: "https://paperclip.example.com/base/path",
+        allowedHostnames: ["100.92.93.56"],
+        bindHost: "100.67.204.21",
+        port: 3100,
+      }),
+    ).toBe("https://paperclip.example.com");
+  });
+
+  it("falls back to allowedHostnames when the bind host is a wildcard", () => {
+    expect(
+      choosePrimaryRuntimeApiUrl({
+        authPublicBaseUrl: null,
+        allowedHostnames: ["198.51.100.10", "192.168.6.178"],
+        bindHost: "0.0.0.0",
+        port: 3102,
+      }),
+    ).toBe("http://198.51.100.10:3102");
+  });
+
+  it("treats a loopback bind host as concrete and reachable", () => {
+    expect(
+      choosePrimaryRuntimeApiUrl({
+        authPublicBaseUrl: null,
+        allowedHostnames: ["198.51.100.10"],
+        bindHost: "127.0.0.1",
+        port: 3102,
+      }),
+    ).toBe("http://127.0.0.1:3102");
+  });
+
+  it("never advertises a link-local bind host, which needs a scope id to dial", () => {
+    expect(
+      choosePrimaryRuntimeApiUrl({
+        authPublicBaseUrl: null,
+        allowedHostnames: ["198.51.100.10"],
+        bindHost: "fe80::1",
+        port: 3102,
+      }),
+    ).toBe("http://198.51.100.10:3102");
+
+    expect(
+      choosePrimaryRuntimeApiUrl({
+        authPublicBaseUrl: null,
+        allowedHostnames: [],
+        bindHost: "169.254.10.20",
+        port: 3102,
+      }),
+    ).toBe("http://localhost:3102");
+  });
+
+  it("ranks the concrete bind host ahead of stale allowedHostnames in the candidate list", () => {
+    expect(
+      buildRuntimeApiCandidateUrls({
+        authPublicBaseUrl: null,
+        allowedHostnames: ["100.92.93.56", "192.168.2.14"],
+        bindHost: "100.67.204.21",
+        port: 3100,
+        networkInterfacesMap: {},
+      }),
+    ).toEqual([
+      "http://100.67.204.21:3100",
+      "http://100.92.93.56:3100",
+      "http://192.168.2.14:3100",
+    ]);
+  });
+
   it("builds ordered callback candidates from explicit, allowed, bind, and interface hosts", () => {
     expect(
       buildRuntimeApiCandidateUrls({

@@ -22,6 +22,22 @@ function isLinkLocalHost(host: string): boolean {
   return false;
 }
 
+/**
+ * A bind host the server can actually be reached on, without operator extras.
+ *
+ * `bindHost` is the address the OS successfully bound the listener to, so it is
+ * the only input to this module that is evidence of reachability. A wildcard
+ * (0.0.0.0 / ::) says nothing about which interface answers, and an IPv6
+ * link-local address cannot be dialed without a scope id, so both are excluded.
+ */
+function isConcreteBindHost(host: string | null | undefined): boolean {
+  const normalized = normalizeHost(host);
+  if (!normalized) return false;
+  if (isWildcardHost(normalized)) return false;
+  if (isLinkLocalHost(normalized)) return false;
+  return true;
+}
+
 function formatOrigin(protocol: string, host: string, port: number): string {
   const normalizedHost = host.includes(":") && !host.startsWith("[") && !host.endsWith("]")
     ? `[${host}]`
@@ -61,16 +77,21 @@ export function choosePrimaryRuntimeApiUrl(input: {
     }
   }
 
+  // The bind host outranks allowedHostnames: it is the address the listener is
+  // actually bound to. allowedHostnames is an unauthenticated config string
+  // whose ordering carries no reachability guarantee, so a stale first entry
+  // must never be able to advertise a base children cannot connect to
+  // (RUAAAAA-5236). Operators who need an externally reachable origin still
+  // declare it explicitly via authPublicBaseUrl above.
+  if (isConcreteBindHost(input.bindHost)) {
+    return formatOrigin("http:", normalizeHost(input.bindHost), input.port);
+  }
+
   const allowedHostname = input.allowedHostnames
     .map((value) => value.trim())
     .find(Boolean);
   if (allowedHostname) {
     return formatOrigin("http:", allowedHostname, input.port);
-  }
-
-  const bindHost = normalizeHost(input.bindHost);
-  if (bindHost && !isWildcardHost(bindHost)) {
-    return formatOrigin("http:", bindHost, input.port);
   }
 
   return formatOrigin("http:", "localhost", input.port);
@@ -128,15 +149,16 @@ export function buildRuntimeApiCandidateUrls(input: {
   pushCandidate(candidates, seen, input.preferredApiUrl);
   pushCandidate(candidates, seen, explicitOrigin);
 
+  // Same precedence as choosePrimaryRuntimeApiUrl: a concrete bind host is
+  // reachable by construction, so it outranks the allowedHostnames entries.
+  if (isConcreteBindHost(input.bindHost)) {
+    pushCandidate(candidates, seen, formatOrigin(protocol, normalizeHost(input.bindHost), input.port));
+  }
+
   for (const rawHost of input.allowedHostnames) {
     const host = normalizeHost(rawHost);
     if (!host) continue;
     pushCandidate(candidates, seen, formatOrigin(protocol, host, input.port));
-  }
-
-  const bindHost = normalizeHost(input.bindHost);
-  if (bindHost && !isWildcardHost(bindHost)) {
-    pushCandidate(candidates, seen, formatOrigin(protocol, bindHost, input.port));
   }
 
   if (explicitOrigin) {
