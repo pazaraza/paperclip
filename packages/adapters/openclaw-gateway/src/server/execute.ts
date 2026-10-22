@@ -1729,9 +1729,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         const cooldownBackoffSequence = parseCooldownBackoffSequence(ctx.config.cooldownBackoffMs);
         const waitCallTimeoutMs = waitTimeoutMs + connectTimeoutMs;
         const waitBudgetStart = Date.now();
+        // RUAAAAA-5280: the slice cap must be sized from the SHORTEST slice the loop can use,
+        // not the nominal one. RUAAAAA-5256 added `saturatedProbeSliceMs` (5s) for any run that
+        // has not reported provider-started, but `maxSlices` was still derived from the nominal
+        // 30s slice, so the cap fired at 20*5s ~= 100s and cut a 600s budget down by 6x.
+        // RUAAAAA-5256 masked this because the saturation verdict broke out of the loop long
+        // before the cap; once the false `gateway_draining` verdict was corrected, runs that
+        // legitimately need more than ~100s to start died on the cap instead. Derive the cap from
+        // the shortest slice so the wall-clock budget survives either cadence.
+        const shortestSliceMs = Math.max(1, Math.min(waitSliceMs, saturatedProbeSliceMs));
         const maxSlices = Math.max(
           WAIT_SLICE_MIN_SLICES,
-          Math.ceil(waitTimeoutMs / Math.max(1, waitSliceMs)) + WAIT_SLICE_OVERRUN_SLACK,
+          Math.ceil(waitTimeoutMs / shortestSliceMs) + WAIT_SLICE_OVERRUN_SLACK,
         );
         let cooldownSignal: CooldownSignal | null = null;
         let cooldownAttempts = 0;
