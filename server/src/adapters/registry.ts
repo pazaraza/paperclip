@@ -9,6 +9,7 @@ import {
   getAdapterSessionManagement,
 } from "@paperclipai/adapter-utils";
 import {
+  applyHermesCompactionStallRecovery,
   applyHermesSessionContentionRecovery,
   createGuardedHermesSessionCodec,
   isHermesSessionId,
@@ -641,10 +642,15 @@ const hermesLocalAdapter: ServerAdapterModule = {
         "[hermes_local] adapter reported a session id that is not a hermes session id; dropping it (RUAAAAA-5244)",
       );
     }
-    return applyHermesSessionContentionRecovery(
+    // RUAAAAA-5339: a run that burns its whole budget in hermes' own context
+    // compaction produces no turns and keeps the same wedged session, so the
+    // next dispatch resumes it and fails identically. Drop the session and
+    // name the cause instead of recording a bare "Timed out".
+    const recovered = applyHermesSessionContentionRecovery(
       sanitizeHermesExecutionResult(hermesResult),
       capturedStderr,
     );
+    return applyHermesCompactionStallRecovery(recovered);
   },
   testEnvironment: (ctx) => hermesTestEnvironment(normalizeHermesConfig(ctx) as never),
   sessionCodec: createGuardedHermesSessionCodec(hermesSessionCodec, (rejections) => {
