@@ -54,6 +54,7 @@ import {
   classifyIssueGraphLiveness,
   type IssueLivenessFinding,
 } from "./issue-graph-liveness.js";
+import { reconcileStrandedTimedOutRunLiveness } from "../run-liveness-reconcile.js";
 import {
   recoveryAssigneeAdapterOverrides,
   withRecoveryModelProfileHint,
@@ -3173,6 +3174,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       orphanBlockersAssigned: 0,
       successfulRunHandoffEscalated: 0,
       successfulRunHandoffAutoCleared: 0,
+      runLivenessReconciled: 0,
       escalated: 0,
       writeToolingFailureHandoff: 0,
       skipped: 0,
@@ -3500,6 +3502,32 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
 
       if (didAutomaticRecoveryFail(latestRun, "issue_continuation_needed")) {
+        // RUAAAAA-5323: the run row was classified once, at run
+        // finalization, against the evidence that existed at that
+        // instant. When the openclaw_gateway wait budget expired
+        // before the gateway streamed anything back, that evidence was
+        // empty and the row froze at `livenessState: failed` /
+        // `lastUsefulActionAt: null` — permanently, because nothing ever
+        // asked again. The orphaned agent kept working and landed real
+        // durable writes afterwards.
+        //
+        // Re-run the classification here, before the auto-clear guards
+        // below, so they evaluate against a row that reflects the late
+        // evidence. Guarded to runs finalized `timed_out` whose own
+        // durable writes grew *after* `finishedAt`, and repaired at most
+        // once per row, so settled rows are never churned.
+        //
+        // The reconciler re-fetches the run row by id on purpose: the
+        // `latestRun` snapshot in this loop is the same stale-snapshot
+        // shape that caused the original defect.
+        const runLivenessReconciled = await reconcileStrandedTimedOutRunLiveness(
+          db,
+          latestRun?.id ?? null,
+        );
+        if (runLivenessReconciled.reconciled) {
+          result.runLivenessReconciled += 1;
+        }
+
         // Cycle-1 auto-clear: a `timed_out` continuation retry that
         // landed durable progress BEFORE the openclaw_gateway
         // wait-timeout fired is not a real stall. The evidence check
