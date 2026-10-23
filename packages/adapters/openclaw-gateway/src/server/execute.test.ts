@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildWaitTimeoutMessage,
   classifyWaitSliceStatus,
+  deriveMaxSlices,
   detectCooldownSignal,
   detectWaitSliceSaturation,
   parseCooldownBackoffSequence,
@@ -364,5 +365,72 @@ describe("buildWaitTimeoutMessage (RUAAAAA-5310)", () => {
     expect(msg).toContain("across 0 polling slice(s)");
     expect(msg).toContain(`= ${4_200}ms/slice measured`);
     expect(msg).not.toContain("NaN");
+  });
+});
+
+/**
+ * RUAAAAA-5317. The non-vacuous regression guard for "the waiter abandons live runs at ~130s
+ * against a 600s budget".
+ *
+ * RUAAAAA-5280 fixed the arithmetic inline in the wait loop but left it untested. Every `maxSlices`
+ * in this suite was an *input* to the message formatter; none asserted how the cap is derived, so
+ * a future edit could reintroduce the nominal-cadence derivation and every test would stay green.
+ *
+ * The invariant under test is not "the timeout got longer" — a longer cap proves nothing. It is:
+ *
+ *     the cap must be unreachable before the wall-clock budget has actually run out
+ *
+ * checked at the production config (600s budget, 30s nominal slice, 5s RUAAAAA-5256 probe slice).
+ */
+describe("deriveMaxSlices (RUAAAAA-5317)", () => {
+  // The exact production config from the live adapterConfig of the Head of Engineering agent.
+  const PROD = { waitTimeoutMs: 600_000, nominalSliceMs: 30_000, probeSliceMs: 5_000 };
+
+  it("keeps the slice cap beyond the wall-clock budget on probe cadence", () => {
+    const { maxSlices, shortestSliceMs, capEarliestFireMs } = deriveMaxSlices(PROD);
+    // The load-bearing invariant: the loop cannot hit the cap before the budget is spent.
+    expect(capEarliestFireMs).toBeGreaterThanOrEqual(PROD.waitTimeoutMs);
+    // Probe cadence is the shortest the loop can use, so that is what the cap must be sized from.
+    expect(shortestSliceMs).toBe(5_000);
+    // The pre-fix derivation: ceil(600000/30000)+4 = 24, which fired at 24*5s = 120s.
+    expect(maxSlices).not.toBe(24);
+    expect(maxSlices).toBe(124);
+  });
+
+  it("REGRESSION: a run outliving the old ~130s abandonment point still fits under the cap", () => {
+    // RUAAAAA-5317 asks for proof that the fix is not "raise the timeout". Reproduce the real
+    // failure at loop level: a still-running turn that is NOT provider-started stays on 5s probe
+    // slices for its whole life, so a 200s run makes 40 slices.
+    const RUN_MS = 200_000; // comfortably past the 130s abandonment point, inside the 600s budget
+    const { maxSlices, shortestSliceMs } = deriveMaxSlices(PROD);
+    const slicesTaken = Math.ceil(RUN_MS / shortestSliceMs);
+
+    expect(slicesTaken).toBe(40);
+    // Pre-fix: 40 > 24, so the loop abandoned a live run at 120s and wrote finished_at.
+    const preFixMaxSlices = Math.ceil(PROD.waitTimeoutMs / PROD.nominalSliceMs) + 4;
+    expect(preFixMaxSlices).toBe(24);
+    expect(slicesTaken).toBeGreaterThan(preFixMaxSlices); // this is the bug being pinned
+    // Post-fix the same run stays under the cap, so the waiter keeps polling to completion
+    // instead of declaring the run dead and dispatching a replacement wake.
+    expect(slicesTaken).toBeLessThan(maxSlices);
+  });
+
+  it("sizes the cap from the shortest cadence regardless of which one the loop is on", () => {
+    // Once `providerStarted` is seen the loop switches to the nominal 30s slice, which makes the
+    // budget even easier to survive. The cap must not shrink just because the cadence got longer.
+    const probe = deriveMaxSlices(PROD);
+    const nominal = deriveMaxSlices({ ...PROD, probeSliceMs: 30_000 });
+    expect(nominal.maxSlices).toBe(24); // ceil(600000/30000)+4 — correct HERE, because 30s is the real cadence
+    expect(nominal.capEarliestFireMs).toBeGreaterThanOrEqual(PROD.waitTimeoutMs);
+    // The probe path needs more slices to cover the same wall clock, and must get them.
+    expect(probe.maxSlices).toBeGreaterThan(nominal.maxSlices);
+  });
+
+  it("never returns a cap below the floor, whatever the input", () => {
+    expect(deriveMaxSlices({ waitTimeoutMs: 0, nominalSliceMs: 30_000, probeSliceMs: 5_000 }).maxSlices).toBe(4);
+    // Degenerate cadence must not divide by zero into Infinity.
+    const zero = deriveMaxSlices({ waitTimeoutMs: 600_000, nominalSliceMs: 0, probeSliceMs: 0 });
+    expect(Number.isFinite(zero.maxSlices)).toBe(true);
+    expect(zero.shortestSliceMs).toBe(1);
   });
 });

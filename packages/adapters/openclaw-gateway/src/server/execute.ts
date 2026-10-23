@@ -289,6 +289,43 @@ export type WaitTimeoutExitReason = "budget_exhausted" | "slice_cap_exhausted";
  * by construction, so no future cadence change can make this message contradict itself again.
  * The configured intervals and the cap are still reported, labelled as configuration.
  */
+/**
+ * RUAAAAA-5317: the largest number of polling slices the wait loop may make.
+ *
+ * This is the load-bearing constant of the wait loop and it was the one line that made the loop
+ * abandon live runs at ~130s against a 600s budget. The cap was derived from the NOMINAL slice
+ * interval while the loop actually ran on the shorter RUAAAAA-5256 probe interval:
+ *
+ *     maxSlices = ceil(waitTimeoutMs / waitSliceMs) + slack   // 600000/30000 + 4 = 24
+ *
+ * but `sliceMs` in the loop is `min(waitSliceMs, saturatedProbeSliceMs)` (5s) for any run whose
+ * payloads never carry `providerStarted`. 24 slices x 5s is 120s, so the cap fired at ~120s and
+ * `finished_at` was written while the agent turn was still working. The three runs in RUAAAAA-5317
+ * are the exact fingerprint: "elapsed 121053ms across 24 polling slice(s)".
+ *
+ * The invariant this function must hold, and the reason it is exported rather than inlined:
+ *
+ *     maxSlices * shortestSliceMs >= waitTimeoutMs
+ *
+ * i.e. the cap must be reachable ONLY after the wall-clock budget has run out. If any future edit
+ * derives the cap from a cadence the loop does not actually use, this invariant is the thing that
+ * catches it. See `deriveMaxSlices` in execute.test.ts for the non-vacuous regression guard.
+ */
+export function deriveMaxSlices(input: {
+  waitTimeoutMs: number;
+  nominalSliceMs: number;
+  probeSliceMs: number;
+}): { maxSlices: number; shortestSliceMs: number; capEarliestFireMs: number } {
+  const { waitTimeoutMs, nominalSliceMs, probeSliceMs } = input;
+  // Derive from the SHORTEST slice the loop can use, so the budget survives either cadence.
+  const shortestSliceMs = Math.max(1, Math.min(nominalSliceMs, probeSliceMs));
+  const maxSlices = Math.max(
+    WAIT_SLICE_MIN_SLICES,
+    Math.ceil(waitTimeoutMs / shortestSliceMs) + WAIT_SLICE_OVERRUN_SLACK,
+  );
+  return { maxSlices, shortestSliceMs, capEarliestFireMs: maxSlices * shortestSliceMs };
+}
+
 export function buildWaitTimeoutMessage(input: {
   waitTimeoutMs: number;
   elapsedMs: number;
@@ -1796,11 +1833,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         // before the cap; once the false `gateway_draining` verdict was corrected, runs that
         // legitimately need more than ~100s to start died on the cap instead. Derive the cap from
         // the shortest slice so the wall-clock budget survives either cadence.
-        const shortestSliceMs = Math.max(1, Math.min(waitSliceMs, saturatedProbeSliceMs));
-        const maxSlices = Math.max(
-          WAIT_SLICE_MIN_SLICES,
-          Math.ceil(waitTimeoutMs / shortestSliceMs) + WAIT_SLICE_OVERRUN_SLACK,
-        );
+        //
+        // RUAAAAA-5317: derivation extracted to `deriveMaxSlices` so the cap-versus-budget
+        // invariant is directly testable. The inline arithmetic had no test at all — every
+        // `maxSlices` in the suite was an input to the message formatter, never an assertion
+        // about how the cap is computed, so this class of bug could return silently.
+        const { maxSlices, shortestSliceMs } = deriveMaxSlices({
+          waitTimeoutMs,
+          nominalSliceMs: waitSliceMs,
+          probeSliceMs: saturatedProbeSliceMs,
+        });
         let cooldownSignal: CooldownSignal | null = null;
         let cooldownAttempts = 0;
         let waitPayload: Record<string, unknown> | null = null;
