@@ -54,6 +54,12 @@ import {
   classifyIssueGraphLiveness,
   type IssueLivenessFinding,
 } from "./issue-graph-liveness.js";
+import {
+  SWEEP_CONTINUATION_ATTEMPT_SNAPSHOT_KEY,
+  SWEEP_CONTINUATION_EXHAUSTED_COMMENT_PREFIX,
+  decideSweepContinuation,
+  readSweepContinuationAttempt,
+} from "./run-liveness-continuations.js";
 import { reconcileStrandedTimedOutRunLiveness } from "../run-liveness-reconcile.js";
 import {
   recoveryAssigneeAdapterOverrides,
@@ -511,13 +517,28 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     retryReason: "assignment_recovery" | "issue_continuation_needed";
     source: string;
     retryOfRunId?: string | null;
+    // RUAAAAA-5326: `nextAttempt` threads the sweep's own attempt budget
+    // forward on the seeded run's contextSnapshot. It is deliberately NOT the
+    // `continuationAttempt` column: that column is the liveness continuation
+    // ladder's budget, and writing to it makes a sweep-seeded run arrive at
+    // `decideRunLivenessContinuation` with one of its two attempts already
+    // spent.
+    continuationAttempt?: number | null;
+    maxContinuationAttempts?: number | null;
   }) {
+    const continuationAttemptHints = input.continuationAttempt
+      ? {
+        [SWEEP_CONTINUATION_ATTEMPT_SNAPSHOT_KEY]: input.continuationAttempt,
+        sweepContinuationMaxAttempts: input.maxContinuationAttempts ?? null,
+      }
+      : {};
     const queued = await deps.enqueueWakeup(input.agentId, {
       source: "automation",
       triggerDetail: "system",
       reason: input.reason,
       payload: withRecoveryModelProfileHint({
         issueId: input.issueId,
+        ...continuationAttemptHints,
         ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
       }),
       requestedByActorType: "system",
@@ -528,6 +549,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         wakeReason: input.reason,
         retryReason: input.retryReason,
         source: input.source,
+        ...continuationAttemptHints,
         ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
       }),
     });
@@ -545,6 +567,43 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     }
 
     return queued;
+  }
+
+  // RUAAAAA-5326: when the sweep's bounded budget is spent, hand the issue to
+  // a human once instead of re-seeding the ladder on every later pass. Keyed on
+  // the issue rather than a run id because the sweep has no run of its own.
+  async function postSweepContinuationExhaustedCommentOnce(
+    issue: Pick<typeof issues.$inferSelect, "id" | "companyId">,
+    agentId: string,
+    comment: string,
+  ) {
+    const existing = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.companyId, issue.companyId),
+          eq(issueComments.issueId, issue.id),
+          sql`${issueComments.body} like ${`${SWEEP_CONTINUATION_EXHAUSTED_COMMENT_PREFIX}%`}`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (existing) return;
+    await issuesSvc.addComment(issue.id, comment, { agentId });
+  }
+
+  // RUAAAAA-5326: the sweep may chain from `issue.checkoutRunId` when there is
+  // no latest run row, so the attempt budget has to be readable by id and not
+  // only off the `getLatestIssueRun` projection.
+  async function readRunSweepContinuationAttempt(runId: string | null | undefined) {
+    if (!runId) return 0;
+    const rows = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .limit(1);
+    return readSweepContinuationAttempt(rows[0]?.contextSnapshot);
   }
 
   async function enqueueInitialAssignedTodoDispatch(issue: typeof issues.$inferSelect, agentId: string) {
@@ -3169,6 +3228,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       assignmentDispatched: 0,
       dispatchRequeued: 0,
       continuationRequeued: 0,
+      continuationExhausted: 0,
       productiveContinuationObserved: 0,
       successfulContinuationObserved: 0,
       orphanBlockersAssigned: 0,
@@ -3452,6 +3512,24 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
+        // RUAAAAA-5326: this call site is outside both bounded ladders — the
+        // latest run SUCCEEDED, so `didAutomaticRecoveryFail` never matches,
+        // and `isRepeatedProductiveContinuationRecovery` string-matches the
+        // `source` label, so it does not match a run the sibling site seeded.
+        // Read the sweep's own attempt budget before re-seeding.
+        const productiveSweepDecision = decideSweepContinuation({
+          sourceRunAttempt: readSweepContinuationAttempt(successfulRun.contextSnapshot),
+          retryReason: "issue_continuation_needed",
+        });
+        if (productiveSweepDecision.kind !== "enqueue") {
+          if (productiveSweepDecision.kind === "exhausted") {
+            await postSweepContinuationExhaustedCommentOnce(issue, agentId, productiveSweepDecision.comment);
+            result.continuationExhausted += 1;
+          }
+          result.skipped += 1;
+          continue;
+        }
+
         if (await isInvocationBudgetBlocked(issue, agentId)) {
           result.skipped += 1;
           continue;
@@ -3464,6 +3542,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           retryReason: "issue_continuation_needed",
           source: "issue.productive_terminal_continuation_recovery",
           retryOfRunId: successfulRun.id,
+          continuationAttempt: productiveSweepDecision.nextAttempt,
+          maxContinuationAttempts: productiveSweepDecision.maxAttempts,
         });
         if (queued) {
           result.continuationRequeued += 1;
@@ -3584,6 +3664,25 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
 
+      // RUAAAAA-5326: the 2253 sibling site. Same shape as the productive
+      // branch above — outside both bounded ladders, so read the attempt budget
+      // before re-seeding the top of the retry ladder. The source run can be
+      // the checkout run when the issue has no latest run row yet.
+      const continuationSweepDecision = decideSweepContinuation({
+        sourceRunAttempt: latestRun
+          ? readSweepContinuationAttempt(latestRun.contextSnapshot)
+          : await readRunSweepContinuationAttempt(issue.checkoutRunId),
+        retryReason: "issue_continuation_needed",
+      });
+      if (continuationSweepDecision.kind !== "enqueue") {
+        if (continuationSweepDecision.kind === "exhausted") {
+          await postSweepContinuationExhaustedCommentOnce(issue, agentId, continuationSweepDecision.comment);
+          result.continuationExhausted += 1;
+        }
+        result.skipped += 1;
+        continue;
+      }
+
       if (await isInvocationBudgetBlocked(issue, agentId)) {
         result.skipped += 1;
         continue;
@@ -3596,6 +3695,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         retryReason: "issue_continuation_needed",
         source: "issue.continuation_recovery",
         retryOfRunId: latestRun?.id ?? issue.checkoutRunId ?? null,
+        continuationAttempt: continuationSweepDecision.nextAttempt,
+        maxContinuationAttempts: continuationSweepDecision.maxAttempts,
       });
       if (queued) {
         result.continuationRequeued += 1;

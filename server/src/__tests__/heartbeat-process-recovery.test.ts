@@ -81,6 +81,11 @@ import {
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
 } from "../services/recovery/index.ts";
+import {
+  DEFAULT_MAX_SWEEP_CONTINUATION_ATTEMPTS,
+  SWEEP_CONTINUATION_EXHAUSTED_COMMENT_PREFIX,
+} from "../services/run-continuations.ts";
+import { readSweepContinuationAttempt } from "../services/recovery/run-liveness-continuations.ts";
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
@@ -536,6 +541,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     livenessState?: "completed" | "advanced" | "plan_only" | "empty_response" | "blocked" | "failed" | "needs_followup" | null;
     runErrorCode?: string | null;
     runError?: string | null;
+    // RUAAAAA-5326: the sweep's own attempt budget, carried on the run's
+    // contextSnapshot. Deliberately NOT the `continuationAttempt` column,
+    // which belongs to the liveness continuation ladder.
+    sweepContinuationAttempt?: number | null;
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -598,6 +607,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           : input.retryReason ?? "issue_assigned",
         ...(input.retryReason ? { retryReason: input.retryReason } : {}),
         ...(input.runSource ? { source: input.runSource } : {}),
+        ...(input.sweepContinuationAttempt
+          ? { sweepContinuationAttempt: input.sweepContinuationAttempt }
+          : {}),
       },
       startedAt: now,
       finishedAt: new Date("2026-03-19T00:05:00.000Z"),
@@ -3965,6 +3977,118 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
     expect(wakeups).toHaveLength(2);
+  });
+
+  // RUAAAAA-5326 — the periodic recovery sweep is a third re-enqueue path,
+  // outside both bounded ladders (the comment ladder in `heartbeat.ts` and
+  // `DEFAULT_MAX_LIVENESS_CONTINUATION_ATTEMPTS` in
+  // `run-liveness-continuations.ts`). It used to carry no chain counter, so
+  // the top of the retry ladder was re-seeded without a cumulative attempt
+  // count. These three tests are a PAIR on purpose:
+  //
+  //   * "carries the chain counter" proves the counter is actually WRITTEN on
+  //     the seeded run. Without it, the two cut tests below pass vacuously —
+  //     a guard that reads a field nobody populates always sees 0 and always
+  //     says "enqueue".
+  //   * the two cut tests prove the budget is read and spent.
+  //
+  // Reverting the guard (`decideSweepContinuation`) makes both cut tests fail:
+  // each sees a re-enqueue instead of an exhausted handoff.
+
+  it("RUAAAAA-5326: carries the chain counter onto the run the sweep re-enqueues", async () => {
+    const { agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.continuationRequeued).toBe(1);
+    expect(result.continuationExhausted).toBe(0);
+
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    const seededRun = runs.find((row) => row.id !== runId);
+    expect(seededRun).toBeTruthy();
+    // The next sweep pass reads this key back, so it has to land on the run.
+    expect(seededRun?.contextSnapshot as Record<string, unknown> | undefined).toMatchObject({
+      sweepContinuationAttempt: 1,
+      sweepContinuationMaxAttempts: DEFAULT_MAX_SWEEP_CONTINUATION_ATTEMPTS,
+    });
+    // And it must NOT touch the liveness continuation ladder's own counter —
+    // a run seeded by the sweep arrives at `decideRunLivenessContinuation`
+    // with its full budget, not one already spent.
+    expect(seededRun?.continuationAttempt ?? 0).toBe(0);
+    // ...and the sweep's read path actually sees it.
+    expect(readSweepContinuationAttempt(seededRun?.contextSnapshot)).toBe(1);
+
+    if (seededRun) {
+      await waitForRunToSettle(heartbeat, seededRun.id);
+    }
+  });
+
+  it("RUAAAAA-5326: cuts the sweep chain at the continuation rung and posts the human handoff instead of re-queueing", async () => {
+    const { agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      // The sweep already re-seeded this run once. Attempt 1 == the budget.
+      sweepContinuationAttempt: 1,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.continuationExhausted).toBe(1);
+    expect(result.escalated).toBe(0);
+
+    // No new run, and no new wakeup request: the sweep did not re-seed.
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs.map((row) => row.id)).toEqual([runId]);
+    const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeups).toHaveLength(1);
+
+    // `exhausted` must hand off, not silently skip.
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body.startsWith(SWEEP_CONTINUATION_EXHAUSTED_COMMENT_PREFIX)).toBe(true);
+    expect(comments[0]?.body).toContain("1/1");
+    expect(comments[0]?.body).toContain("issue_continuation_needed");
+
+    // The issue stays put — this is a handoff, not a forced block.
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+
+    // Idempotent: a later sweep pass must not stack a second notice.
+    const second = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(second.continuationExhausted).toBe(1);
+    const commentsAfter = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(commentsAfter).toHaveLength(1);
+  });
+
+  it("RUAAAAA-5326: cuts the sweep chain at the productive rung too", async () => {
+    const { agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+      // No `retryReason`/`source`, so the pre-existing
+      // `isRepeatedProductiveContinuationRecovery` guard does NOT match and
+      // this run genuinely reaches the productive enqueue site. The seeded
+      // attempt budget is the only thing that can cut it here.
+      sweepContinuationAttempt: 1,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.continuationExhausted).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.successfulRunHandoffAutoCleared).toBe(0);
+
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs.map((row) => row.id)).toEqual([runId]);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body.startsWith(SWEEP_CONTINUATION_EXHAUSTED_COMMENT_PREFIX)).toBe(true);
   });
 
   it("blocks stranded in-progress work after a productive continuation retry was already used", async () => {
