@@ -144,6 +144,16 @@ import { recoveryService } from "./recovery/service.js";
 import { productivityReviewService } from "./productivity-review.js";
 import { withAgentStartLock } from "./agent-start-lock.js";
 import {
+  isRunExecutionActive,
+  markRunExecutionActive,
+  markRunExecutionFinished,
+} from "./heartbeat-run-execution-registry.js";
+import {
+  buildProcessLossMessage,
+  isRunInsideExecutionBudget,
+  resolveRunExecutionHorizonMs,
+} from "./heartbeat-run-liveness.js";
+import {
   redactCurrentUserText,
   redactCurrentUserValue,
   type CurrentUserRedactionOptions,
@@ -2188,22 +2198,6 @@ async function terminateHeartbeatRunProcess(input: {
   );
 }
 
-function buildProcessLossMessage(run: {
-  processPid: number | null;
-  processGroupId: number | null;
-}, options?: { descendantOnly?: boolean }) {
-  if (options?.descendantOnly && run.processGroupId) {
-    return `Process lost -- parent pid ${run.processPid ?? "unknown"} exited, but descendant process group ${run.processGroupId} was still alive and was terminated`;
-  }
-  if (run.processPid) {
-    return `Process lost -- child pid ${run.processPid} is no longer running`;
-  }
-  if (run.processGroupId) {
-    return `Process lost -- process group ${run.processGroupId} is no longer running`;
-  }
-  return "Process lost -- server may have restarted";
-}
-
 function truncateDisplayId(value: string | null | undefined, max = 128) {
   if (!value) return null;
   return value.length > max ? value.slice(0, max) : value;
@@ -2327,7 +2321,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     environmentRuntime,
   });
   const workspaceOperationsSvc = workspaceOperationService(db);
-  const activeRunExecutions = new Set<string>();
   const budgetHooks = {
     cancelWorkForScope: cancelBudgetScopeWork,
   };
@@ -6264,9 +6257,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(eq(heartbeatRuns.status, "running"));
 
     const reaped: string[] = [];
+    const skippedInsideExecutionBudget: string[] = [];
 
     for (const { run, adapterType, adapterConfig } of activeRuns) {
-      if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
+      if (runningProcesses.has(run.id) || isRunExecutionActive(run.id)) continue;
 
       // Apply staleness threshold to avoid false positives
       if (staleThresholdMs > 0) {
@@ -6275,6 +6269,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
+      const hasRecordedProcess = Boolean(run.processPid || run.processGroupId);
+
+      // RUAAAAA-5353: an adapter that never reports its child process (the
+      // hermes_local adapter does not call `onSpawn`) leaves no process metadata
+      // on the run row, so the pid/group liveness checks below have nothing to
+      // inspect and the reaper froze a `failed` / `process_lost` verdict on a
+      // run whose child was still alive and working. Refuse to freeze that
+      // verdict while the run is still inside the execution budget its own
+      // adapter was given -- the adapter is allowed to still be running.
+      if (!hasRecordedProcess && staleThresholdMs > 0) {
+        const horizonMs = resolveRunExecutionHorizonMs(parseObject(adapterConfig));
+        const startedAtMs = run.startedAt ? new Date(run.startedAt).getTime() : 0;
+        if (
+          horizonMs !== null &&
+          isRunInsideExecutionBudget({ startedAtMs, nowMs: now.getTime(), horizonMs })
+        ) {
+          skippedInsideExecutionBudget.push(run.id);
+          continue;
+        }
+      }
+
       const processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
       const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
       if (processPidAlive) {
@@ -6309,7 +6324,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const shouldRetry = tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 1;
-      const baseMessage = buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
+      const baseMessage = buildProcessLossMessage({
+        processPid: run.processPid,
+        processGroupId: run.processGroupId,
+        startedAtMs: run.startedAt ? new Date(run.startedAt).getTime() : 0,
+        descendantOnly: descendantOnlyCleanup,
+      });
 
       let finalizedRun = await setRunStatus(run.id, "failed", {
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
@@ -6374,7 +6394,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (reaped.length > 0) {
       logger.warn({ reapedCount: reaped.length, runIds: reaped }, "reaped orphaned heartbeat runs");
     }
-    return { reaped: reaped.length, runIds: reaped };
+    if (skippedInsideExecutionBudget.length > 0) {
+      logger.info(
+        { skippedCount: skippedInsideExecutionBudget.length, runIds: skippedInsideExecutionBudget },
+        "skipped orphaned-run reap: runs are still inside their adapter execution budget",
+      );
+    }
+    return { reaped: reaped.length, runIds: reaped, skippedInsideExecutionBudget };
   }
 
   async function resumeQueuedRuns() {
@@ -6578,7 +6604,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       run = claimed;
     }
 
-    activeRunExecutions.add(run.id);
+    markRunExecutionActive(run.id);
 
     try {
     const agent = await getAgent(run.agentId);
@@ -7902,7 +7928,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             failureReason: latestRun?.error ?? undefined,
           });
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
-          activeRunExecutions.delete(run.id);
+          markRunExecutionFinished(run.id);
           await startNextQueuedRunForAgent(run.agentId);
         }
   }
