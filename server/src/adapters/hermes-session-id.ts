@@ -1,28 +1,64 @@
 /**
- * hermes_local session-id format guard (RUAAAAA-5244).
+ * hermes_local session-id format guard (RUAAAAA-5244) and session-contention
+ * recovery (RUAAAAA-5296).
+ *
+ * Ported onto the reconciled master in RUAAAAA-5418. Upstream moved the hermes
+ * adapter in-tree at `packages/adapters/hermes` (0.3.1), so the guard is now
+ * wired *around* the vendored adapter in `server/src/adapters/registry.ts`
+ * rather than around the old in-tree adapter. The upstream adapter
+ * construction is left intact; this module only wraps it.
+ *
+ * ── Why the session-id guard exists ─────────────────────────────────────
  *
  * Hermes Agent mints every session id in the shape
- * `<YYYYMMDD>_<HHMMSS>_<6 lowercase hex>` (e.g. `20260706_234011_dc2cf9`).
+ * `<YYYYMMDD>_<HHMMSS>_<suffix>` (e.g. `20260706_234011_dc2cf9`).
  * Nothing else is a session id.
  *
  * The adapter scrapes the id out of hermes stdout/stderr with
  * `SESSION_ID_REGEX_LEGACY = /session[_ ](?:id|saved)[:\s]+([a-zA-Z0-9_-]+)/i`,
  * which happily captures the next prose word. "Session saved from the previous
  * run" yields `sessionId: "from"`. The adapter's own codec only checks
- * non-empty, and `resolveNextSessionState()` in heartbeat.ts falls back to
- * `readNonEmptyString(adapterResult.sessionId)` without validation, so the
- * garbage word lands in `agent_task_sessions.session_params_json` /
- * `agent_runtime_state.session_id` and the next run shells out
- * `hermes --resume from`.
+ * non-empty, so the garbage word used to land in
+ * `agent_task_sessions.session_params_json` / `agent_runtime_state.session_id`
+ * and the next run shelled out `hermes --resume from`.
  *
  * This module is the server-side choke point: it fails closed. A value that
  * does not match the shape is never persisted, never displayed, and never
  * handed back to the adapter as a resume target.
  */
-import type { AdapterSessionCodec } from "@paperclipai/adapter-utils";
+import type {
+  AdapterExecutionContext,
+  AdapterExecutionResult,
+  AdapterSessionCodec,
+} from "@paperclipai/adapter-utils";
 
-/** The only shape a hermes session id can have. */
-export const HERMES_SESSION_ID_PATTERN = /^\d{8}_\d{6}_[0-9a-f]{6}$/;
+/**
+ * The canonical shape of a hermes session id.
+ *
+ * This is deliberately the *same* rule upstream master already enforces for
+ * `hermes_local` in `server/src/services/heartbeat/run-state.ts`
+ * (`isCanonicalSessionIdForAdapter`). That module imports this constant so
+ * there is a single source of truth.
+ *
+ * The guard must never be *stricter* than the rule the server applies. A
+ * stricter codec would reject session ids the server considers valid and
+ * silently break `hermes --resume` continuity, because the session would be
+ * dropped after every run (the agent would restart from scratch forever).
+ * The upstream rule is therefore a superset of hermes' documented shape, and
+ * this guard uses it verbatim.
+ *
+ * Accepted:
+ *  - `<YYYYMMDD>_<HHMMSS>_<suffix>` with a suffix of at least four word
+ *    characters (hermes' documented shape is six lowercase hex:
+ *    `20260706_234011_dc2cf9`)
+ *  - a canonical UUID
+ *
+ * Rejected: prose words captured by hermes' legacy stdout parser (`from`,
+ * `to`, `previous`), the truncated display form `20260706_234011_`,
+ * empty strings, and anything else.
+ */
+export const HERMES_SESSION_ID_PATTERN =
+  /^(?:\d{8}_\d{6}_[A-Za-z0-9_-]{4,}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$/;
 
 /**
  * True only for a well-formed hermes session id. `from`, `20260827`, an
@@ -126,7 +162,7 @@ export const HERMES_SESSION_NOT_OWNED_PATTERN = /hermes-refusal-reason:\s*SESSIO
 /** Distinct run error code so this is not scored as `adapter_failed`. */
 export const HERMES_SESSION_NOT_OWNED_ERROR_CODE = "session_not_owned";
 
-/** True when the captured stderr shows the session-contention refusal. */
+/** True when the captured child output shows the session-contention refusal. */
 export function isHermesSessionNotOwned(text: string | null | undefined): boolean {
   return typeof text === "string" && HERMES_SESSION_NOT_OWNED_PATTERN.test(text);
 }
@@ -169,6 +205,12 @@ export function applyHermesSessionContentionRecovery<TResult extends SessionCont
  * execute path needs its own guard. `null` — not `undefined` — is returned so
  * the value is explicitly reported as absent rather than falling through to
  * "keep the previous session".
+ *
+ * The vendored adapter reports `sessionDisplayId` as `sessionId.slice(0, 16)`
+ * (`20260706_234011_`). That truncated form is not a session id, so it is
+ * cleared here — exactly as upstream's canonical-session-id rule already
+ * treats it. Upstream then falls back to the full session id from
+ * `sessionParams` for the display id, so nothing is lost.
  */
 export function sanitizeHermesExecutionResult<TResult extends SessionIdCarrier>(
   result: TResult,
@@ -198,4 +240,71 @@ export function sanitizeHermesExecutionResult<TResult extends SessionIdCarrier>(
 
   if (!changed) return result;
   return next;
+}
+
+/** Upper bound on the child's stderr kept for refusal detection. */
+export const HERMES_STDERR_CAPTURE_LIMIT = 16 * 1024;
+
+export type HermesSessionGuardHooks = {
+  /** Called when the adapter reported a session id that is not a hermes session id. */
+  onRejectedSessionId?: (info: { agentId: string; runId: string; sessionId: string }) => void;
+  /** Called when the child refused the pinned session (SESSION_NOT_OWNED). */
+  onSessionContention?: (info: { agentId: string; runId: string }) => void;
+};
+
+/**
+ * Wrap a hermes_local `execute` so the guard actually runs.
+ *
+ * Two things happen around the vendored adapter:
+ *
+ * 1. **Session-id guard (RUAAAAA-5244).** The adapter result is run through
+ *    `sanitizeHermesExecutionResult`, so a malformed id (`"from"`) is dropped
+ *    before the server can persist it into `agent_task_sessions` /
+ *    `agent_runtime_state`. Upstream's server-side canonical-session-id rule
+ *    already refuses to persist such an id; this closes the same hole at the
+ *    adapter boundary and makes the rejection observable in the logs.
+ *
+ * 2. **Session-contention recovery (RUAAAAA-5296).** The vendored adapter does
+ *    not surface the child's stderr on the result, and its own parser only
+ *    keeps stderr lines matching /error|exception|traceback|failed/i — which
+ *    the `SESSION_NOT_OWNED` refusal matches none of. So a bounded copy of the
+ *    child's stderr is captured through `ctx.onLog` and matched against the
+ *    refusal pattern. On a match the result gets `clearSession: true` and the
+ *    distinct `session_not_owned` error code, which makes
+ *    `resolveNextSessionState()` return nulls so the server calls
+ *    `clearTaskSessions()` and the next dispatch starts a fresh session
+ *    instead of re-pinning the refused one.
+ */
+export function createGuardedHermesLocalExecute(
+  baseExecute: (ctx: AdapterExecutionContext) => Promise<AdapterExecutionResult>,
+  hooks: HermesSessionGuardHooks = {},
+): (ctx: AdapterExecutionContext) => Promise<AdapterExecutionResult> {
+  return async (ctx) => {
+    const agentId = ctx.agent?.id ?? "unknown";
+    const runId = ctx.runId ?? "unknown";
+
+    let capturedStderr = "";
+    const patchedCtx: AdapterExecutionContext = {
+      ...ctx,
+      onLog: async (stream, chunk) => {
+        if (stream === "stderr" && capturedStderr.length < HERMES_STDERR_CAPTURE_LIMIT) {
+          capturedStderr += chunk;
+        }
+        await ctx.onLog?.(stream, chunk);
+      },
+    };
+
+    const raw = await baseExecute(patchedCtx);
+
+    if (typeof raw?.sessionId === "string" && !isHermesSessionId(raw.sessionId)) {
+      hooks.onRejectedSessionId?.({ agentId, runId, sessionId: raw.sessionId });
+    }
+
+    const sanitized = sanitizeHermesExecutionResult(raw);
+    const recovered = applyHermesSessionContentionRecovery(sanitized, capturedStderr);
+    if (recovered.clearSession) {
+      hooks.onSessionContention?.({ agentId, runId });
+    }
+    return recovered;
+  };
 }

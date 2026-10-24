@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { sessionCodec as hermesSessionCodec } from "hermes-paperclip-adapter/server";
+import { sessionCodec as hermesSessionCodec } from "@paperclipai/hermes-paperclip-adapter/server";
 import {
   createGuardedHermesSessionCodec,
   HERMES_SESSION_ID_PATTERN,
@@ -9,7 +9,8 @@ import {
 } from "../adapters/hermes-session-id.js";
 
 /**
- * RUAAAAA-5244 regression guard.
+ * RUAAAAA-5244 regression guard, ported onto the reconciled master
+ * (RUAAAAA-5418).
  *
  * The adapter's legacy stdout parser is
  *   /session[_ ](?:id|saved)[:\s]+([a-zA-Z0-9_-]+)/i
@@ -19,6 +20,12 @@ import {
  * "Session saved from the previous context" and persisted it into
  * agent_task_sessions.session_params_json for 30 rows across 10 agents, which
  * then shelled out `hermes --resume from`.
+ *
+ * The accepted shape is the canonical hermes session-id rule that upstream
+ * master already applies server-side
+ * (isCanonicalSessionIdForAdapter in services/heartbeat/run-state.ts). The
+ * guard must not be stricter than that rule, or wiring it would drop session
+ * ids the server is willing to resume and break session continuity.
  */
 
 const VALID = "20260706_234011_dc2cf9";
@@ -41,13 +48,13 @@ describe("hermes session id format guard (RUAAAAA-5244)", () => {
     }
   });
 
-  it("rejects near-miss shapes", () => {
+  it("rejects shapes that are not hermes session ids", () => {
     for (const bad of [
-      "20260706_234011_dc2cf",
-      "20260706_234011_dc2cf99",
-      "20260706_234011_DC2CF9",
       "20260706_234011-dc2cf9",
       "20260706_234011",
+      "20260706_234011_",
+      "20260706_2340_dc2cf9",
+      "20260706_234011_dc2",
       "",
       "   ",
     ]) {
@@ -56,6 +63,22 @@ describe("hermes session id format guard (RUAAAAA-5244)", () => {
     expect(isHermesSessionId(42)).toBe(false);
     expect(isHermesSessionId(null)).toBe(false);
     expect(isHermesSessionId(undefined)).toBe(false);
+  });
+
+  it("accepts every shape the server-side canonical rule accepts", () => {
+    // The guard is wired in front of the vendored hermes adapter, so it must
+    // never reject an id that upstream's canonical rule
+    // (isCanonicalSessionIdForAdapter) considers valid. A stricter guard would
+    // silently break "hermes --resume" continuity for those agents.
+    for (const good of [
+      "20260706_234011_dc2cf9",
+      "20260706_234011_dc2cf99",
+      "20260706_234011_dc2cf",
+      "20260706_234011_DC2CF9",
+      "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+    ]) {
+      expect(isHermesSessionId(good)).toBe(true);
+    }
   });
 
   it("fails closed on a persisted sessionId of 'from'", () => {
@@ -114,8 +137,22 @@ describe("hermes session id format guard (RUAAAAA-5244)", () => {
     expect(sanitized.sessionDisplayId).toBeNull();
   });
 
+  it("clears the vendored adapter's truncated display id", () => {
+    // The vendored hermes adapter reports sessionDisplayId as
+    // sessionId.slice(0, 16). That truncated form is not a session id, and
+    // upstream's canonical rule rejects it too - the server then falls back to
+    // the full session id from sessionParams for display.
+    const sanitized = sanitizeHermesExecutionResult({
+      sessionId: VALID,
+      sessionParams: { sessionId: VALID },
+      sessionDisplayId: VALID.slice(0, 16),
+    });
+    expect(sanitized.sessionDisplayId).toBeNull();
+    expect(sanitized.sessionParams).toEqual({ sessionId: VALID });
+  });
+
   it("reproduces the production failure against the real adapter regex", () => {
-    // The exact legacy pattern shipped in hermes-paperclip-adapter dist.
+    // The exact legacy pattern shipped in the hermes adapter dist.
     const legacy = /session[_ ](?:id|saved)[:\s]+([a-zA-Z0-9_-]+)/i;
     const stdout = [
       "Reviewed the pricing doc and left three comments.",

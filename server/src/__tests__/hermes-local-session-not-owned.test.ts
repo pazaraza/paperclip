@@ -2,15 +2,17 @@ import { describe, expect, it } from "vitest";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { execute } from "hermes-paperclip-adapter/server";
+import { execute } from "@paperclipai/hermes-paperclip-adapter/server";
 import {
+  createGuardedHermesLocalExecute,
   HERMES_SESSION_NOT_OWNED_ERROR_CODE,
   applyHermesSessionContentionRecovery,
   isHermesSessionNotOwned,
 } from "../adapters/hermes-session-id.js";
 
 /**
- * RUAAAAA-5296 regression guard: the hermes session-contention refusal.
+ * RUAAAAA-5296 regression guard, ported onto the reconciled master
+ * (RUAAAAA-5418): the hermes session-contention refusal.
  *
  * `persistSession` pins a dispatch to a session id and `hermes --resume <id>`
  * is refused while a person holds that session interactively:
@@ -53,6 +55,11 @@ process.exit(0);
 `;
 }
 
+/**
+ * The vendored hermes adapter (packages/adapters/hermes) reads its config from
+ * `ctx.config` first and only falls back to `ctx.agent.adapterConfig`, so the
+ * fake command has to be supplied through `ctx.config`.
+ */
 function ctx(commandPath: string, runtimeSessionId?: string) {
   return {
     runId: "run-5296",
@@ -61,20 +68,21 @@ function ctx(commandPath: string, runtimeSessionId?: string) {
       name: "Godines OS Reliability & QA Lead",
       companyId: "company-1",
       workspaceDir: os.tmpdir(),
-      adapterConfig: {
-        hermesCommand: commandPath,
-        persistSession: true,
-        // Keep the child cheap and hermes-free.
-        model: "test-model",
-        extraArgs: [],
-      },
+      adapterType: "hermes_local",
     },
     runtime: {
       sessionParams: runtimeSessionId ? { sessionId: runtimeSessionId } : {},
       sessionDisplayId: runtimeSessionId ?? "",
       cwd: os.tmpdir(),
     },
-    config: {},
+    config: {
+      hermesCommand: commandPath,
+      persistSession: true,
+      cwd: os.tmpdir(),
+      // Keep the child cheap and hermes-free.
+      model: "test-model",
+      extraArgs: [],
+    },
     context: {},
     onLog: async () => {},
   };
@@ -144,6 +152,39 @@ describe("hermes SESSION_NOT_OWNED recovery (RUAAAAA-5296)", () => {
       const unchanged = applyHermesSessionContentionRecovery(result, "");
       expect(unchanged).toBe(result);
       expect(unchanged.clearSession).toBeUndefined();
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers the session when the guard wraps the vendored adapter", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "hermes-5296-guard-"));
+    try {
+      const commandPath = await writeFakeHermes(dir, refusingHermes());
+      const guarded = createGuardedHermesLocalExecute(execute);
+
+      const result = await guarded(ctx(commandPath, HELD_SESSION) as never);
+
+      // The vendored adapter never surfaces the child's stderr on the result,
+      // so the guard has to recover the refusal from the child's stderr stream.
+      expect(result.clearSession).toBe(true);
+      expect(result.errorCode).toBe(HERMES_SESSION_NOT_OWNED_ERROR_CODE);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves a successful run untouched when the guard wraps the vendored adapter", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "hermes-5296-guard-ok-"));
+    try {
+      const commandPath = await writeFakeHermes(dir, succeedingHermes("20261022_114854_26d1cd"));
+      const guarded = createGuardedHermesLocalExecute(execute);
+
+      const result = await guarded(ctx(commandPath) as never);
+
+      expect(result.clearSession).toBeUndefined();
+      expect(result.errorCode).toBeUndefined();
+      expect(result.sessionParams).toEqual({ sessionId: "20261022_114854_26d1cd" });
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
     }
