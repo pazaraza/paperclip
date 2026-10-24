@@ -8,6 +8,7 @@ import {
   parseCooldownBackoffSequence,
   parseSaturatedDuration,
   parseSaturatedMinQueuedSlices,
+  resolveGatewayOperatorScopes,
   resolveSessionKey,
 } from "./execute.js";
 
@@ -432,5 +433,35 @@ describe("deriveMaxSlices (RUAAAAA-5317)", () => {
     const zero = deriveMaxSlices({ waitTimeoutMs: 600_000, nominalSliceMs: 0, probeSliceMs: 0 });
     expect(Number.isFinite(zero.maxSlices)).toBe(true);
     expect(zero.shortestSliceMs).toBe(1);
+  });
+});
+
+describe("resolveGatewayOperatorScopes", () => {
+  it("drops scopes outside the gateway's closed operator scope set (RUAAAAA-5381)", () => {
+    const result = resolveGatewayOperatorScopes([
+      "operator.admin",
+      "operator.write",
+      "operator.read",
+      "agent.run",
+      "agent.wake",
+    ]);
+    expect(result.scopes).toEqual(["operator.admin", "operator.write", "operator.read"]);
+    expect(result.dropped).toEqual(["agent.run", "agent.wake"]);
+  });
+
+  it("falls back to the default operator scope set when nothing valid survives", () => {
+    const result = resolveGatewayOperatorScopes(["agent.run", "agent.wake"]);
+    expect(result.scopes).toEqual(["operator.admin"]);
+    expect(result.dropped).toEqual(["agent.run", "agent.wake"]);
+  });
+
+  it("keeps a valid operator scope list untouched", () => {
+    const result = resolveGatewayOperatorScopes(["operator.admin"]);
+    expect(result.scopes).toEqual(["operator.admin"]);
+    expect(result.dropped).toEqual([]);
+  });
+
+  it("defaults to operator.admin when no scopes are configured", () => {
+    expect(resolveGatewayOperatorScopes(undefined).scopes).toEqual(["operator.admin"]);
   });
 });

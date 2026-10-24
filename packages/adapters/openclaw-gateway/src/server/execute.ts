@@ -104,6 +104,34 @@ const DEFAULT_CLIENT_MODE = "backend";
 const DEFAULT_CLIENT_VERSION = "paperclip";
 const DEFAULT_ROLE = "operator";
 
+/**
+ * RUAAAAA-5381: the gateway's operator scope set is CLOSED
+ * (OpenClaw `src/gateway/operator-scopes.ts` -> KNOWN_OPERATOR_SCOPES).
+ * Forwarding a scope outside that set (for example `agent.run` / `agent.wake`,
+ * which are agent-runtime scopes and not operator scopes) makes the gateway
+ * reject EVERY request on that connection with FORBIDDEN
+ * "Gateway requester authority changed" — the connect handshake still
+ * succeeds, so the failure only surfaces on the first `agent` call and never
+ * self-heals on the next wake. OpenClaw 2026.10.6 made this fatal; the
+ * 2026.8.2 gateway accepted the same scope list.
+ *
+ * Filter the requested scopes down to the known operator set so a stale
+ * adapterConfig can never take an agent's lane down again, and report the
+ * dropped scopes so the misconfiguration stays visible in the run log.
+ */
+const KNOWN_OPERATOR_SCOPES = new Set([
+  "operator.admin",
+  "operator.read",
+  "operator.write",
+  "operator.sessions.read",
+  "operator.sessions.write",
+  "operator.approvals",
+  "operator.questions",
+  "operator.pairing",
+  "operator.talk",
+  "operator.talk.secrets",
+]);
+
 // RUAAAAA-5062: cooldown-aware retry/backoff for openclaw_gateway.
 const COOLDOWN_ERROR_PATTERNS: RegExp[] = [
   /provider\s+([\w.-]+)\s+is in cooldown/i,
@@ -539,9 +567,15 @@ function toStringArray(value: unknown): string[] {
   return [];
 }
 
+export function resolveGatewayOperatorScopes(value: unknown): { scopes: string[]; dropped: string[] } {
+  const parsed = uniqueScopes(toStringArray(value));
+  const kept = parsed.filter((scope) => KNOWN_OPERATOR_SCOPES.has(scope));
+  const dropped = parsed.filter((scope) => !KNOWN_OPERATOR_SCOPES.has(scope));
+  return { scopes: kept.length > 0 ? kept : [...DEFAULT_SCOPES], dropped };
+}
+
 function normalizeScopes(value: unknown): string[] {
-  const parsed = toStringArray(value);
-  return parsed.length > 0 ? parsed : [...DEFAULT_SCOPES];
+  return resolveGatewayOperatorScopes(value).scopes;
 }
 
 function uniqueScopes(scopes: string[]): string[] {
@@ -1512,9 +1546,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const clientMode = nonEmpty(ctx.config.clientMode) ?? DEFAULT_CLIENT_MODE;
   const clientVersion = nonEmpty(ctx.config.clientVersion) ?? DEFAULT_CLIENT_VERSION;
   const role = nonEmpty(ctx.config.role) ?? DEFAULT_ROLE;
-  const scopes = normalizeScopes(ctx.config.scopes);
+  const scopeResolution = resolveGatewayOperatorScopes(ctx.config.scopes);
+  const scopes = scopeResolution.scopes;
   const deviceFamily = nonEmpty(ctx.config.deviceFamily);
   const disableDeviceAuth = parseBoolean(ctx.config.disableDeviceAuth, false);
+  if (scopeResolution.dropped.length > 0) {
+    await ctx.onLog(
+      "stdout",
+      `[openclaw-gateway] dropped non-operator gateway scopes ${scopeResolution.dropped.join(",")} (RUAAAAA-5381: the gateway rejects them with "Gateway requester authority changed")
+`,
+    );
+  }
 
   const wakePayload = buildWakePayload(ctx);
   const paperclipEnv = buildPaperclipEnvForWake(ctx, wakePayload);
