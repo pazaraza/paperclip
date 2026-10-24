@@ -18,6 +18,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { logger } from "../middleware/logger.js";
+import { HERMES_DEFAULT_PROMPT_TEMPLATE } from "./hermes-default-prompt-template.js";
 
 /** Upper bound on stderr kept for post-run refusal detection (RUAAAAA-5296). */
 const HERMES_STDERR_CAPTURE_LIMIT = 16 * 1024;
@@ -596,12 +597,21 @@ const hermesLocalAdapter: ServerAdapterModule = {
       },
     };
 
-    // Only inject the auth guard into promptTemplate when a custom template already exists.
-    // When no custom template is set, Hermes uses its built-in default heartbeat/task prompt —
-    // overwriting it with only the auth guard text would strip the assigned issue/workflow instructions.
-    if (promptTemplate) {
-      patchedConfig.promptTemplate = `${authGuardPrompt}\n\n${promptTemplate}`;
-    }
+    // RUAAAAA-5408: the auth guard has to be prepended on EVERY wake, not
+    // only when the seat already carries a custom promptTemplate.
+    //
+    // The previous comment here claimed the adapter's built-in default
+    // carries the auth instruction. It does not: the installed
+    // hermes-paperclip-adapter's DEFAULT_PROMPT_TEMPLATE has zero occurrences
+    // of Authorization / Bearer / X-Paperclip-Run-Id, and its heartbeat curl is
+    // bare. So an empty-template seat woke with a prompt that told it to curl
+    // the Paperclip API and never named a token, and the first call 401'd.
+    //
+    // The guard is prepended to the adapter's real default instead of
+    // replacing it, so the assigned issue / workflow / comment sections
+    // survive the injection.
+    const baseTemplate = promptTemplate || HERMES_DEFAULT_PROMPT_TEMPLATE;
+    patchedConfig.promptTemplate = `${authGuardPrompt}\n\n${baseTemplate}`;
 
     if (injectedSource && injectedSource !== "explicit") {
       logger.info(

@@ -433,7 +433,7 @@ describe("server adapter registry", () => {
     expect(patchedCtx.agent.adapterConfig.promptTemplate).toContain("Existing prompt");
   });
 
-  it("preserves an explicit Hermes Paperclip API key and does not set promptTemplate when none was configured", async () => {
+  it("preserves an explicit Hermes Paperclip API key and still guards the wake when no promptTemplate was configured", async () => {
     const adapter = requireServerAdapter("hermes_local");
 
     await adapter.execute({
@@ -463,13 +463,18 @@ describe("server adapter registry", () => {
     const [patchedCtx] = hermesExecuteMock.mock.calls[0];
     expect(patchedCtx.agent.adapterConfig.env.PAPERCLIP_API_KEY).toBe("explicit-agent-key");
     expect(patchedCtx.agent.adapterConfig.env.PAPERCLIP_RUN_ID).toBe("run-123");
-    // No custom promptTemplate was set — Hermes must use its built-in default.
-    // Setting promptTemplate here would replace the full default with just the auth guard text,
-    // stripping assigned issue / workflow instructions.
-    expect(patchedCtx.agent.adapterConfig.promptTemplate).toBeUndefined();
+    // RUAAAAA-5408: no custom promptTemplate was set, so the auth guard is
+    // prepended to the adapter's built-in default instead of being skipped.
+    // The default stays the base of the prompt, so the assigned issue /
+    // workflow instructions are not stripped.
+    const guardedTemplate = String(patchedCtx.agent.adapterConfig.promptTemplate);
+    expect(guardedTemplate).toMatch(/Authorization: Bearer/);
+    expect(guardedTemplate).toMatch(/X-Paperclip-Run-Id: /);
+    expect(guardedTemplate).toContain("{{#taskId}}");
+    expect(guardedTemplate).toContain("{{#noTask}}");
   });
 
-  it("does not set promptTemplate when no custom template is configured, preserving Hermes default", async () => {
+  it("prepends the auth guard to the Hermes default when no custom template is configured", async () => {
     const adapter = requireServerAdapter("hermes_local");
 
     await adapter.execute({
@@ -492,8 +497,14 @@ describe("server adapter registry", () => {
     });
 
     const [patchedCtx] = hermesExecuteMock.mock.calls[0];
-    // promptTemplate must remain unset so Hermes uses its built-in heartbeat/task prompt.
-    expect(patchedCtx.agent.adapterConfig.promptTemplate).toBeUndefined();
+    // RUAAAAA-5408: the guard is prepended to the adapter's built-in
+    // heartbeat/task prompt instead of being skipped for empty-template seats.
+    const guardedTemplate = String(patchedCtx.agent.adapterConfig.promptTemplate);
+    expect(guardedTemplate).toMatch(/Authorization: Bearer/);
+    expect(guardedTemplate).toMatch(/X-Paperclip-Run-Id: /);
+    expect(guardedTemplate).toContain("{{#taskId}}");
+    expect(guardedTemplate).toContain("{{#noTask}}");
+    expect(guardedTemplate).toContain("{{#commentId}}");
     // Auth token is still injected.
     expect(patchedCtx.agent.adapterConfig.env.PAPERCLIP_API_KEY).toBe("agent-run-jwt");
   });
