@@ -53,6 +53,13 @@ import {
   resolveProvider,
 } from "./detect-model.js";
 import { reconcileHermesPaperclipSkills } from "./skills.js";
+import {
+  HERMES_COMPACTION_STALL_ERROR_CODE,
+  countHermesCompactionSpinnerLines,
+  describeHermesCompactionStall,
+  isHermesCompactionStall,
+  isHermesNonSuccessExit,
+} from "./compaction-stall.js";
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -615,6 +622,41 @@ export async function execute(
     executionResult.errorMessage = parsed.errorMessage;
   } else if (!result.timedOut && typeof result.exitCode === "number" && result.exitCode !== 0) {
     executionResult.errorMessage = `Hermes exited with code ${result.exitCode}`;
+  }
+
+  // RUAAAAA-5339: a run whose whole output was the compaction progress
+  // line is not a generic failure. Hermes' own context compaction stalls,
+  // the run executes no turns, and the session is persisted anyway — so every
+  // later dispatch resumes the same wedged session and fails identically.
+  // Name the cause (the server otherwise falls back to a bare "Timed out")
+  // and drop the wedged session so the next dispatch starts clean.
+  //
+  // Arm on ANY non-success exit, not only on result.timedOut. Paperclip sets
+  // timedOut only when its own wall-clock timer fires; a child that dies on
+  // SIGINT by itself is reported as exit code 130 with timedOut false, and
+  // the server files that run as failed/adapter_failed instead of
+  // timed_out. That is the same livelock, and leaving it unarmed would
+  // strand those sessions.
+  if (
+    isHermesCompactionStall(parsed.response) &&
+    isHermesNonSuccessExit({
+      timedOut: result.timedOut,
+      exitCode: result.exitCode,
+      signal: result.signal,
+    })
+  ) {
+    executionResult.errorMessage = describeHermesCompactionStall({
+      spinnerLines: countHermesCompactionSpinnerLines(parsed.response),
+      signal: result.signal,
+      timeoutSec,
+      exitCode: result.exitCode,
+      // Preserve a genuine stderr error alongside the stall diagnosis; the
+      // generic "Hermes exited with code N" message is replaced because it
+      // names no cause.
+      detail: parsed.errorMessage,
+    });
+    executionResult.errorCode = HERMES_COMPACTION_STALL_ERROR_CODE;
+    executionResult.clearSession = true;
   }
 
   if (parsed.usage) {

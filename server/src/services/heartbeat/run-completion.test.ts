@@ -157,6 +157,18 @@ describe.skipIf(!support.supported)("heartbeat run completion boundary", () => {
     { timedOut: true, expected: "timed_out", errorCode: "timeout" },
     { signal: "SIGTERM", expected: "failed", errorCode: "adapter_failed" },
     { errorMessage: "provider quota", errorCode: "provider_quota", expected: "failed" },
+    // RUAAAAA-5339: the hermes adapter names a compaction stall, and the
+    // server keeps that name instead of collapsing it to "timeout" or
+    // "adapter_failed". The failed case is the path the 5 exit-130 runs
+    // took on 2026-10-24: the run was already terminal as failed, so the
+    // adapter error code is the only thing that distinguishes them.
+    { timedOut: true, errorCode: "compaction_stall", expected: "timed_out" },
+    {
+      errorMessage:
+        "Hermes stalled in context compaction for the whole run (run budget 600s, exit 130) - 4 progress lines, no assistant output.",
+      errorCode: "compaction_stall",
+      expected: "failed",
+    },
   ])("keeps adapter outcome classification ($expected, $errorCode)", async ({ expected, ...result }) => {
     const f = await fixture();
     Object.assign(f.input.adapterResult, result);
@@ -298,6 +310,33 @@ describe.skipIf(!support.supported)("heartbeat run completion boundary", () => {
     const f = await fixture();
     f.input.adapterResult.clearSession = true;
     await f.completion.completeRun(f.input);
+    expect(f.deps.clearTaskSessions).toHaveBeenCalledWith(f.run.companyId, f.agent.id, { taskKey: "completion-task", adapterType: "process", expectedRunId: f.run.id });
+    expect(f.deps.upsertTaskSession).not.toHaveBeenCalled();
+  });
+
+  it("records the compaction-stall cause and releases the wedged session on the failed path", async () => {
+    // RUAAAAA-5339: this is the shape of the 5 production runs the reviewer
+    // found on 2026-10-24. The adapter reported a compaction stall, but the
+    // run was filed as failed/adapter_failed because the run was already
+    // terminal when the adapter result arrived. The run record must still
+    // name the stall, and the wedged session must be released so the next
+    // dispatch starts clean.
+    const f = await fixture();
+    Object.assign(f.input.adapterResult, {
+      exitCode: 130,
+      timedOut: false,
+      errorCode: "compaction_stall",
+      errorMessage:
+        "Hermes stalled in context compaction for the whole run (run budget 600s, exit 130) - 4 progress lines, no assistant output.",
+      clearSession: true,
+    });
+    await f.completion.completeRun(f.input);
+
+    const run = await read(f.run.id);
+    expect(run).toMatchObject({ status: "failed", errorCode: "compaction_stall" });
+    // Not the generic message: the record names the cause.
+    expect(run.error).toContain("compaction");
+    expect(run.error).not.toBe("Adapter failed");
     expect(f.deps.clearTaskSessions).toHaveBeenCalledWith(f.run.companyId, f.agent.id, { taskKey: "completion-task", adapterType: "process", expectedRunId: f.run.id });
     expect(f.deps.upsertTaskSession).not.toHaveBeenCalled();
   });
