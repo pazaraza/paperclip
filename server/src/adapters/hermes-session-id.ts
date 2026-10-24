@@ -1,5 +1,6 @@
 /**
- * hermes_local session-id format guard (RUAAAAA-5244).
+ * hermes_local adapter guards: session-id format (RUAAAAA-5244), held-session
+ * recovery (RUAAAAA-5296), and compaction-stall recovery (RUAAAAA-5339).
  *
  * Hermes Agent mints every session id in the shape
  * `<YYYYMMDD>_<HHMMSS>_<6 lowercase hex>` (e.g. `20260706_234011_dc2cf9`).
@@ -20,6 +21,7 @@
  * handed back to the adapter as a resume target.
  */
 import type { AdapterSessionCodec } from "@paperclipai/adapter-utils";
+import { logger } from "../middleware/logger.js";
 
 /** The only shape a hermes session id can have. */
 export const HERMES_SESSION_ID_PATTERN = /^\d{8}_\d{6}_[0-9a-f]{6}$/;
@@ -135,6 +137,137 @@ type SessionContentionCarrier = SessionIdCarrier & {
   clearSession?: boolean;
   errorCode?: string | null;
 };
+
+/**
+ * RUAAAAA-5339: the progress line Hermes prints while its own context
+ * compaction runs. Observed form is `⟳ compacting context…` (U+27F3 arrow,
+ * U+2026 ellipsis), but the decoration and punctuation vary between Hermes
+ * versions and locales, so match on the stable words and allow any
+ * non-alphanumeric decoration around them. Requiring the line to carry no
+ * alphanumeric characters after "context" keeps real prose from matching.
+ */
+const HERMES_COMPACTION_SPINNER_LINE = /^[^A-Za-z0-9]*compacting\s+context[^A-Za-z0-9]*$/i;
+
+/** Distinct run error code so a compaction stall is not scored as `timeout`. */
+export const HERMES_COMPACTION_STALL_ERROR_CODE = "compaction_stall";
+
+/**
+ * True when Hermes burned its run budget in `⟳ compacting context…` and
+ * produced no assistant output.
+ *
+ * Hermes' native compaction stalls on some sessions and never returns: it
+ * reprints the spinner until the adapter's `timeoutSec` kills the child
+ * (SIGINT, exit 130). Measured over 48h on 2026-10-23, 61 of 79
+ * `hermes_local` timeouts showed this signature across 15 agents, and 0 of
+ * 314 `openclaw_gateway` timeouts did — so it is specific to `hermes_local`.
+ *
+ * The stall is invisible in the run record because the adapter returns
+ * `timedOut: true` with no `errorMessage`, and heartbeat.ts falls back to the
+ * bare string "Timed out" (heartbeat.ts:7583). The `process` adapter does set
+ * `Timed out after ${timeoutSec}s` (adapters/process/execute.ts:60); hermes
+ * does not, so a hermes timeout carries no budget, no signal, and no cause.
+ *
+ * Detection reads the adapter's own `resultJson.result`, which for these runs
+ * contains nothing but the spinner text: `parseHermesOutput` scrapes the last
+ * prose it saw, and the spinner is all the child ever wrote.
+ */
+export function isHermesCompactionStall(result: string | null | undefined): boolean {
+  if (typeof result !== "string") return false;
+  const lines = result.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  if (lines.length === 0) return false;
+  return lines.every((line) => HERMES_COMPACTION_SPINNER_LINE.test(line));
+}
+
+type CompactionStallCarrier = SessionContentionCarrier & {
+  timedOut?: boolean;
+  exitCode?: number | null;
+  errorMessage?: string | null;
+  signal?: string | null;
+  resultJson?: { result?: unknown } | null;
+};
+
+/**
+ * True when the run did not produce a usable result.
+ *
+ * A compaction stall is only a stall if the run also failed. Paperclip sets
+ * `timedOut` only when its own wall-clock timer fires, so a child that dies
+ * on its own is not covered by that flag. Two shapes were observed on
+ * production: the Hermes CLI catches SIGINT and exits 130 (exit code 130, no
+ * signal), and a child killed outright by a signal reports no exit code at
+ * all (exit code null, signal set). The server files both as
+ * failed/adapter_failed rather than timed_out, and the server's own
+ * "succeeded" test requires both a zero exit code and no signal, so this
+ * mirrors that rule exactly.
+ */
+export function isHermesNonSuccessExit(input: {
+  timedOut?: boolean;
+  exitCode?: number | null;
+  signal?: string | null;
+}): boolean {
+  if (input.timedOut) return true;
+  if (typeof input.exitCode === "number") return input.exitCode !== 0;
+  // Killed by a signal: it never produced an exit code, so it never
+  // succeeded either.
+  return typeof input.signal === "string" && input.signal.length > 0;
+}
+
+/**
+ * RUAAAAA-5339: break the compaction-stall livelock.
+ *
+ * When a run times out mid-compaction it has executed no turns and its
+ * `resultJson.result` is only spinner text. The session is persisted anyway
+ * (`resolveNextSessionState()` keeps `previousParams` because the adapter
+ * reports no new session), so the next dispatch resumes the same wedged
+ * session and fails identically — an agent can sit at zero successful runs
+ * for 50h while still dispatching every few hours.
+ *
+ * RUAAAAA-5242's rotation policy cannot catch this: it is threshold-based on
+ * run count, token volume and session age, but a session can enter the stall
+ * after 2 runs, long before `maxSessionRuns: 12`. Confirmed on 2026-10-23:
+ * every stalled run had `paperclipSessionRotationReason` unset.
+ *
+ * So detect the stall from the run's own output and drop the session, the
+ * same lever RUAAAAA-5296 uses for a held-session collision. The next
+ * dispatch starts a fresh session and the agent recovers on its own.
+ *
+ * A stall is also given a real `errorMessage` (budget, signal, spinner count)
+ * so the run stops scoring as a bare "Timed out" and names its own cause.
+ */
+export function applyHermesCompactionStallRecovery<TResult extends CompactionStallCarrier>(
+  result: TResult,
+): TResult {
+  if (
+    !isHermesNonSuccessExit({
+      timedOut: result.timedOut,
+      exitCode: result.exitCode,
+      signal: result.signal,
+    })
+  ) {
+    return result;
+  }
+  const scraped = result.resultJson?.result;
+  if (!isHermesCompactionStall(typeof scraped === "string" ? scraped : null)) return result;
+
+  const spinnerLines = String(scraped).split(/\r?\n/).filter((line) => line.trim().length > 0).length;
+  const signal = result.signal ? `, signal ${result.signal}` : "";
+  const exit = typeof result.exitCode === "number" ? `, exit ${result.exitCode}` : "";
+  const errorMessage =
+    `Hermes stalled in context compaction for the whole run budget (${spinnerLines} ` +
+    `progress lines, no assistant output${signal}${exit}); session dropped so the next ` +
+    `dispatch starts fresh. See RUAAAAA-5339.`;
+
+  logger.warn(
+    { spinnerLines, signal: result.signal ?? null },
+    "[hermes_local] compaction stall consumed the run budget with no output; clearing the wedged session (RUAAAAA-5339)",
+  );
+
+  return {
+    ...result,
+    errorMessage,
+    clearSession: true,
+    errorCode: HERMES_COMPACTION_STALL_ERROR_CODE,
+  };
+}
 
 /**
  * RUAAAAA-5296: recover from a held-session collision.
