@@ -63,7 +63,7 @@ describe("hermes_local e2e env shape (RUAAAAA-2375)", () => {
       onLog: async () => {},
       onMeta: async () => {},
       onSpawn: async () => {},
-      authToken: "broken-local-agent-jwt-from-heartbeat",
+      authToken: "per-run-agent-jwt-from-heartbeat",
     });
 
     expect(hermesExecuteMock).toHaveBeenCalledTimes(1);
@@ -75,7 +75,7 @@ describe("hermes_local e2e env shape (RUAAAAA-2375)", () => {
     // issues against Paperclip.
     const env = patchedCtx.agent.adapterConfig.env;
     expect(env.PAPERCLIP_API_KEY).toBe("pcp_e2e_test_token_DO_NOT_USE_42");
-    expect(env.PAPERCLIP_API_KEY).not.toBe("broken-local-agent-jwt-from-heartbeat");
+    expect(env.PAPERCLIP_API_KEY).not.toBe("per-run-agent-jwt-from-heartbeat");
     expect(env.PAPERCLIP_RUN_ID).toBe("run-e2e-2375");
     expect(env.OPENAI_API_KEY).toBe("sk-llm-not-paperclip");
     // RUAAAAA-5408: the operator did not set a custom promptTemplate, so the
