@@ -10,6 +10,9 @@ import {
   parseObject,
   readPaperclipIssueWorkModeFromContext,
   renderPaperclipWakePrompt,
+  renderTemplate,
+  resolveAdapterPaperclipApiRootUrl,
+  resolvePaperclipApiOriginUrl,
   stringifyPaperclipWakePayload,
 } from "@paperclipai/adapter-utils/server-utils";
 import crypto, { randomUUID } from "node:crypto";
@@ -17,7 +20,7 @@ import { WebSocket } from "ws";
 
 type SessionKeyStrategy = "fixed" | "issue" | "run";
 
-type WakePayload = {
+export type WakePayload = {
   runId: string;
   agentId: string;
   companyId: string;
@@ -751,16 +754,55 @@ function buildWakePayload(ctx: AdapterExecutionContext): WakePayload {
   };
 }
 
-function resolvePaperclipApiUrlOverride(value: unknown): string | null {
-  const raw = nonEmpty(value);
-  if (!raw) return null;
-  try {
-    const parsed = new URL(raw);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
-    return parsed.toString();
-  } catch {
-    return null;
-  }
+/**
+ * RUAAAAA-5402 — the gateway wake text hands the seat two bases and has to say
+ * which is which:
+ *
+ * - origin (`http://host:port`) — what `PAPERCLIP_API_URL` means everywhere
+ *   else; every documented call is `${origin}/api/...`.
+ * - root (`http://host:port/api`) — what a prompt template needs, so
+ *   `{{paperclipApiUrl}}/agents/me/inbox-lite` resolves to a real URL.
+ *
+ * `adapterConfig.paperclipApiUrl` is written both ways in the field (the fleet
+ * repair wrote the `/api` root, the adapter docs show the bare origin), so both
+ * shapes are normalised once here instead of at each use site. Handing a seat an
+ * unlabelled base is what produced the silent false negative: a base without
+ * `/api` answers the read path with HTTP 200 and the SPA index, which reads as
+ * "empty inbox" rather than as an error.
+ */
+export function resolveGatewayPaperclipApiBases(ctx: AdapterExecutionContext): {
+  origin: string;
+  root: string;
+} {
+  const serverOrigin = buildPaperclipEnv(ctx.agent).PAPERCLIP_API_URL;
+  const configured = ctx.config.paperclipApiUrl;
+  return {
+    origin:
+      resolvePaperclipApiOriginUrl(configured) ??
+      resolvePaperclipApiOriginUrl(serverOrigin) ??
+      serverOrigin,
+    root: resolveAdapterPaperclipApiRootUrl(configured),
+  };
+}
+
+/**
+ * Template data for `adapterConfig.promptTemplate`, mirroring the shape the
+ * local adapters render against so a template can move between adapters.
+ */
+function buildGatewayTemplateData(
+  ctx: AdapterExecutionContext,
+  paperclipApiUrl: string,
+): Record<string, unknown> {
+  return {
+    agentId: ctx.agent.id,
+    companyId: ctx.agent.companyId,
+    runId: ctx.runId,
+    company: { id: ctx.agent.companyId },
+    agent: ctx.agent,
+    run: { id: ctx.runId, source: "on_demand" },
+    context: ctx.context,
+    paperclipApiUrl,
+  };
 }
 
 export const DEFAULT_CLAIMED_API_KEY_PATH = '$OPENCLAW_AGENT_DIR/../paperclip-claimed-api-key.json';
@@ -769,16 +811,20 @@ export function resolveClaimedApiKeyPath(value: unknown): string {
   return nonEmpty(value) ?? DEFAULT_CLAIMED_API_KEY_PATH;
 }
 
-function buildPaperclipEnvForWake(ctx: AdapterExecutionContext, wakePayload: WakePayload): Record<string, string> {
-  const paperclipApiUrlOverride = resolvePaperclipApiUrlOverride(ctx.config.paperclipApiUrl);
+function buildPaperclipEnvForWake(
+  ctx: AdapterExecutionContext,
+  wakePayload: WakePayload,
+  apiBases: { origin: string; root: string },
+): Record<string, string> {
   const paperclipEnv: Record<string, string> = {
     ...buildPaperclipEnv(ctx.agent),
     PAPERCLIP_RUN_ID: ctx.runId,
   };
 
-  if (paperclipApiUrlOverride) {
-    paperclipEnv.PAPERCLIP_API_URL = paperclipApiUrlOverride;
-  }
+  // `PAPERCLIP_API_URL` keeps its documented meaning: the origin, with every
+  // call under `/api`. A configured value that carries the `/api` root is
+  // trimmed back to the origin so the seat does not build `/api/api/...`.
+  paperclipEnv.PAPERCLIP_API_URL = apiBases.origin;
   if (wakePayload.taskId) paperclipEnv.PAPERCLIP_TASK_ID = wakePayload.taskId;
   const issueWorkMode = readPaperclipIssueWorkModeFromContext(ctx.context);
   if (issueWorkMode) paperclipEnv.PAPERCLIP_ISSUE_WORK_MODE = issueWorkMode;
@@ -793,11 +839,54 @@ function buildPaperclipEnvForWake(ctx: AdapterExecutionContext, wakePayload: Wak
   return paperclipEnv;
 }
 
-function buildWakeText(
+/**
+ * RUAAAAA-5402 — the whole wake text a gateway seat receives.
+ *
+ * `adapterConfig.promptTemplate` used to be inert for gateway seats: the
+ * adapter never read it, so nothing a seat carried ever reached the agent and
+ * the generated wake text was the seat's only prompt surface. It is rendered
+ * here with the same template data the local adapters use, and the text carries
+ * the canonical read contract with an API base that is labelled rather than
+ * guessed.
+ */
+export function buildGatewayWakeText(ctx: AdapterExecutionContext): string {
+  const wakePayload = buildWakePayload(ctx);
+  const apiBases = resolveGatewayPaperclipApiBases(ctx);
+  const paperclipEnv = buildPaperclipEnvForWake(ctx, wakePayload, apiBases);
+  return buildGatewayWakeTextFromParts(ctx, wakePayload, apiBases, paperclipEnv);
+}
+
+function buildGatewayWakeTextFromParts(
+  ctx: AdapterExecutionContext,
+  wakePayload: WakePayload,
+  apiBases: { origin: string; root: string },
+  paperclipEnv: Record<string, string>,
+): string {
+  const structuredWakePrompt = renderPaperclipWakePrompt(ctx.context.paperclipWake);
+  const structuredWakeJson = stringifyPaperclipWakePayload(ctx.context.paperclipWake);
+  const promptTemplate = nonEmpty(ctx.config.promptTemplate);
+  const renderedPromptTemplate = promptTemplate
+    ? renderTemplate(promptTemplate, buildGatewayTemplateData(ctx, apiBases.root)).trim()
+    : "";
+  return buildWakeText(
+    wakePayload,
+    paperclipEnv,
+    structuredWakeJson
+      ? joinWakePayloadSections(structuredWakePrompt, structuredWakeJson)
+      : structuredWakePrompt,
+    resolveClaimedApiKeyPath(ctx.config.claimedApiKeyPath),
+    apiBases,
+    renderedPromptTemplate,
+  );
+}
+
+export function buildWakeText(
   payload: WakePayload,
   paperclipEnv: Record<string, string>,
   structuredWakePrompt: string,
   claimedApiKeyPath: string,
+  apiBases: { origin: string; root: string },
+  renderedPromptTemplate: string,
 ): string {
   const orderedKeys = [
     "PAPERCLIP_RUN_ID",
@@ -821,6 +910,7 @@ function buildWakeText(
 
   const issueIdHint = payload.taskId ?? payload.issueId ?? "";
   const apiBaseHint = paperclipEnv.PAPERCLIP_API_URL ?? "<set PAPERCLIP_API_URL>";
+  const apiRootHint = apiBases.root;
 
   const lines = [
     "Paperclip wake event for a cloud adapter.",
@@ -834,6 +924,7 @@ function buildWakeText(
     `Load PAPERCLIP_API_KEY from ${claimedApiKeyPath} (the token you saved after claim-api-key).`,
     "",
     `api_base=${apiBaseHint}`,
+    `api_root=${apiRootHint}`,
     `task_id=${payload.taskId ?? ""}`,
     `issue_id=${payload.issueId ?? ""}`,
     `wake_reason=${payload.wakeReason ?? ""}`,
@@ -847,6 +938,10 @@ function buildWakeText(
     "- Use X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID on every mutating API call.",
     "- Use only /api endpoints listed below.",
     "- Do NOT call guessed endpoints like /api/cloud-adapter/*, /api/cloud-adapters/*, /api/adapters/cloud/*, or /api/heartbeat.",
+    "",
+    "Read contract (canonical - read your assignments with these):",
+    `- Preferred: GET ${apiRootHint}/agents/me/inbox-lite`,
+    `- Fallback:  GET ${apiRootHint}/companies/$PAPERCLIP_COMPANY_ID/issues?assigneeAgentId=$PAPERCLIP_AGENT_ID&status=todo,in_progress,in_review,blocked`,
     "",
     "Workflow:",
     "1) GET /api/agents/me",
@@ -870,6 +965,13 @@ function buildWakeText(
     "- POST /api/issues/{issueId}/comments",
     "- PATCH /api/issues/{issueId}",
     "- POST /api/companies/{companyId}/issues (when asked to create a new issue)",
+    ...(renderedPromptTemplate
+      ? [
+          "",
+          "Agent prompt template (adapterConfig.promptTemplate, rendered):",
+          renderedPromptTemplate,
+        ]
+      : []),
     ...(structuredWakePrompt
       ? [
           "",
@@ -1559,17 +1661,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   const wakePayload = buildWakePayload(ctx);
-  const paperclipEnv = buildPaperclipEnvForWake(ctx, wakePayload);
-  const structuredWakePrompt = renderPaperclipWakePrompt(ctx.context.paperclipWake);
-  const structuredWakeJson = stringifyPaperclipWakePayload(ctx.context.paperclipWake);
-  const wakeText = buildWakeText(
-    wakePayload,
-    paperclipEnv,
-    structuredWakeJson
-      ? joinWakePayloadSections(structuredWakePrompt, structuredWakeJson)
-      : structuredWakePrompt,
-    resolveClaimedApiKeyPath(ctx.config.claimedApiKeyPath),
-  );
+  const apiBases = resolveGatewayPaperclipApiBases(ctx);
+  const paperclipEnv = buildPaperclipEnvForWake(ctx, wakePayload, apiBases);
+  const wakeText = buildGatewayWakeTextFromParts(ctx, wakePayload, apiBases, paperclipEnv);
 
   const sessionKeyStrategy = normalizeSessionKeyStrategy(ctx.config.sessionKeyStrategy);
   // RUAAAAA-5256: admission-control feedback knobs. Defaults keep a saturated run under ~15s

@@ -40,7 +40,8 @@ Request behavior fields:
 - saturatedMinQueuedSlices (number, optional): consecutive queued/not-started agent.wait slices required before declaring saturation (default 3)
 - saturatedRetryDelayMs (number, optional): retryNotBefore floor reported on a saturated run; routes the run into Paperclip's bounded transient retry (default 120000)
 - autoPairOnFirstConnect (boolean, optional): on first "pairing required", attempt device.pair.list/device.pair.approve via shared auth, then retry once (default true)
-- paperclipApiUrl (string, optional): absolute Paperclip base URL advertised in wake text
+- paperclipApiUrl (string, optional): absolute Paperclip base URL advertised in wake text. Accepts either the origin (http://host:3100) or the /api root (http://host:3100/api); the wake text advertises the origin as PAPERCLIP_API_URL/api_base and the root as api_root, and {{paperclipApiUrl}} in a prompt template resolves to the root
+- promptTemplate (string, optional): prompt template rendered into the wake text. {{paperclipApiUrl}} resolves to the Paperclip API root (origin + /api); {{agentId}}, {{companyId}}, {{runId}}, {{agent}}, {{company}}, {{run}} and {{context}} are also available
 - claimedApiKeyPath (string, optional): path to the claimed API key JSON file read by the agent at wake time (default ~/.openclaw/workspace/paperclip-claimed-api-key.json)
 
 Session routing fields:

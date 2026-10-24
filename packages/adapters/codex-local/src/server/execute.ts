@@ -31,6 +31,7 @@ import {
   refreshPaperclipWorkspaceEnvForExecution,
   readPaperclipRuntimeSkillEntries,
   readPaperclipIssueWorkModeFromContext,
+  resolveAdapterPaperclipApiRootUrl,
   resolvePaperclipDesiredSkillNames,
   renderTemplate,
   renderPaperclipWakePrompt,
@@ -285,6 +286,31 @@ export async function ensureCodexSkillsInjected(
     skillsEntries.map((entry) => entry.runtimeName),
     onLog,
   );
+}
+
+/**
+ * RUAAAAA-5402: a prompt template that wants the Paperclip API needs the
+ * `/api` root, not the bare origin `PAPERCLIP_API_URL` advertises. Without this
+ * key `renderTemplate` resolves `{{paperclipApiUrl}}` to "" — a missing path
+ * renders empty — so a template that said `{{paperclipApiUrl}}/agents/me` shipped
+ * a broken URL instead of a missing one.
+ */
+export function buildCodexTemplateData<TAgent extends { id: string; companyId: string }>(input: {
+  agent: TAgent;
+  runId: string;
+  context: Record<string, unknown>;
+  configuredPaperclipApiUrl: unknown;
+}): Record<string, unknown> {
+  return {
+    agentId: input.agent.id,
+    companyId: input.agent.companyId,
+    runId: input.runId,
+    company: { id: input.agent.companyId },
+    agent: input.agent,
+    run: { id: input.runId, source: "on_demand" },
+    context: input.context,
+    paperclipApiUrl: resolveAdapterPaperclipApiRootUrl(input.configuredPaperclipApiUrl),
+  };
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
@@ -599,15 +625,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const repoAgentsNote =
     "Codex exec automatically applies repo-scoped AGENTS.md instructions from the current workspace; Paperclip does not currently suppress that discovery.";
   const bootstrapPromptTemplate = asString(config.bootstrapPromptTemplate, "");
-  const templateData = {
-    agentId: agent.id,
-    companyId: agent.companyId,
-    runId,
-    company: { id: agent.companyId },
+  const templateData = buildCodexTemplateData({
     agent,
-    run: { id: runId, source: "on_demand" },
+    runId,
     context,
-  };
+    configuredPaperclipApiUrl: config.paperclipApiUrl,
+  });
   const renderedBootstrapPrompt =
     !sessionId && bootstrapPromptTemplate.trim().length > 0
       ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
