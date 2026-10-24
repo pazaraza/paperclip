@@ -18,6 +18,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { logger } from "../middleware/logger.js";
+import { HERMES_DEFAULT_PROMPT_TEMPLATE } from "./hermes-default-prompt-template.js";
 
 /** Upper bound on stderr kept for post-run refusal detection (RUAAAAA-5296). */
 const HERMES_STDERR_CAPTURE_LIMIT = 16 * 1024;
@@ -40,7 +41,8 @@ const HERMES_STDERR_CAPTURE_LIMIT = 16 * 1024;
  *   rejected so we never silently inject a malformed/JWT-shaped value.
  * - Returns `null` (with a warn log) when the path is unset, unreadable,
  *   malformed, or carries an invalid token. The caller is then responsible
- *   for falling back to the local JWT path or skipping injection.
+ *   for falling back to the run-scoped agent JWT (`ctx.authToken`) or for
+ *   skipping injection entirely.
  *
  * The lookup is run once per `execute()` call. Cache-busting is the caller's
  * responsibility (the run id is the natural cache key — every wake is one
@@ -536,10 +538,13 @@ const hermesLocalAdapter: ServerAdapterModule = {
 
     // RUAAAAA-2375: prefer the agent's stored Paperclip API key (read from the
     // per-agent `paperclip-claimed-api-key.json` written when the agent claimed
-    // its key) over the local-agent JWT issued by `createLocalAgentJwt`. The
-    // JWT path silently fails in production — the signature verifies but the
-    // agent lookup in actorMiddleware returns null, so every route returns
-    // 401. The stored token works for both reads and writes today.
+    // its key) over the local-agent JWT issued by `createLocalAgentJwt`. When
+    // RUAAAAA-2375 was filed the JWT path failed in production — the signature
+    // verified but the agent lookup in actorMiddleware returned null, so every
+    // route returned 401. That lookup is repaired: a local-agent JWT now
+    // resolves to an agent actor instead of a 401. The stored token stays
+    // preferred because it is a stable per-agent credential rather than one
+    // scoped to a single run.
     //
     // Cache the lookup at run start so we only hit the filesystem once per
     // wake even if Hermes shells out multiple Paperclip API calls.
@@ -547,7 +552,25 @@ const hermesLocalAdapter: ServerAdapterModule = {
     // Fallback order:
     //   1. explicit existingConfig.env.PAPERCLIP_API_KEY (operator override — never overwritten)
     //   2. stored api_key from adapterConfig.claimedApiKeyPath  ← preferred
-    //   3. normalizedCtx.authToken (the local JWT)             ← legacy / unmigrated agents
+    //   3. normalizedCtx.authToken                             ← legacy / unmigrated agents
+    //
+    // Branch 3 injects the local-agent JWT that `createLocalAgentJwt` mints
+    // for this run — `server/src/services/heartbeat.ts` is the only caller
+    // that passes `authToken` into `adapter.execute`, and it always passes
+    // `createLocalAgentJwt(agentId, companyId, adapterType, runId)`. It is
+    // the SAME token RUAAAAA-2375 named; what changed since is that the JWT
+    // path authenticates, because the agent lookup in actorMiddleware is
+    // repaired and the token now resolves to an agent actor.
+    //
+    // Verified live on 2026-10-24 against the running control plane: a JWT
+    // minted for a hermes_local seat returns HTTP 200 on
+    // `GET /api/companies/{companyId}/issues?assigneeAgentId={seat}`, where
+    // the same request without an Authorization header returns 401 and a
+    // malformed bearer returns {"error":"Unauthorized","guard":"signature"}.
+    //
+    // RUAAAAA-5412: the warning logged on this branch used to call this path
+    // "broken for hermes_local — RUAAAAA-2375", which sent the next reader
+    // looking for a credential outage that does not exist.
     //
     // We deliberately do NOT set `supportsLocalAgentJwt: false` on the
     // hermes_local adapter so the heartbeat path can still issue the JWT
@@ -578,7 +601,7 @@ const hermesLocalAdapter: ServerAdapterModule = {
       injectedSource = "authToken";
       logger.warn(
         { agentId, runId },
-        "[hermes_local] no stored api_key; falling back to local-agent JWT (broken for hermes_local — RUAAAAA-2375)",
+        "[hermes_local] no stored api_key; injecting the run-scoped local-agent JWT for this run (RUAAAAA-5412)",
       );
     } else {
       logger.warn(
@@ -596,17 +619,39 @@ const hermesLocalAdapter: ServerAdapterModule = {
       },
     };
 
-    // Only inject the auth guard into promptTemplate when a custom template already exists.
-    // When no custom template is set, Hermes uses its built-in default heartbeat/task prompt —
-    // overwriting it with only the auth guard text would strip the assigned issue/workflow instructions.
-    if (promptTemplate) {
-      patchedConfig.promptTemplate = `${authGuardPrompt}\n\n${promptTemplate}`;
-    }
+    // RUAAAAA-5408: the auth guard has to be prepended on EVERY wake, not
+    // only when the seat already carries a custom promptTemplate.
+    //
+    // The previous comment here claimed the adapter's built-in default
+    // carries the auth instruction. It does not: the installed
+    // hermes-paperclip-adapter's DEFAULT_PROMPT_TEMPLATE has zero occurrences
+    // of Authorization / Bearer / X-Paperclip-Run-Id, and its heartbeat curl is
+    // bare. So an empty-template seat woke with a prompt that told it to curl
+    // the Paperclip API and never named a token, and the first call 401'd.
+    //
+    // The guard is prepended to the adapter's real default instead of
+    // replacing it, so the assigned issue / workflow / comment sections
+    // survive the injection.
+    const baseTemplate = promptTemplate || HERMES_DEFAULT_PROMPT_TEMPLATE;
+    patchedConfig.promptTemplate = `${authGuardPrompt}\n\n${baseTemplate}`;
 
+    // RUAAAAA-5412: log the source AND whether a value was actually injected.
+    // `source` alone records which branch ran; it says nothing about whether
+    // a key reached the child, so "a key was injected" used to depend on the
+    // branches staying in sync with each other. `injected` is derived from
+    // the value itself, so the log cannot claim an injection that did not
+    // happen.
     if (injectedSource && injectedSource !== "explicit") {
       logger.info(
-        { agentId, runId, source: injectedSource },
-        "[hermes_local] injecting PAPERCLIP_API_KEY for child process",
+        {
+          agentId,
+          runId,
+          source: injectedSource,
+          injected: Boolean(injectedApiKey),
+        },
+        injectedApiKey
+          ? "[hermes_local] injecting PAPERCLIP_API_KEY for child process"
+          : "[hermes_local] key source resolved but no PAPERCLIP_API_KEY value to inject",
       );
     }
 

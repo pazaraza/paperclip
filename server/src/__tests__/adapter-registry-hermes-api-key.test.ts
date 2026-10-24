@@ -95,12 +95,12 @@ describe("hermes_local PAPERCLIP_API_KEY injection (RUAAAAA-2375)", () => {
 
   it("injects the stored api_key from adapterConfig.claimedApiKeyPath instead of the JWT", async () => {
     const patchedCtx = await executeHermes({
-      authToken: "broken-local-agent-jwt",
+      authToken: "per-run-agent-jwt",
       agent: { adapterConfig: { claimedApiKeyPath: keyFile } },
     });
 
     expect(patchedCtx.agent.adapterConfig.env.PAPERCLIP_API_KEY).toBe("pcp_stored_agent_token_abc123");
-    expect(patchedCtx.agent.adapterConfig.env.PAPERCLIP_API_KEY).not.toBe("broken-local-agent-jwt");
+    expect(patchedCtx.agent.adapterConfig.env.PAPERCLIP_API_KEY).not.toBe("per-run-agent-jwt");
     expect(patchedCtx.agent.adapterConfig.env.PAPERCLIP_RUN_ID).toBe("run-123");
     // One filesystem read per execute() — the lookup is cached at run start.
     expect(fsReadFileSpy).toHaveBeenCalledTimes(1);
@@ -119,7 +119,7 @@ describe("hermes_local PAPERCLIP_API_KEY injection (RUAAAAA-2375)", () => {
 
     try {
       const patchedCtx = await executeHermes({
-        authToken: "broken-local-agent-jwt",
+        authToken: "per-run-agent-jwt",
         agent: {
           adapterConfig: { claimedApiKeyPath: "~/.openclaw/agents/agent-123/paperclip-claimed-api-key.json" },
         },
@@ -134,40 +134,40 @@ describe("hermes_local PAPERCLIP_API_KEY injection (RUAAAAA-2375)", () => {
     }
   });
 
-  it("falls back to the local JWT when claimedApiKeyPath is not configured", async () => {
+  it("falls back to the run-scoped agent JWT when claimedApiKeyPath is not configured", async () => {
     const patchedCtx = await executeHermes({
-      authToken: "broken-local-agent-jwt",
+      authToken: "per-run-agent-jwt",
       agent: { adapterConfig: {} },
     });
 
-    expect(patchedCtx.agent.adapterConfig.env.PAPERCLIP_API_KEY).toBe("broken-local-agent-jwt");
+    expect(patchedCtx.agent.adapterConfig.env.PAPERCLIP_API_KEY).toBe("per-run-agent-jwt");
     expect(fsReadFileSpy).not.toHaveBeenCalled();
   });
 
-  it("falls back to the local JWT when the configured file is missing", async () => {
+  it("falls back to the run-scoped agent JWT when the configured file is missing", async () => {
     const missing = path.join(tmpRoot, "does-not-exist.json");
     const patchedCtx = await executeHermes({
-      authToken: "broken-local-agent-jwt",
+      authToken: "per-run-agent-jwt",
       agent: { adapterConfig: { claimedApiKeyPath: missing } },
     });
 
-    expect(patchedCtx.agent.adapterConfig.env.PAPERCLIP_API_KEY).toBe("broken-local-agent-jwt");
+    expect(patchedCtx.agent.adapterConfig.env.PAPERCLIP_API_KEY).toBe("per-run-agent-jwt");
     expect(fsReadFileSpy).toHaveBeenCalledWith(missing, expect.any(String));
   });
 
-  it("falls back to the local JWT when the configured file is malformed JSON", async () => {
+  it("falls back to the run-scoped agent JWT when the configured file is malformed JSON", async () => {
     const malformed = path.join(tmpRoot, "malformed.json");
     fs.writeFileSync(malformed, "not-json{");
     const patchedCtx = await executeHermes({
-      authToken: "broken-local-agent-jwt",
+      authToken: "per-run-agent-jwt",
       agent: { adapterConfig: { claimedApiKeyPath: malformed } },
     });
 
-    expect(patchedCtx.agent.adapterConfig.env.PAPERCLIP_API_KEY).toBe("broken-local-agent-jwt");
+    expect(patchedCtx.agent.adapterConfig.env.PAPERCLIP_API_KEY).toBe("per-run-agent-jwt");
     expect(fsReadFileSpy).toHaveBeenCalledWith(malformed, expect.any(String));
   });
 
-  it("falls back to the local JWT when the token field is missing", async () => {
+  it("falls back to the run-scoped agent JWT when the token field is missing", async () => {
     const noToken = path.join(tmpRoot, "no-token.json");
     fs.writeFileSync(noToken, JSON.stringify({ agentId: "x" }));
     const ctx = await executeHermes({
@@ -176,7 +176,7 @@ describe("hermes_local PAPERCLIP_API_KEY injection (RUAAAAA-2375)", () => {
     expect(ctx.agent.adapterConfig.env.PAPERCLIP_API_KEY).toBe("j-missing");
   });
 
-  it("falls back to the local JWT when the token is not pcp_-prefixed", async () => {
+  it("falls back to the run-scoped agent JWT when the token is not pcp_-prefixed", async () => {
     const noPrefix = path.join(tmpRoot, "bad-prefix.json");
     fs.writeFileSync(noPrefix, JSON.stringify({ token: "jwt-shaped-token" }));
     const ctx = await executeHermes({
@@ -185,7 +185,7 @@ describe("hermes_local PAPERCLIP_API_KEY injection (RUAAAAA-2375)", () => {
     expect(ctx.agent.adapterConfig.env.PAPERCLIP_API_KEY).toBe("j-prefix");
   });
 
-  it("falls back to the local JWT when the token is an empty string", async () => {
+  it("falls back to the run-scoped agent JWT when the token is an empty string", async () => {
     const blank = path.join(tmpRoot, "blank.json");
     fs.writeFileSync(blank, JSON.stringify({ token: "" }));
     const ctx = await executeHermes({
@@ -194,7 +194,7 @@ describe("hermes_local PAPERCLIP_API_KEY injection (RUAAAAA-2375)", () => {
     expect(ctx.agent.adapterConfig.env.PAPERCLIP_API_KEY).toBe("j-blank");
   });
 
-  it("falls back to the local JWT when the JSON root is not an object", async () => {
+  it("falls back to the run-scoped agent JWT when the JSON root is not an object", async () => {
     const notObject = path.join(tmpRoot, "not-object.json");
     fs.writeFileSync(notObject, JSON.stringify(["nope"]));
     const ctx = await executeHermes({
@@ -205,7 +205,7 @@ describe("hermes_local PAPERCLIP_API_KEY injection (RUAAAAA-2375)", () => {
 
   it("never overwrites an explicit operator-supplied PAPERCLIP_API_KEY", async () => {
     const patchedCtx = await executeHermes({
-      authToken: "broken-local-agent-jwt",
+      authToken: "per-run-agent-jwt",
       agent: {
         adapterConfig: {
           claimedApiKeyPath: keyFile,
@@ -243,9 +243,73 @@ describe("hermes_local PAPERCLIP_API_KEY injection (RUAAAAA-2375)", () => {
     }
   });
 
+  it("logs the key source AND whether a value was actually injected (RUAAAAA-5412)", async () => {
+    const loggerModule = await import("../middleware/logger.js");
+    const infoSpy = vi.spyOn(loggerModule.logger, "info").mockImplementation(() => undefined);
+
+    try {
+      await executeHermes({
+        authToken: "per-run-agent-jwt",
+        agent: { adapterConfig: {} },
+      });
+
+      const injectionCalls = infoSpy.mock.calls.filter((call) =>
+        String(call[1] ?? "").startsWith("[hermes_local]"),
+      );
+      expect(injectionCalls).toHaveLength(1);
+
+      const payload = injectionCalls[0][0] as Record<string, unknown>;
+      expect(payload.source).toBe("authToken");
+      // `source` records which branch ran; `injected` is derived from the
+      // value, so it is the field that actually proves a key reached the child.
+      expect(payload.injected).toBe(true);
+    } finally {
+      infoSpy.mockRestore();
+    }
+  });
+
+  it("does not log an injection when no key source is available (RUAAAAA-5412)", async () => {
+    const loggerModule = await import("../middleware/logger.js");
+    const infoSpy = vi.spyOn(loggerModule.logger, "info").mockImplementation(() => undefined);
+    const warnSpy = vi.spyOn(loggerModule.logger, "warn").mockImplementation(() => undefined);
+
+    try {
+      await executeHermes({ agent: { adapterConfig: {} } });
+
+      const injectionCalls = infoSpy.mock.calls.filter((call) =>
+        String(call[1] ?? "").startsWith("[hermes_local]"),
+      );
+      expect(injectionCalls).toHaveLength(0);
+      expect(warnSpy).toHaveBeenCalled();
+    } finally {
+      infoSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("does not warn that the hermes_local key path is broken (RUAAAAA-5412)", async () => {
+    const loggerModule = await import("../middleware/logger.js");
+    const warnSpy = vi.spyOn(loggerModule.logger, "warn").mockImplementation(() => undefined);
+
+    try {
+      await executeHermes({
+        authToken: "per-run-agent-jwt",
+        agent: { adapterConfig: {} },
+      });
+
+      const warnings = warnSpy.mock.calls.map((call) => String(call[1] ?? ""));
+      expect(warnings.length).toBeGreaterThan(0);
+      expect(warnings.join("\n")).not.toContain("broken for hermes_local");
+      // The warning must name the token that is actually injected.
+      expect(warnings.join("\n")).toContain("local-agent JWT");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
   it("preserves Hermes command normalization when injecting the stored api_key", async () => {
     const patchedCtx = await executeHermes({
-      authToken: "broken-local-agent-jwt",
+      authToken: "per-run-agent-jwt",
       agent: {
         adapterConfig: {
           claimedApiKeyPath: keyFile,
