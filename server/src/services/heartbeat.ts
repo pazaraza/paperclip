@@ -76,6 +76,10 @@ import {
   normalizeMaxTurnStopReason,
 } from "./heartbeat-stop-metadata.js";
 import {
+  resolveHeartbeatRunOutcome,
+  type HeartbeatRunPreemptingFinalization,
+} from "./heartbeat-run-outcome.js";
+import {
   classifyAndPersistRunLiveness as classifyAndPersistRunLivenessForRun,
 } from "./run-liveness-reconcile.js";
 import { logActivity, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
@@ -7563,17 +7567,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
       const normalizedUsage = sessionUsageResolution.normalizedUsage;
 
-      let outcome: "succeeded" | "failed" | "cancelled" | "timed_out";
       const latestRun = await getRun(run.id);
-      if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
-        outcome = latestRun.status;
-      } else if (adapterResult.timedOut) {
-        outcome = "timed_out";
-      } else if ((adapterResult.exitCode ?? 0) === 0 && !adapterResult.errorMessage) {
-        outcome = "succeeded";
-      } else {
-        outcome = "failed";
-      }
+      // A run row can already be terminal when the adapter returns: the orphan
+      // reaper finalizes rows as failed/process_lost while the child is still
+      // alive (RUAAAAA-5353). When the adapter then reports a wall-clock death,
+      // that earlier verdict described a live child, not the run's outcome, so
+      // the run is labeled timed_out and the reaper's premature finalization is
+      // preserved separately instead of being overwritten (RUAAAAA-5414).
+      const outcomeResolution = resolveHeartbeatRunOutcome({
+        priorStatus: latestRun?.status ?? null,
+        priorErrorCode: latestRun?.errorCode ?? null,
+        priorError: latestRun?.error ?? null,
+        priorFinishedAt: latestRun?.finishedAt ?? null,
+        startedAt: run.startedAt ?? null,
+        adapterTimedOut: adapterResult.timedOut === true,
+        adapterExitCode: adapterResult.exitCode ?? null,
+        adapterErrorMessage: adapterResult.errorMessage ?? null,
+      });
+      const outcome = outcomeResolution.outcome;
+      const preemptingFinalization: HeartbeatRunPreemptingFinalization | null =
+        outcomeResolution.preemptingFinalization;
       const runErrorMessage =
         outcome === "cancelled"
           ? (latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled")
@@ -7637,11 +7650,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             } as Record<string, unknown>)
           : null;
 
+      // When the reaper preempted this row and the adapter then reported a
+      // wall-clock death, the reaper's premature finalization is kept alongside
+      // the corrected label instead of being overwritten by it (RUAAAAA-5414).
+      const adapterResultJson = preemptingFinalization
+        ? {
+            ...(adapterResult.resultJson ?? {}),
+            orphanedFinalization: preemptingFinalization,
+          }
+        : adapterResult.resultJson ?? null;
+
       const persistedResultJson = mergeHeartbeatRunResultJson(
         mergeRunStopMetadataForAgent(agent, outcome, {
           resultJson: mergeModelProfileRunMetadata(
             mergeAdapterRecoveryMetadata({
-              resultJson: adapterResult.resultJson ?? null,
+              resultJson: adapterResultJson,
               errorFamily: adapterResult.errorFamily ?? null,
               retryNotBefore: adapterResult.retryNotBefore ?? null,
             }),
