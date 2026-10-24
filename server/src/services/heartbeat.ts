@@ -77,6 +77,7 @@ import {
 } from "./heartbeat-stop-metadata.js";
 import {
   resolveHeartbeatRunOutcome,
+  resolveTaskSessionLastError,
   type HeartbeatRunPreemptingFinalization,
 } from "./heartbeat-run-outcome.js";
 import {
@@ -7788,7 +7789,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               sessionParamsJson: nextSessionState.params,
               sessionDisplayId: nextSessionState.displayId,
               lastRunId: finalizedRun.id,
-              lastError: outcome === "succeeded" ? null : (adapterResult.errorMessage ?? "run_failed"),
+              lastError: resolveTaskSessionLastError({
+                outcome,
+                adapterErrorMessage: adapterResult.errorMessage,
+              }),
             });
           }
         }

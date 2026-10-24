@@ -3,6 +3,7 @@ import {
   REAPER_ORPHANED_RUN_ERROR_CODE,
   isHeartbeatRunTerminalStatus,
   resolveHeartbeatRunOutcome,
+  resolveTaskSessionLastError,
 } from "./heartbeat-run-outcome.js";
 
 describe("heartbeat run outcome", () => {
@@ -90,5 +91,40 @@ describe("heartbeat run outcome", () => {
     expect(isHeartbeatRunTerminalStatus("failed")).toBe(true);
     expect(isHeartbeatRunTerminalStatus("running")).toBe(false);
     expect(isHeartbeatRunTerminalStatus(null)).toBe(false);
+  });
+  it("files a wall-clock death on the task session as a timeout, not a run failure", () => {
+    expect(
+      resolveTaskSessionLastError({
+        outcome: "timed_out",
+        adapterErrorMessage: null,
+      }),
+    ).toBe("timeout");
+  });
+
+  it("keeps the adapter error message on the task session for a genuine failure", () => {
+    expect(
+      resolveTaskSessionLastError({
+        outcome: "failed",
+        adapterErrorMessage: "Adapter failed",
+      }),
+    ).toBe("Adapter failed");
+  });
+
+  it("falls back to run_failed for a failure with no adapter message", () => {
+    expect(
+      resolveTaskSessionLastError({
+        outcome: "failed",
+        adapterErrorMessage: null,
+      }),
+    ).toBe("run_failed");
+  });
+
+  it("clears the task session error on success", () => {
+    expect(
+      resolveTaskSessionLastError({
+        outcome: "succeeded",
+        adapterErrorMessage: null,
+      }),
+    ).toBeNull();
   });
 });

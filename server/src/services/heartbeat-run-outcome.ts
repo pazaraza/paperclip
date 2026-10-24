@@ -130,3 +130,25 @@ export function resolveHeartbeatRunOutcome(
 
   return { outcome: "failed", preemptingFinalization: null };
 }
+
+/**
+ * Resolve the error text a task session should carry for a run outcome.
+ *
+ * A wall-clock death is a timeout, not a generic run failure: the adapter
+ * reports `timedOut` and leaves no error message, so the fallback used to
+ * file it as `run_failed`. That label is what left stale `run_failed` flags
+ * on task session rows whose run had in fact hit its ceiling (RUAAAAA-5414,
+ * gate 5 on RUAAAAA-5350).
+ *
+ * `timeout` is used rather than `timed_out` so the text stays recognisable
+ * to the fleet-health watch, which classifies timeout-class errors by
+ * matching `%timeout%`.
+ */
+export function resolveTaskSessionLastError(input: {
+  outcome: HeartbeatRunOutcome;
+  adapterErrorMessage?: string | null;
+}): string | null {
+  if (input.outcome === "succeeded") return null;
+  if (input.outcome === "timed_out") return "timeout";
+  return input.adapterErrorMessage ?? "run_failed";
+}
