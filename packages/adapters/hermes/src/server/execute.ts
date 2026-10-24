@@ -53,6 +53,12 @@ import {
   resolveProvider,
 } from "./detect-model.js";
 import { reconcileHermesPaperclipSkills } from "./skills.js";
+import {
+  HERMES_COMPACTION_STALL_ERROR_CODE,
+  countHermesCompactionSpinnerLines,
+  describeHermesCompactionStall,
+  isHermesCompactionStall,
+} from "./compaction-stall.js";
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -615,6 +621,26 @@ export async function execute(
     executionResult.errorMessage = parsed.errorMessage;
   } else if (!result.timedOut && typeof result.exitCode === "number" && result.exitCode !== 0) {
     executionResult.errorMessage = `Hermes exited with code ${result.exitCode}`;
+  }
+
+  // RUAAAAA-5339: a timeout whose whole output was the compaction progress
+  // line is not a generic timeout. Hermes' own context compaction stalls,
+  // the run executes no turns, and the session is persisted anyway — so every
+  // later dispatch resumes the same wedged session and fails identically.
+  // Name the cause (the server otherwise falls back to a bare "Timed out")
+  // and drop the wedged session so the next dispatch starts clean.
+  if (
+    result.timedOut &&
+    !executionResult.errorMessage &&
+    isHermesCompactionStall(parsed.response)
+  ) {
+    executionResult.errorMessage = describeHermesCompactionStall({
+      spinnerLines: countHermesCompactionSpinnerLines(parsed.response),
+      signal: result.signal,
+      timeoutSec,
+    });
+    executionResult.errorCode = HERMES_COMPACTION_STALL_ERROR_CODE;
+    executionResult.clearSession = true;
   }
 
   if (parsed.usage) {

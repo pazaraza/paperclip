@@ -454,7 +454,12 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       normalizeResponsibleUserDenialCode(latestRun?.errorCode);
     const runErrorCode =
       outcome === "timed_out"
-        ? "timeout"
+        // RUAAAAA-5339: an adapter can name a more specific cause for a
+        // timeout than "timeout" — the Hermes adapter reports
+        // "compaction_stall" when its own context compaction wedged the run.
+        // Fall back to "timeout" when the adapter gave no code, so every
+        // other timeout keeps its existing classification.
+        ? (adapterResult.errorCode ?? "timeout")
         : outcome === "cancelled"
           ? (latestRun?.errorCode ?? "cancelled")
           : outcome === "failed"
