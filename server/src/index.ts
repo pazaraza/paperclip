@@ -160,7 +160,11 @@ import {
 } from "./shutdown.js";
 import { initializeCloudRuntimeIdentity } from "./services/cloud-runtime-identity.js";
 import { systemdNotify } from "./services/systemd-notify.js";
-import { flushInFlightRunLogMirrors } from "./services/run-log-store.js";
+import {
+  flushInFlightRunLogMirrors,
+  getRunLogStore,
+  type RunLogRetentionResult,
+} from "./services/run-log-store.js";
 import {
   createEmbeddedPostgresSupervisor,
   type EmbeddedPostgresSupervisor,
@@ -2043,6 +2047,90 @@ async function startServerWithDatabaseTeardown(
       });
     }, backupIntervalMs);
   }
+
+  // ---- Run-log retention sweep (RUAAAAA-3219) -----------------
+  // Companion to the database-backup sweep above. Bounded every 6h. Reads
+  // retention from `instance_settings.general.runLogsRetention` live, so
+  // operators can change the keep-window from the API without restart.
+  // The per-company allowlist prevents the sweep from touching orphan
+  // top-level dirs (RUAAAAA-3200 audit identified 1,462 such dirs at
+  // 2.9 MiB total — they pre-date the new run-id-by-agent-id layout and
+  // are NOT in the `companies` table).
+  const RUN_LOG_RETENTION_INTERVAL_MS = 6 * 60 * 60 * 1000;
+  const runLogStore = getRunLogStore();
+  let runLogSweepInFlight = false;
+
+  const runServerRunLogRetention = async (
+    trigger: "scheduled" | "manual",
+  ): Promise<RunLogRetentionResult | null> => {
+    if (runLogSweepInFlight) {
+      if (trigger === "scheduled") {
+        logger.warn(
+          "Skipping scheduled run-log retention because a previous sweep is still running",
+        );
+        return null;
+      }
+      throw new Error("Run-log retention sweep already in progress");
+    }
+    runLogSweepInFlight = true;
+    const startedAtMs = Date.now();
+    try {
+      const generalSettings = await backupSettingsSvc.getGeneral();
+      const retention = generalSettings.runLogsRetention;
+      const companyIds = await backupSettingsSvc.listCompanyIds();
+      const allowed = new Set(companyIds);
+
+      const result = await runLogStore.pruneOlderThan({
+        retentionMs: retention.retentionDays * 24 * 60 * 60 * 1000,
+        allowedCompanyIds: allowed,
+        // Bound a single sweep to 100k files so a stale backlog can't blow
+        // out the disk-pressure budget on a long-running instance. The
+        // next tick picks up where this left off; hitLimit tells callers.
+        maxDeleteCount: 100_000,
+      });
+
+      const label = trigger === "scheduled" ? "automatic" : "manual";
+      logger.info(
+        {
+          trigger: label,
+          retentionDays: retention.retentionDays,
+          allowedCompanyCount: allowed.size,
+          prunedCount: result.prunedCount,
+          bytesReclaimed: result.bytesReclaimed,
+          skippedCompanyDirCount: result.skippedCompanyDirs.length,
+          hitLimit: result.hitLimit,
+          durationMs: Date.now() - startedAtMs,
+        },
+        `Run-log retention sweep complete (${result.prunedCount} files, $(
+          result.bytesReclaimed /
+          1024 /
+          1024
+        ).toFixed(2)} MiB reclaimed across ${allowed.size} companies)`,
+      );
+      return result;
+    } catch (err) {
+      logger.error(
+        { err, trigger },
+        "Run-log retention sweep failed (will retry on next interval tick)",
+      );
+      throw err;
+    } finally {
+      runLogSweepInFlight = false;
+    }
+  };
+
+  logger.info(
+    {
+      intervalHours: RUN_LOG_RETENTION_INTERVAL_MS / (60 * 60 * 1000),
+      retentionSource: "instance-settings-db",
+    },
+    "Automatic run-log retention enabled",
+  );
+  setInterval(() => {
+    void runServerRunLogRetention("scheduled").catch(() => {
+      // runServerRunLogRetention already logs the failure with context.
+    });
+  }, RUN_LOG_RETENTION_INTERVAL_MS);
   
   // Wait for external adapters to finish loading before accepting requests.
   // Without this, adapter type validation (assertKnownAdapterType) would

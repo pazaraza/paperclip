@@ -1,12 +1,11 @@
 import { describe, expect, it } from "vitest";
+import { buildCodexExecArgs } from "./codex-args.js";
 import {
-  applyScopeToModelProfiles,
   classifyCodexAuthJson,
   filterModelsForScope,
   isModelServableForScope,
   resolveServableModel,
 } from "./model-policy.js";
-import { modelProfiles } from "../index.js";
 
 describe("classifyCodexAuthJson", () => {
   it("classifies a ChatGPT subscription login", () => {
@@ -105,45 +104,25 @@ describe("resolveServableModel", () => {
   });
 });
 
-describe("applyScopeToModelProfiles", () => {
-  it("leaves the shipped cheap profile servable under a ChatGPT credential", () => {
-    const cheap = modelProfiles.find((profile) => profile.key === "cheap");
-    expect(cheap).toBeDefined();
-    expect(cheap!.adapterConfig.model).toBe("gpt-6-astra");
-
-    const scoped = applyScopeToModelProfiles(modelProfiles, "chatgpt");
-    expect(scoped.find((profile) => profile.key === "cheap")!.adapterConfig.model).toBe(
-      "gpt-6-astra",
+describe("buildCodexExecArgs modelOverride (RUAAAAA-5276)", () => {
+  it("prefers the override over the configured model", () => {
+    const result = buildCodexExecArgs(
+      { model: "gpt-5.4" },
+      { modelOverride: "gpt-6-astra" },
     );
+    expect(result.model).toBe("gpt-6-astra");
+    expect(result.args).toContain("--model");
+    expect(result.args[result.args.indexOf("--model") + 1]).toBe("gpt-6-astra");
   });
 
-  it("re-targets a profile whose default the credential cannot serve", () => {
-    const broken = [
-      {
-        key: "cheap" as const,
-        label: "Cheap",
-        adapterConfig: { model: "gpt-5.3-codex-spark", modelReasoningEffort: "low" },
-        source: "adapter_default" as const,
-      },
-    ];
-    const scoped = applyScopeToModelProfiles(broken, "chatgpt");
-    expect(scoped[0]!.adapterConfig.model).toBe("gpt-6-astra");
-    // non-model config survives the swap
-    expect(scoped[0]!.adapterConfig.modelReasoningEffort).toBe("low");
-    // the input is not mutated
-    expect(broken[0]!.adapterConfig.model).toBe("gpt-5.3-codex-spark");
+  it("keeps the configured model when no override is supplied", () => {
+    const result = buildCodexExecArgs({ model: "gpt-5.4" });
+    expect(result.model).toBe("gpt-5.4");
   });
 
-  it("does not narrow profiles for non-ChatGPT scopes", () => {
-    const broken = [
-      {
-        key: "cheap" as const,
-        label: "Cheap",
-        adapterConfig: { model: "gpt-5.4" },
-        source: "adapter_default" as const,
-      },
-    ];
-    expect(applyScopeToModelProfiles(broken, "api_key")[0]!.adapterConfig.model).toBe("gpt-5.4");
-    expect(applyScopeToModelProfiles(broken, "unknown")[0]!.adapterConfig.model).toBe("gpt-5.4");
+  it("omits --model when neither the config nor the override sets one", () => {
+    const result = buildCodexExecArgs({}, { modelOverride: null });
+    expect(result.model).toBe("");
+    expect(result.args).not.toContain("--model");
   });
 });

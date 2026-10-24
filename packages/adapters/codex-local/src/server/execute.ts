@@ -98,6 +98,10 @@ import {
 import { prepareCodexRuntimeConfig } from "./runtime-config.js";
 import { resolveCodexDesiredSkillNames } from "./skills.js";
 import { buildCodexExecArgs } from "./codex-args.js";
+import {
+  resolveCodexCredentialScope,
+  resolveServableModel,
+} from "./model-policy.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 import {
   CODEX_OUTPUT_INACTIVITY_MONITOR_SIGTERM_GRACE_MS,
@@ -1280,12 +1284,30 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         taskContextChars: taskContextNote.length,
         heartbeatPromptChars: renderedPrompt.length,
       };
+      // RUAAAAA-5276: pre-empt the ChatGPT credential's model rejection. A
+      // ChatGPT subscription login 400s on models the Codex backend only
+      // serves to API-key credentials, so swap the requested model for the
+      // ChatGPT-servable default BEFORE the CLI is invoked. Upstream only
+      // detects the rejection reactively (CODEX_CHATGPT_MODEL_REJECTION_RE),
+      // which means the run has already failed by then.
+      const configuredModel = asString(config.model, "");
+      const credentialScope = await resolveCodexCredentialScope(
+        env.CODEX_HOME ?? effectiveCodexHome,
+      );
+      const scopedModel = resolveServableModel(configuredModel, credentialScope);
+      if (scopedModel && scopedModel !== configuredModel) {
+        await onLog(
+          "stdout",
+          `[paperclip] Model "${configuredModel}" is not served to ChatGPT credentials; using "${scopedModel}" instead.\n`,
+        );
+      }
       const execArgs = buildCodexExecArgs(
         forceSaferInvocation ? { ...config, fastMode: false } : config,
         {
           resumeSessionId,
           skipGitRepoCheck: executionTargetIsSandbox,
           networkAccess: env.PAPERCLIP_RUNNER_NETWORK_ACCESS !== "disabled",
+          modelOverride: scopedModel,
         },
       );
       const args = execArgs.args;

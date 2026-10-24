@@ -14,6 +14,29 @@ export const SANDBOX_INSTALL_COMMAND = "npm install -g @openai/codex";
 export const DEFAULT_CODEX_LOCAL_MODEL = PAPERCLIP_RUNNER_DEFAULT_MODELS.codex;
 export const DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX = true;
 
+/**
+ * Models the Codex backend only serves to API-key credentials.
+ *
+ * A ChatGPT subscription credential gets `400 invalid_request_error` —
+ * "The '<model>' model is not supported when using Codex with a ChatGPT
+ * account." — for every one of these, so they must never be seeded into an
+ * agent, offered by the picker, or requested while a ChatGPT credential is
+ * active.
+ *
+ * Verified by live probe against a ChatGPT Pro credential on 2026-10-22.
+ */
+export const CHATGPT_ACCOUNT_UNSERVABLE_MODELS = [
+  "gpt-5.4",
+  "gpt-5.3-codex",
+  "gpt-5.3-codex-spark",
+] as const;
+
+/**
+ * Model the adapter falls back to when a ChatGPT credential is active and the
+ * requested model is one of `CHATGPT_ACCOUNT_UNSERVABLE_MODELS`.
+ */
+export const CHATGPT_ACCOUNT_DEFAULT_MODEL = "gpt-6-astra";
+
 export function resolveCodexLocalCliPolicy(config: unknown, options: { networkAccess?: boolean } = {}) {
   const record = typeof config === "object" && config !== null && !Array.isArray(config)
     ? config as Record<string, unknown> : {};

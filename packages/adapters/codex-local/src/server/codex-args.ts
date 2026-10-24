@@ -32,10 +32,20 @@ export function buildCodexExecArgs(
     resumeSessionId?: string | null;
     skipGitRepoCheck?: boolean;
     networkAccess?: boolean;
+    /**
+     * Model to request instead of `config.model` (RUAAAAA-5276). When set it
+     * wins over the configured model; when omitted the configured model is
+     * used unchanged.
+     */
+    modelOverride?: string | null;
   } = {},
 ): BuildCodexExecArgsResult {
   const record = asRecord(config);
-  const model = normalizeCodexModel(asString(record.model, ""));
+  const model = normalizeCodexModel(
+    options.modelOverride !== undefined && options.modelOverride !== null
+      ? options.modelOverride
+      : asString(record.model, ""),
+  );
   const modelReasoningEffort = asString(
     record.modelReasoningEffort,
     asString(record.reasoningEffort, ""),

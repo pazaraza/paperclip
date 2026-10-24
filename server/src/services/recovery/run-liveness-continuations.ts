@@ -2,6 +2,7 @@ import { and, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentWakeupRequests, agents, heartbeatRuns, issues } from "@paperclipai/db";
 import type { RunLivenessState } from "@paperclipai/shared";
+import { parseObject } from "../../adapters/utils.js";
 import { withRecoveryContext } from "./status-only-context.js";
 import { RECOVERY_REASON_KINDS } from "./origins.js";
 
@@ -21,6 +22,47 @@ type IssueRow = Pick<
   "id" | "companyId" | "identifier" | "title" | "status" | "assigneeAgentId" | "executionState" | "projectId"
 >;
 type AgentRow = Pick<typeof agents.$inferSelect, "id" | "companyId" | "status">;
+
+// RUAAAAA-5326 — the periodic recovery sweep in `recovery/service.ts` is a
+// THIRD re-enqueue path. It is not the comment ladder (hard-bounded to 1 in
+// `heartbeat.ts`) and not the liveness continuation ladder above (bounded by
+// `DEFAULT_MAX_LIVENESS_CONTINUATION_ATTEMPTS`). It used to carry no attempt
+// budget at all, so the top of the retry ladder was re-seeded on every sweep
+// interval for any issue that stayed `in_progress` while its runs ended
+// without a terminal disposition.
+//
+// The counter lives in the run's `contextSnapshot`, NOT in the
+// `heartbeatRuns.continuationAttempt` column. RUAAAAA-5326 originally proposed
+// reusing that column; doing so demonstrably steals budget from the liveness
+// ladder above, because `decideRunLivenessContinuation` reads the same column
+// off whatever run it is finalising. A sweep-seeded run written with
+// `continuationAttempt: 1` arrives at that ladder with one of its two attempts
+// already spent. That is visible as
+// `heartbeat-process-recovery.test.ts > "classifies actionable plan-only
+// recovery and enqueues one liveness continuation"` flipping from
+// `continuationAttempt: 1` to `2`. A separate snapshot key keeps both budgets
+// intact and needs no migration.
+export const DEFAULT_MAX_SWEEP_CONTINUATION_ATTEMPTS = 1;
+export const SWEEP_CONTINUATION_ATTEMPT_SNAPSHOT_KEY = "sweepContinuationAttempt";
+export const SWEEP_CONTINUATION_EXHAUSTED_COMMENT_PREFIX =
+  "Bounded sweep continuation exhausted";
+
+export type SweepContinuationDecision =
+  | {
+      kind: "enqueue";
+      nextAttempt: number;
+      maxAttempts: number;
+    }
+  | {
+      kind: "exhausted";
+      attempt: number;
+      maxAttempts: number;
+      comment: string;
+    }
+  | {
+      kind: "skip";
+      reason: string;
+    };
 
 export type RunContinuationDecision =
   | {
@@ -59,6 +101,80 @@ export function buildRunLivenessContinuationIdempotencyKey(input: {
     input.livenessState,
     String(input.nextAttempt),
   ].join(":");
+}
+
+
+export function readSweepContinuationAttempt(contextSnapshot: unknown): number {
+  const context = parseObject(contextSnapshot);
+  return readContinuationAttempt(context[SWEEP_CONTINUATION_ATTEMPT_SNAPSHOT_KEY]);
+}
+
+export function buildSweepContinuationExhaustedComment(input: {
+  retryReason: string;
+  attempt: number;
+  maxAttempts: number;
+}) {
+  return [
+    SWEEP_CONTINUATION_EXHAUSTED_COMMENT_PREFIX,
+    "",
+    `- Retry reason: \`${input.retryReason}\``,
+    `- Sweep re-enqueues used: ${input.attempt}/${input.maxAttempts}`,
+    "- The periodic recovery sweep stopped re-enqueueing this issue: its runs keep ending without a terminal disposition, so every sweep pass would otherwise re-seed the top of the retry ladder.",
+    "- Next action: a human or manager should inspect the runs, then either mark the issue blocked, assign a concrete follow-up, or close it.",
+  ].join("\n");
+}
+
+/**
+ * RUAAAAA-5326. Decides whether the periodic recovery sweep may re-enqueue a
+ * continuation wake for an issue whose latest run left it `in_progress` with
+ * no live execution path.
+ *
+ * The sweep is the last rung: both bounded ladders have already run by the
+ * time it fires, so its budget is deliberately small — one re-enqueue, then a
+ * human handoff. `sourceRunAttempt` is
+ * `contextSnapshot.sweepContinuationAttempt` of the run the sweep would chain
+ * from; the caller threads `nextAttempt` forward onto the seeded run's
+ * `contextSnapshot`, which is where the next pass reads it back.
+ *
+ * Scope note: `didAutomaticRecoveryFail` and
+ * `isRepeatedProductiveContinuationRecovery` already bound the *direct*
+ * sweep-seeded loop, because a sweep-seeded run either fails terminally (first
+ * guard) or keeps the productive `source` label (second guard). What neither
+ * guard covers is a run seeded by one sweep site and re-seeded by the other —
+ * `isRepeatedProductiveContinuationRecovery` string-matches
+ * `issue.productive_terminal_continuation_recovery`, so a run seeded as
+ * `issue.continuation_recovery` that then succeeds productively passes straight
+ * through it and re-enters the ladder. The attempt budget is what cuts that
+ * crossing, and it makes the bound explicit instead of emergent from a string
+ * comparison.
+ *
+ * Known remaining gap: the counter lives on the run the sweep chains from, so
+ * an unrelated wake landing between two sweeps (e.g. `issue_children_completed`
+ * or `source_scoped_recovery_action`) resets it to 0 and buys one more
+ * re-enqueue. That is a strictly smaller loop than the one this closes — it is
+ * bounded by foreign wakes rather than by the sweep interval — and closing it
+ * needs a per-issue chain record rather than a per-run snapshot key.
+ */
+export function decideSweepContinuation(input: {
+  sourceRunAttempt: unknown;
+  retryReason: string;
+  maxAttempts?: number;
+}): SweepContinuationDecision {
+  const maxAttempts = input.maxAttempts ?? DEFAULT_MAX_SWEEP_CONTINUATION_ATTEMPTS;
+  const attempt = readContinuationAttempt(input.sourceRunAttempt);
+  if (attempt >= maxAttempts) {
+    return {
+      kind: "exhausted",
+      attempt,
+      maxAttempts,
+      comment: buildSweepContinuationExhaustedComment({
+        retryReason: input.retryReason,
+        attempt,
+        maxAttempts,
+      }),
+    };
+  }
+  return { kind: "enqueue", nextAttempt: attempt + 1, maxAttempts };
 }
 
 export async function findExistingRunLivenessContinuationWake(

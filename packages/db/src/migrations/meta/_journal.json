@@ -2633,6 +2633,13 @@
       "when": 1792790134086,
       "tag": "0377_clear_settled_native_run_process_identity",
       "breakpoints": true
+    },
+    {
+      "idx": 376,
+      "version": "7",
+      "when": 1792839256364,
+      "tag": "0378_agent_runtime_state_wake_errors",
+      "breakpoints": true
     }
   ]
 }
