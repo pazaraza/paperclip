@@ -7,6 +7,7 @@ import {
   HERMES_COMPACTION_STALL_ERROR_CODE,
   applyHermesCompactionStallRecovery,
   isHermesCompactionStall,
+  isHermesNonSuccessExit,
 } from "../adapters/hermes-session-id.js";
 
 /**
@@ -171,4 +172,46 @@ describe("hermes compaction-stall recovery (RUAAAAA-5339)", () => {
       await fs.rm(dir, { recursive: true, force: true });
     }
   }, 20_000);
+});
+describe("hermes compaction-stall arming on a non-success exit (RUAAAAA-5339)", () => {
+  it("arms on every non-success exit, not only on a wall-clock timeout", () => {
+    // Wall-clock timeout.
+    expect(isHermesNonSuccessExit({ timedOut: true, exitCode: null })).toBe(true);
+    // The child caught SIGINT and exited 130: timedOut is false because
+    // Paperclip's own timer never fired. The server files this as
+    // failed/adapter_failed rather than timed_out.
+    expect(isHermesNonSuccessExit({ timedOut: false, exitCode: 130 })).toBe(true);
+    expect(isHermesNonSuccessExit({ timedOut: false, exitCode: 1 })).toBe(true);
+    // Killed outright by a signal: no exit code at all, but it never
+    // succeeded either.
+    expect(isHermesNonSuccessExit({ timedOut: false, exitCode: null, signal: "SIGINT" })).toBe(true);
+    // A clean exit is not a stall.
+    expect(isHermesNonSuccessExit({ timedOut: false, exitCode: 0 })).toBe(false);
+    expect(isHermesNonSuccessExit({ timedOut: false, exitCode: null })).toBe(false);
+  });
+
+  it("recovers a run that exited 130 without Paperclip's timer firing", () => {
+    const fixed = applyHermesCompactionStallRecovery({
+      exitCode: 130,
+      signal: null,
+      timedOut: false,
+      resultJson: { result: OBSERVED_SPINNER_RESULT },
+    });
+    expect(fixed.clearSession).toBe(true);
+    expect(fixed.errorCode).toBe(HERMES_COMPACTION_STALL_ERROR_CODE);
+    expect(fixed.errorMessage).toContain("compaction");
+    expect(fixed.errorMessage).toContain("130");
+  });
+
+  it("recovers a run that was killed outright by a signal", () => {
+    const fixed = applyHermesCompactionStallRecovery({
+      exitCode: null,
+      signal: "SIGKILL",
+      timedOut: false,
+      resultJson: { result: OBSERVED_SPINNER_RESULT },
+    });
+    expect(fixed.clearSession).toBe(true);
+    expect(fixed.errorCode).toBe(HERMES_COMPACTION_STALL_ERROR_CODE);
+    expect(fixed.errorMessage).toContain("SIGKILL");
+  });
 });

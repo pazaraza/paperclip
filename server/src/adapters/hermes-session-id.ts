@@ -180,10 +180,36 @@ export function isHermesCompactionStall(result: string | null | undefined): bool
 
 type CompactionStallCarrier = SessionContentionCarrier & {
   timedOut?: boolean;
+  exitCode?: number | null;
   errorMessage?: string | null;
   signal?: string | null;
   resultJson?: { result?: unknown } | null;
 };
+
+/**
+ * True when the run did not produce a usable result.
+ *
+ * A compaction stall is only a stall if the run also failed. Paperclip sets
+ * `timedOut` only when its own wall-clock timer fires, so a child that dies
+ * on its own is not covered by that flag. Two shapes were observed on
+ * production: the Hermes CLI catches SIGINT and exits 130 (exit code 130, no
+ * signal), and a child killed outright by a signal reports no exit code at
+ * all (exit code null, signal set). The server files both as
+ * failed/adapter_failed rather than timed_out, and the server's own
+ * "succeeded" test requires both a zero exit code and no signal, so this
+ * mirrors that rule exactly.
+ */
+export function isHermesNonSuccessExit(input: {
+  timedOut?: boolean;
+  exitCode?: number | null;
+  signal?: string | null;
+}): boolean {
+  if (input.timedOut) return true;
+  if (typeof input.exitCode === "number") return input.exitCode !== 0;
+  // Killed by a signal: it never produced an exit code, so it never
+  // succeeded either.
+  return typeof input.signal === "string" && input.signal.length > 0;
+}
 
 /**
  * RUAAAAA-5339: break the compaction-stall livelock.
@@ -210,15 +236,24 @@ type CompactionStallCarrier = SessionContentionCarrier & {
 export function applyHermesCompactionStallRecovery<TResult extends CompactionStallCarrier>(
   result: TResult,
 ): TResult {
-  if (!result.timedOut) return result;
+  if (
+    !isHermesNonSuccessExit({
+      timedOut: result.timedOut,
+      exitCode: result.exitCode,
+      signal: result.signal,
+    })
+  ) {
+    return result;
+  }
   const scraped = result.resultJson?.result;
   if (!isHermesCompactionStall(typeof scraped === "string" ? scraped : null)) return result;
 
   const spinnerLines = String(scraped).split(/\r?\n/).filter((line) => line.trim().length > 0).length;
   const signal = result.signal ? `, signal ${result.signal}` : "";
+  const exit = typeof result.exitCode === "number" ? `, exit ${result.exitCode}` : "";
   const errorMessage =
     `Hermes stalled in context compaction for the whole run budget (${spinnerLines} ` +
-    `progress lines, no assistant output${signal}); session dropped so the next ` +
+    `progress lines, no assistant output${signal}${exit}); session dropped so the next ` +
     `dispatch starts fresh. See RUAAAAA-5339.`;
 
   logger.warn(
