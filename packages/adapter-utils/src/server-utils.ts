@@ -890,26 +890,87 @@ export function buildInvocationEnvForLogs(
   return redactEnvForLogs(merged);
 }
 
-export function buildPaperclipEnv(agent: { id: string; companyId: string }): Record<string, string> {
+/**
+ * RUAAAAA-5402 — the Paperclip REST surface lives under `/api`, while the
+ * advertised `PAPERCLIP_API_URL` is the bare origin (`http://host:port`); every
+ * documented call is `$PAPERCLIP_API_URL/api/...`. A prompt template that wants a
+ * complete API base needs the `/api` root so it can say
+ * `{{paperclipApiUrl}}/agents/me/inbox-lite` instead of hard-coding a literal.
+ *
+ * Three shapes come out of the same parser:
+ * - `normalizePaperclipApiBaseUrl` — origin + path, no trailing slash.
+ * - `resolvePaperclipApiOriginUrl` — origin form; a trailing `/api` segment is
+ *   dropped so the value stays interchangeable with `PAPERCLIP_API_URL`.
+ * - `resolvePaperclipApiRootUrl` — root form; the `/api` suffix is guaranteed
+ *   and the function is idempotent (a base that already ends in `/api` comes
+ *   back unchanged).
+ */
+export function normalizePaperclipApiBaseUrl(value: unknown): string | null {
+  const raw = typeof value === "string" ? value.trim() : "";
+  if (!raw) return null;
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    const path = parsed.pathname.replace(/\/+$/, "");
+    return `${parsed.origin}${path}`;
+  } catch {
+    return null;
+  }
+}
+
+export function resolvePaperclipApiOriginUrl(value: unknown): string | null {
+  const base = normalizePaperclipApiBaseUrl(value);
+  if (!base) return null;
+  return base.endsWith("/api") ? base.slice(0, -"/api".length) : base;
+}
+
+export function resolvePaperclipApiRootUrl(value: unknown): string | null {
+  const base = normalizePaperclipApiBaseUrl(value);
+  if (!base) return null;
+  return base.endsWith("/api") ? base : `${base}/api`;
+}
+
+/**
+ * The API base this server advertises to adapters (origin form, no `/api`
+ * suffix), resolved from the runtime environment.
+ */
+export function resolveServerPaperclipApiUrl(): string {
   const resolveHostForUrl = (rawHost: string): string => {
     const host = rawHost.trim();
     if (!host || host === "0.0.0.0" || host === "::") return "localhost";
     if (host.includes(":") && !host.startsWith("[") && !host.endsWith("]")) return `[${host}]`;
     return host;
   };
-  const vars: Record<string, string> = {
-    PAPERCLIP_AGENT_ID: agent.id,
-    PAPERCLIP_COMPANY_ID: agent.companyId,
-  };
   const runtimeHost = resolveHostForUrl(
     process.env.PAPERCLIP_LISTEN_HOST ?? process.env.HOST ?? "localhost",
   );
   const runtimePort = process.env.PAPERCLIP_LISTEN_PORT ?? process.env.PORT ?? "3100";
-  const apiUrl =
+  return (
     process.env.PAPERCLIP_RUNTIME_API_URL ??
     process.env.PAPERCLIP_API_URL ??
-    `http://${runtimeHost}:${runtimePort}`;
-  vars.PAPERCLIP_API_URL = apiUrl;
+    `http://${runtimeHost}:${runtimePort}`
+  );
+}
+
+/**
+ * The API root a prompt template should use: the configured
+ * `adapterConfig.paperclipApiUrl` when it is a usable URL, otherwise the server
+ * runtime base with the `/api` suffix. Never empty — an unresolved template
+ * path renders as "", which would turn `{{paperclipApiUrl}}` into a broken URL.
+ */
+export function resolveAdapterPaperclipApiRootUrl(configuredValue: unknown): string {
+  const configured = resolvePaperclipApiRootUrl(configuredValue);
+  if (configured) return configured;
+  const server = resolveServerPaperclipApiUrl();
+  return resolvePaperclipApiRootUrl(server) ?? server;
+}
+
+export function buildPaperclipEnv(agent: { id: string; companyId: string }): Record<string, string> {
+  const vars: Record<string, string> = {
+    PAPERCLIP_AGENT_ID: agent.id,
+    PAPERCLIP_COMPANY_ID: agent.companyId,
+  };
+  vars.PAPERCLIP_API_URL = resolveServerPaperclipApiUrl();
   return vars;
 }
 

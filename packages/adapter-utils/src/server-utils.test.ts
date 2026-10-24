@@ -2,15 +2,19 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   applyPaperclipWorkspaceEnv,
   appendWithByteCap,
   buildInvocationEnvForLogs,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   materializePaperclipSkillCopy,
+  normalizePaperclipApiBaseUrl,
   refreshPaperclipWorkspaceEnvForExecution,
   renderPaperclipWakePrompt,
+  resolveAdapterPaperclipApiRootUrl,
+  resolvePaperclipApiOriginUrl,
+  resolvePaperclipApiRootUrl,
   runningProcesses,
   runChildProcess,
   sanitizeSshRemoteEnv,
@@ -932,5 +936,72 @@ describe("appendWithByteCap", () => {
     expect(output).not.toContain("\uFFFD");
     expect(Buffer.from(output, "utf8").toString("utf8")).toBe(output);
     expect(Buffer.byteLength(output, "utf8")).toBeLessThanOrEqual(7);
+  });
+});
+
+/**
+ * RUAAAAA-5402 — the Paperclip REST surface lives under `/api`, while the
+ * advertised `PAPERCLIP_API_URL` is the bare origin. A prompt template needs
+ * the `/api` root, and a seat may write its configured base either way, so both
+ * shapes have to normalise to something unambiguous.
+ */
+describe("Paperclip API base normalisation (RUAAAAA-5402)", () => {
+  const savedRuntimeApiUrl = process.env.PAPERCLIP_RUNTIME_API_URL;
+
+  afterEach(() => {
+    if (savedRuntimeApiUrl === undefined) delete process.env.PAPERCLIP_RUNTIME_API_URL;
+    else process.env.PAPERCLIP_RUNTIME_API_URL = savedRuntimeApiUrl;
+  });
+
+  it("normalises a base to origin+path without a trailing slash", () => {
+    expect(normalizePaperclipApiBaseUrl("http://100.67.204.21:3100")).toBe(
+      "http://100.67.204.21:3100",
+    );
+    expect(normalizePaperclipApiBaseUrl("http://100.67.204.21:3100/")).toBe(
+      "http://100.67.204.21:3100",
+    );
+    expect(normalizePaperclipApiBaseUrl("http://host/paperclip/api/")).toBe(
+      "http://host/paperclip/api",
+    );
+  });
+
+  it("rejects anything that is not an http(s) base", () => {
+    expect(normalizePaperclipApiBaseUrl("ftp://host")).toBeNull();
+    expect(normalizePaperclipApiBaseUrl("not a url")).toBeNull();
+    expect(normalizePaperclipApiBaseUrl("")).toBeNull();
+    expect(normalizePaperclipApiBaseUrl(undefined)).toBeNull();
+    expect(normalizePaperclipApiBaseUrl(42)).toBeNull();
+  });
+
+  it("drops a trailing /api for the origin form and keeps it for the root form", () => {
+    expect(resolvePaperclipApiOriginUrl("http://100.67.204.21:3100/api")).toBe(
+      "http://100.67.204.21:3100",
+    );
+    expect(resolvePaperclipApiOriginUrl("http://100.67.204.21:3100")).toBe(
+      "http://100.67.204.21:3100",
+    );
+    expect(resolvePaperclipApiRootUrl("http://100.67.204.21:3100")).toBe(
+      "http://100.67.204.21:3100/api",
+    );
+    expect(resolvePaperclipApiRootUrl("http://100.67.204.21:3100/api")).toBe(
+      "http://100.67.204.21:3100/api",
+    );
+  });
+
+  it("falls back to the server runtime base with the /api suffix", () => {
+    process.env.PAPERCLIP_RUNTIME_API_URL = "http://127.0.0.1:3100";
+    expect(resolveAdapterPaperclipApiRootUrl(undefined)).toBe("http://127.0.0.1:3100/api");
+    expect(resolveAdapterPaperclipApiRootUrl("http://100.67.204.21:3100")).toBe(
+      "http://100.67.204.21:3100/api",
+    );
+    // A configured value always wins over the server base.
+    expect(resolveAdapterPaperclipApiRootUrl("http://100.67.204.21:3100/api")).toBe(
+      "http://100.67.204.21:3100/api",
+    );
+  });
+
+  it("never hands a template an empty base", () => {
+    process.env.PAPERCLIP_RUNTIME_API_URL = "http://127.0.0.1:3100";
+    expect(resolveAdapterPaperclipApiRootUrl("not a url").length).toBeGreaterThan(0);
   });
 });
