@@ -29,6 +29,7 @@ import {
 import { notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { getServerAdapter } from "../../adapters/index.js";
+import { HERMES_SESSION_ID_PATTERN } from "../../adapters/hermes-session-id.js";
 import type {
   AdapterExecutionResult,
   AdapterSessionCodec,
@@ -867,8 +868,11 @@ export type RunSessionOutcome =
 
 const HERMES_ADAPTER_TYPE = "hermes_local";
 
-const HERMES_SESSION_ID_REGEX =
-  /^(?:\d{8}_\d{6}_[A-Za-z0-9_-]{4,}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$/;
+// RUAAAAA-5418: the canonical hermes session-id rule lives in the guard
+// module so the server-side check and the adapter-side guard can never drift
+// apart. A stricter adapter-side guard would reject session ids the server
+// considers valid and break hermes --resume continuity.
+const HERMES_SESSION_ID_REGEX = HERMES_SESSION_ID_PATTERN;
 
 export function requiresCanonicalSessionIds(adapterType: string | null | undefined) {
   return adapterType === HERMES_ADAPTER_TYPE;

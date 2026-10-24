@@ -1,4 +1,5 @@
 import { probePluginRunnerEnvironment } from "../services/native-runtime/plugin-runner-probe.js";
+import { logger } from "../middleware/logger.js";
 import { HttpError } from "../errors.js";
 import type { AdapterRuntimeCommandSpec, ServerAdapterModule } from "./types.js";
 import { parseAdapterModelsEnv } from "../services/adapter-models-env.js";
@@ -103,6 +104,7 @@ import {
   createHermesGatewayServerAdapter,
   createHermesLocalServerAdapter,
 } from "@paperclipai/hermes-paperclip-adapter";
+import { sessionCodec as hermesLocalSessionCodec } from "@paperclipai/hermes-paperclip-adapter/server";
 import {
   execute as openCodeExecute,
   listOpenCodeSkills,
@@ -123,6 +125,10 @@ import {
   agentConfigurationDoc as openclawGatewayAgentConfigurationDoc,
   models as openclawGatewayModels,
 } from "@paperclipai/adapter-openclaw-gateway";
+import {
+  createGuardedHermesLocalExecute,
+  createGuardedHermesSessionCodec,
+} from "./hermes-session-id.js";
 import { listCodexModels, refreshCodexModels } from "./codex-models.js";
 import { listCursorModels } from "./cursor-models.js";
 import {
@@ -878,9 +884,47 @@ const hermesGatewayAdapter: ServerAdapterModule = {
   runtimeToolDelivery: "invocation_context",
 };
 
+// RUAAAAA-5418: upstream vendored the hermes adapter in-tree
+// (packages/adapters/hermes, 0.3.1) and builds hermes_local straight from
+// it, so the local session-id guard (RUAAAAA-5244) and the session-contention
+// recovery (RUAAAAA-5296) had no call site left. Wrap the vendored adapter
+// instead of touching it: the upstream construction stays intact and the
+// guard runs around it.
+//
+// The guard's accepted session-id shape is the same canonical rule upstream
+// already applies server-side (isCanonicalSessionIdForAdapter in
+// server/src/services/heartbeat/run-state.ts), so wiring it can never narrow
+// the ids the server is willing to resume.
+const hermesLocalBase = createHermesLocalServerAdapter();
+
 const hermesLocalAdapter: ServerAdapterModule = {
-  ...createHermesLocalServerAdapter(),
+  ...hermesLocalBase,
   runtimeToolDelivery: "environment",
+  execute: createGuardedHermesLocalExecute(hermesLocalBase.execute, {
+    onRejectedSessionId: ({ agentId, runId, sessionId }) => {
+      logger.warn(
+        { agentId, runId, rejectedSessionId: sessionId },
+        "[hermes_local] adapter reported a session id that is not a hermes session id; dropping it (RUAAAAA-5244)",
+      );
+    },
+    onSessionContention: ({ agentId, runId }) => {
+      logger.warn(
+        { agentId, runId },
+        "[hermes_local] hermes refused the pinned session (SESSION_NOT_OWNED); clearing the session so the next dispatch starts fresh (RUAAAAA-5296)",
+      );
+    },
+  }),
+  sessionCodec: createGuardedHermesSessionCodec(
+    hermesLocalBase.sessionCodec ?? hermesLocalSessionCodec,
+    (rejections) => {
+      for (const rejection of rejections) {
+        logger.warn(
+          { rejectedField: rejection.field, rejectedSessionId: rejection.value },
+          "[hermes_local] refusing to persist a malformed hermes session id (RUAAAAA-5244)",
+        );
+      }
+    },
+  ),
 };
 
 const openclawGatewayAdapter: ServerAdapterModule = {
