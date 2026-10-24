@@ -17,12 +17,15 @@ export const agentRuntimeState = pgTable(
     totalCachedInputTokens: bigint("total_cached_input_tokens", { mode: "number" }).notNull().default(0),
     totalCostCents: numeric("total_cost_cents", { precision: 24, scale: 7, mode: "number" }).notNull().default(0),
     lastError: text("last_error"),
+    lastWakeError: text("last_wake_error"),
+    lastWakeAttemptedAt: timestamp("last_wake_attempted_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
     companyAgentIdx: index("agent_runtime_state_company_agent_idx").on(table.companyId, table.agentId),
     companyUpdatedIdx: index("agent_runtime_state_company_updated_idx").on(table.companyId, table.updatedAt),
+    lastWakeErrorIdx: index("agent_runtime_state_last_wake_error_idx").on(table.lastWakeAttemptedAt),
   }),
 );
 

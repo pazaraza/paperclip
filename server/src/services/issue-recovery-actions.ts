@@ -584,10 +584,65 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
     return updated ? toReadModel(updated) : null;
   }
 
+  async function getById(
+    companyId: string,
+    actionId: string,
+    dbOrTx: DbOrTransaction = db,
+  ): Promise<IssueRecoveryAction | null> {
+    const [row] = await dbOrTx
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.id, actionId),
+        ),
+      )
+      .limit(1);
+    return row ? toReadModel(row) : null;
+  }
+
+  /**
+   * Update the outcome and resolution note of a recovery action that has
+   * already been resolved (e.g., by the auto-clear safety net). This lets
+   * the route handler honor an operator's authoritative resolution even
+   * when the issue status transition already resolved the action.
+   */
+  async function updateResolution(
+    companyId: string,
+    actionId: string,
+    updates: {
+      outcome?: IssueRecoveryActionOutcome;
+      resolutionNote?: string | null;
+    },
+    dbOrTx: DbOrTransaction = db,
+  ): Promise<IssueRecoveryAction | null> {
+    const now = new Date();
+    const [updated] = await dbOrTx
+      .update(issueRecoveryActions)
+      .set({
+        ...(updates.outcome !== undefined ? { outcome: updates.outcome } : {}),
+        ...(updates.resolutionNote !== undefined
+          ? { resolutionNote: updates.resolutionNote }
+          : {}),
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.id, actionId),
+        ),
+      )
+      .returning();
+    return updated ? toReadModel(updated) : null;
+  }
+
   return {
     getActiveForIssue,
+    getById,
     listActiveForIssues,
     resolveActiveForIssue,
+    updateResolution,
     upsertSourceScoped,
   };
 }

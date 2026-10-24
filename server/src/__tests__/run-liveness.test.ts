@@ -258,4 +258,104 @@ describe("run liveness classifier", () => {
     expect(classification.actionability).toBe("unknown");
     expect(classification.nextAction).toBeNull();
   });
+
+  it("classifies timed_out runs with concrete action evidence as advanced (RUAAAAA-2072 fix)", () => {
+    const latestEvidenceAt = new Date("2026-06-22T14:48:00Z");
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      runStatus: "timed_out",
+      errorCode: "timeout",
+      issue: {
+        ...baseInput.issue,
+        status: "in_progress",
+      },
+      evidence: {
+        issueCommentsCreated: 1,
+        workProductsCreated: 1,
+        activityEventsCreated: 3,
+        latestEvidenceAt,
+      },
+    });
+
+    expect(classification.livenessState).toBe("advanced");
+    expect(classification.livenessReason).toMatch(/timed out at gateway but produced concrete action evidence/i);
+    expect(classification.livenessReason).toMatch(/1 issue comment\(s\)/);
+    expect(classification.livenessReason).toMatch(/1 work product\(s\)/);
+    expect(classification.livenessReason).toMatch(/3 activity event\(s\)/);
+    expect(classification.lastUsefulActionAt).toEqual(latestEvidenceAt);
+  });
+
+  it("still classifies timed_out runs with no concrete evidence as failed", () => {
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      runStatus: "timed_out",
+      errorCode: "timeout",
+      issue: {
+        ...baseInput.issue,
+        status: "in_progress",
+      },
+      evidence: null,
+    });
+
+    expect(classification.livenessState).toBe("failed");
+    expect(classification.livenessReason).toMatch(/timed_out \(timeout\)/);
+    expect(classification.lastUsefulActionAt).toBeNull();
+  });
+
+  it("does not promote timed_out runs to advanced when the issue is not in_progress", () => {
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      runStatus: "timed_out",
+      errorCode: "timeout",
+      issue: {
+        ...baseInput.issue,
+        status: "blocked",
+      },
+      evidence: {
+        issueCommentsCreated: 1,
+        latestEvidenceAt: new Date("2026-06-22T14:48:00Z"),
+      },
+    });
+
+    expect(classification.livenessState).toBe("failed");
+    expect(classification.livenessReason).toMatch(/timed_out/);
+  });
+
+  it("does not promote failed runs to advanced even with concrete evidence", () => {
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      runStatus: "failed",
+      errorCode: "adapter_failed",
+      issue: {
+        ...baseInput.issue,
+        status: "in_progress",
+      },
+      evidence: {
+        issueCommentsCreated: 2,
+        latestEvidenceAt: new Date("2026-06-22T14:48:00Z"),
+      },
+    });
+
+    expect(classification.livenessState).toBe("failed");
+    expect(classification.livenessReason).toMatch(/failed \(adapter_failed\)/);
+  });
+
+  it("does not treat workspace-only operations as concrete evidence for timed_out advancement", () => {
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      runStatus: "timed_out",
+      errorCode: "timeout",
+      issue: {
+        ...baseInput.issue,
+        status: "in_progress",
+      },
+      evidence: {
+        workspaceOperationsCreated: 1,
+        latestEvidenceAt: new Date("2026-06-22T14:48:00Z"),
+      },
+    });
+
+    // Workspace creation alone is setup evidence, not task progress.
+    expect(classification.livenessState).toBe("failed");
+  });
 });

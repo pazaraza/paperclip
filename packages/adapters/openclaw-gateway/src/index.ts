@@ -34,6 +34,11 @@ Request behavior fields:
 - workspaceRuntime (object, optional): reserved workspace runtime metadata; workspace runtime services are manually controlled from the workspace UI and are not auto-started by heartbeats
 - timeoutSec (number, optional): adapter timeout in seconds (default 120)
 - waitTimeoutMs (number, optional): agent.wait timeout override (default timeoutSec * 1000)
+- waitPollIntervalMs (number, optional): per-slice agent.wait window used after the run has been provider-started (default 30000)
+- cooldownBackoffMs (number[] | comma string, optional): provider-cooldown backoff sequence (default 30000,60000,120000)
+- saturatedProbeIntervalMs (number, optional): short agent.wait window used while the run has still never been provider-started, so gateway saturation is visible in seconds (default 5000)
+- saturatedMinQueuedSlices (number, optional): consecutive queued/not-started agent.wait slices required before declaring saturation (default 3)
+- saturatedRetryDelayMs (number, optional): retryNotBefore floor reported on a saturated run; routes the run into Paperclip's bounded transient retry (default 120000)
 - autoPairOnFirstConnect (boolean, optional): on first "pairing required", attempt device.pair.list/device.pair.approve via shared auth, then retry once (default true)
 - paperclipApiUrl (string, optional): absolute Paperclip base URL advertised in wake text
 - claimedApiKeyPath (string, optional): path to the claimed API key JSON file read by the agent at wake time (default ~/.openclaw/workspace/paperclip-claimed-api-key.json)

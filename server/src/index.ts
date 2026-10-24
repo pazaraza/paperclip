@@ -933,7 +933,44 @@ async function startServerWithDatabaseTeardown(
   // document parsed fail-closed above (`plugins.autoInstall`). Absent env means
   // self-hosted: createApp falls back to its built-in kubernetes-only default.
   const managedPluginAutoInstall = managedConfig?.plugins.autoInstall ?? null;
+  // ---- Runtime PDP init (RUAAAAA-1955, Slice 1949-B) ----------------
+  // The runtime PDP (Policy Decision Point) gates tool calls on
+  // JobBundle + SafeWrapper membership. v0 boots in phase=1
+  // (observation mode - logs every call but always returns allow)
+  // unless the parent issue description contains the literal token
+  // phase=2, in which case the runtime starts in phase=2 and
+  // enforces the 5-row decision table. The init is fail-closed: if the
+  // catalog or matrix cannot be parsed the server refuses to start.
+  // Catalog + matrix paths come from env vars (operator-set) with sensible
+  // defaults relative to the server working directory.
+  let pdpRuntime: import("./policy-decision-point/types.js").PdpRuntime | null = null;
+  const PDP_PARENT_ISSUE_ID = "c36fcaca-86a7-49e6-bd76-bbb6eb5f0f40"; // RUAAAAA-1949
+  {
+    const { initPdp } = await import("./policy-decision-point/init.js");
+    const catalogPath =
+      process.env.PDP_CATALOG_PATH ??
+      "/Users/orionis/.paperclip/instances/default/projects/17962940-d69e-4909-bb45-c7bb534505e5/930849e3-de06-47ba-8027-63a527ae1baa/_default/job-bundle-catalog.example.json";
+    const matrixPath =
+      process.env.PDP_MATRIX_PATH ??
+      "/Users/orionis/.paperclip/instances/default/projects/17962940-d69e-4909-bb45-c7bb534505e5/930849e3-de06-47ba-8027-63a527ae1baa/_default/safe-wrapper-approval-matrix.json";
+    try {
+      pdpRuntime = await initPdp({
+        db: db as any,
+        catalogPath,
+        matrixPath,
+        parentIssueId: PDP_PARENT_ISSUE_ID,
+      });
+    } catch (err) {
+      logger.error(
+        { err: (err as Error).message, catalogPath, matrixPath },
+        "PDP init failed at server boot; the runtime will start WITHOUT the PDP enforcement layer",
+      );
+      pdpRuntime = null;
+    }
+  }
+
   const app = await createApp(db as any, {
+    pdp: pdpRuntime ?? undefined,
     prepareIdleDatabaseBackup: idleDatabaseBackupEnabled
       ? async () => (await runServerDatabaseBackup("idle")) !== null
       : undefined,

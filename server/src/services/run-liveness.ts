@@ -331,6 +331,33 @@ export function classifyRunLiveness(input: RunLivenessClassificationInput): RunL
     if (hasUnmanagedBackgroundTaskEvidence(input.resultJson)) {
       return output("failed", UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON);
     }
+    // Ported from the local branch: openclaw_gateway runs frequently exceed
+    // the gateway wait timeout AFTER the agent has already landed durable
+    // writes (child issues, comments, work products, document revisions,
+    // activity events). The recovery classifier must not treat those as
+    // failures - the work is durable and the issue is still advancing.
+    // Classify as advanced with the concrete evidence so the source issue
+    // continuation path is preserved by reconciliation.
+    //
+    // Gating conditions:
+    //  1. runStatus === "timed_out" (the openclaw_gateway wait-timeout case;
+    //     failed/cancelled still classify as failed).
+    //  2. issue status === "in_progress" - if the agent already PATCHed the
+    //     issue to done/blocked/etc, the run-finalization ordering is not
+    //     the proximate cause.
+    //  3. concreteEvidence is true.
+    if (
+      input.runStatus === "timed_out" &&
+      issueStatus === "in_progress" &&
+      concreteEvidence
+    ) {
+      return output(
+        "advanced",
+        "Run timed out at gateway but produced concrete action evidence: " +
+          evidenceReason(evidence),
+        nextAction,
+      );
+    }
     return output("failed", input.errorCode ? `Run ended with ${input.runStatus} (${input.errorCode})` : `Run ended with ${input.runStatus}`);
   }
 

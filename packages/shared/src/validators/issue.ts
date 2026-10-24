@@ -566,6 +566,12 @@ const RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES = [
   "false_positive",
   "blocked",
   "cancelled",
+  // Ported from the local branch (RUAAAAA-617ea8a491): "continuing" keeps a
+  // source issue at in_progress with a live continuation path, and
+  // "recovered_by_subsequent_run" records that a later run already finished
+  // the work the stranded run started.
+  "continuing",
+  "recovered_by_subsequent_run",
 ] as const;
 
 export const resumeWorkspaceFinalizationSchema = z.object({
@@ -670,6 +676,33 @@ export const resolveIssueRecoveryActionSchema = z
           code: z.ZodIssueCode.custom,
           message:
             "This recovery outcome requires sourceIssueStatus to be done or in_review",
+          path: ["sourceIssueStatus"],
+        });
+      }
+      return;
+    }
+
+    // Ported from the local branch (RUAAAAA-617ea8a491).
+    if (value.outcome === "continuing") {
+      if (value.sourceIssueStatus !== "in_progress") {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Continuing recovery actions must keep the source issue at in_progress",
+          path: ["sourceIssueStatus"],
+        });
+      }
+      return;
+    }
+
+    if (value.outcome === "recovered_by_subsequent_run") {
+      if (
+        value.sourceIssueStatus !== "done" &&
+        value.sourceIssueStatus !== "in_review"
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            "Recovered-by-subsequent-run recovery actions must move the source issue to done or in_review",
           path: ["sourceIssueStatus"],
         });
       }

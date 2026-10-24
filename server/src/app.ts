@@ -91,6 +91,7 @@ import { folderRoutes } from "./routes/folders.js";
 import { summarySlotRoutes } from "./routes/summary-slots.js";
 import { statusCardRoutes } from "./routes/status-cards.js";
 import { teamsCatalogRoutes } from "./routes/teams-catalog.js";
+import { toolInventoryRouter } from "./routes/company-tool-inventory.js";
 import { agentRoutes } from "./routes/agents.js";
 import { resolveAgentRunnerTargetForCompany } from "./services/agent-runner-selection.js";
 import type { SetupTokenSessionService } from "./services/setup-token-session.js";
@@ -549,6 +550,14 @@ export async function createApp(
     managedPluginAutoInstall?: readonly string[] | null;
     /** Test override for the bundled plugin catalog root. */
     bundledPluginCatalogRoot?: string;
+    /**
+     * Optional runtime PDP runtime (RUAAAAA-1955, Slice 1949-B). When
+     * provided, the PDP middleware is wired into the tool-execute
+     * route. When omitted, the tool dispatcher behaves exactly as
+     * it did before 1955 (no enforcement layer). The runtime is
+     * produced by `initPdp()` in `src/policy-decision-point/init.ts`.
+     */
+    pdp?: import("./policy-decision-point/types.js").PdpRuntime;
   },
 ) {
   const app = express();
@@ -848,6 +857,10 @@ export async function createApp(
       },
     }),
   );
+  api.use("/companies", companyRoutes(db, opts.storageService));
+  api.use(companySkillRoutes(db));
+  api.use(agentRoutes(db, { pluginWorkerManager: workerManager }));
+  api.use(toolInventoryRouter(db));
   api.use(assetRoutes(db, opts.storageService));
   api.use(agentProfileAvatarRoutes(db, opts.storageService));
   api.use(projectToolRoutes(db));
@@ -1049,7 +1062,7 @@ export async function createApp(
       loader,
       { scheduler, jobStore },
       { workerManager },
-      { toolDispatcher },
+      { toolDispatcher, pdp: opts.pdp },
       { workerManager },
       { toolGateway },
     ),

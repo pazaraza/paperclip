@@ -1,9 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_MAX_LIVENESS_CONTINUATION_ATTEMPTS,
+  DEFAULT_MAX_SWEEP_CONTINUATION_ATTEMPTS,
   RUN_LIVENESS_CONTINUATION_REASON,
+  SWEEP_CONTINUATION_EXHAUSTED_COMMENT_PREFIX,
   buildRunLivenessContinuationIdempotencyKey,
   decideRunLivenessContinuation,
+  decideSweepContinuation,
+  readSweepContinuationAttempt,
 } from "../services/run-continuations.ts";
 
 const companyId = "company-1";
@@ -169,5 +173,70 @@ describe("run liveness continuations", () => {
 
       expect(decision.kind).toBe("skip");
     }
+  });
+});
+
+// RUAAAAA-5326 — the periodic recovery sweep in `recovery/service.ts` is a
+// third re-enqueue path, outside both ladders above. It carries the same
+// `continuationAttempt` number so all three bounds read one counter.
+describe("sweep continuation budget (RUAAAAA-5326)", () => {
+  it("reads the sweep budget out of the run contextSnapshot and nothing else", () => {
+    expect(readSweepContinuationAttempt({ sweepContinuationAttempt: 2 })).toBe(2);
+    // The liveness ladder's counter must not be mistaken for the sweep's.
+    expect(readSweepContinuationAttempt({ continuationAttempt: 2 })).toBe(0);
+    expect(readSweepContinuationAttempt({ livenessContinuationAttempt: 2 })).toBe(0);
+    expect(readSweepContinuationAttempt({})).toBe(0);
+    expect(readSweepContinuationAttempt(null)).toBe(0);
+    expect(readSweepContinuationAttempt({ sweepContinuationAttempt: "3" })).toBe(3);
+  });
+  it("enqueues the first sweep re-enqueue and carries attempt 1 forward", () => {
+    const decision = decideSweepContinuation({
+      sourceRunAttempt: 0,
+      retryReason: "issue_continuation_needed",
+    });
+
+    expect(decision.kind).toBe("enqueue");
+    if (decision.kind !== "enqueue") return;
+    expect(decision.nextAttempt).toBe(1);
+    expect(decision.maxAttempts).toBe(DEFAULT_MAX_SWEEP_CONTINUATION_ATTEMPTS);
+  });
+
+  it("treats a missing or unparseable source attempt as the first attempt, not as a spent budget", () => {
+    for (const sourceRunAttempt of [undefined, null, "", "not-a-number", 0, -3]) {
+      const decision = decideSweepContinuation({
+        sourceRunAttempt,
+        retryReason: "issue_continuation_needed",
+      });
+      expect(decision.kind).toBe("enqueue");
+    }
+  });
+
+  it("exhausts with a human-handoff comment once the budget is spent", () => {
+    const decision = decideSweepContinuation({
+      sourceRunAttempt: DEFAULT_MAX_SWEEP_CONTINUATION_ATTEMPTS,
+      retryReason: "issue_continuation_needed",
+    });
+
+    expect(decision.kind).toBe("exhausted");
+    if (decision.kind !== "exhausted") return;
+    expect(decision.attempt).toBe(DEFAULT_MAX_SWEEP_CONTINUATION_ATTEMPTS);
+    expect(decision.maxAttempts).toBe(DEFAULT_MAX_SWEEP_CONTINUATION_ATTEMPTS);
+    expect(decision.comment.startsWith(SWEEP_CONTINUATION_EXHAUSTED_COMMENT_PREFIX)).toBe(true);
+    expect(decision.comment).toContain(`1/${DEFAULT_MAX_SWEEP_CONTINUATION_ATTEMPTS}`);
+    expect(decision.comment).toContain("issue_continuation_needed");
+    expect(decision.comment).toMatch(/human|manager/i);
+  });
+
+  it("keeps enqueueing below an explicitly raised budget", () => {
+    const decision = decideSweepContinuation({
+      sourceRunAttempt: 1,
+      retryReason: "issue_continuation_needed",
+      maxAttempts: 3,
+    });
+
+    expect(decision.kind).toBe("enqueue");
+    if (decision.kind !== "enqueue") return;
+    expect(decision.nextAttempt).toBe(2);
+    expect(decision.maxAttempts).toBe(3);
   });
 });
