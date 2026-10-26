@@ -129,6 +129,7 @@ const OUTCOME_LABEL: Record<IssueRecoveryActionOutcome, string> = {
   cancelled: "cancelled",
   continuing: "continuing from in_progress",
   recovered_by_subsequent_run: "recovered by subsequent routine run",
+  auto_cleared_by_reconciliation: "auto-cleared by routine reconciliation",
 };
 
 function readEvidenceString(value: unknown): string | null {

@@ -2188,7 +2188,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.id, priorAction.id));
     expect(clearedAction?.status).toBe("resolved");
-    expect(clearedAction?.outcome).toBe("recovered_by_subsequent_run");
+    // RUAAAAA-5489 (AC6): the reconciler closed the issue itself, so the
+    // outcome must not claim that a run did the work.
+    expect(clearedAction?.outcome).toBe("auto_cleared_by_reconciliation");
+    expect(clearedAction?.outcome).not.toBe("recovered_by_subsequent_run");
     expect(clearedAction?.resolutionNote).toMatch(/RUAAAAA-2239/);
     expect(clearedAction?.resolutionNote).toMatch(/succeeded/);
 
@@ -2325,7 +2328,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.id, priorAction.id));
     expect(actionAfter?.status).toBe("resolved");
-    expect(actionAfter?.outcome).toBe("recovered_by_subsequent_run");
+    // RUAAAAA-5489 (AC6): the reconciler closed the issue itself.
+    expect(actionAfter?.outcome).toBe("auto_cleared_by_reconciliation");
+    expect(actionAfter?.outcome).not.toBe("recovered_by_subsequent_run");
     expect(actionAfter?.resolutionNote).toMatch(/error code differs/);
 
     const activityRows = await db
@@ -2414,5 +2419,201 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .where(eq(issueRecoveryActions.id, nonRoutineAction.id));
     expect(nonRoutineActionAfter?.status).toBe("active");
     expect(nonRoutineActionAfter?.outcome).toBeNull();
+  });
+
+  // -------------------------------------------------------------------------
+  // RUAAAAA-5489 - board side of the anchor gap (AC5/AC6).
+  //
+  // The routine_recovery reconciliation closes a stranded sibling and
+  // resolves its recovery action without posting the firing to the anchor
+  // the tick's own contract points at. The tick then has no anchor record,
+  // and it is no longer detectable by the stranded-tick reaper either,
+  // because the reconciliation overwrites exactly the state the reaper
+  // selects on.
+  //
+  // AC5: the reconciliation must REFUSE to close a tick whose parent is a
+  // live recording anchor, leaving the recovery action active so the
+  // watch-side reaper repairs it in the right order (post to the anchor
+  // first, then close).
+  //
+  // AC6: the outcome must not be "recovered_by_subsequent_run" when the
+  // reconciler itself closed the issue.
+  // -------------------------------------------------------------------------
+
+  it("does NOT auto-close a routine_execution sibling whose record lives on a live recording anchor (RUAAAAA-5489 AC5)", async () => {
+    const routineId = randomUUID();
+    const fixture = await seedRoutineExecutionFixture({
+      routineId,
+      priorErrorCode: "ECONNREFUSED",
+      priorRunStatus: "failed",
+    });
+    const recoveryActionSvc = issueRecoveryActionService(db);
+
+    // A live recording anchor: an open, unassigned issue that persists the
+    // record for its children instead of being worked as a task of its own.
+    const anchorId = randomUUID();
+    await db.insert(issues).values({
+      id: anchorId,
+      companyId: fixture.companyId,
+      title: "Persistent tick log (anchor)",
+      status: "backlog",
+      priority: "medium",
+      issueNumber: 90,
+      identifier: `${fixture.prefix}-90`,
+    });
+    await db
+      .update(issues)
+      .set({ parentId: anchorId })
+      .where(eq(issues.id, fixture.priorIssueId));
+
+    const priorAction = await seedActiveStrandedAction({
+      companyId: fixture.companyId,
+      sourceIssueId: fixture.priorIssueId,
+      ownerAgentId: fixture.managerId,
+      fingerprint: `5489-ac5:${fixture.priorIssueId}`,
+    });
+
+    // The routine re-fire succeeds cleanly.
+    await db.insert(heartbeatRuns).values({
+      id: fixture.currentRunId,
+      companyId: fixture.companyId,
+      agentId: fixture.coderId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "succeeded",
+      contextSnapshot: { issueId: fixture.currentIssueId },
+      startedAt: new Date("2026-06-27T03:00:00.000Z"),
+      finishedAt: new Date("2026-06-27T03:00:25.000Z"),
+    });
+
+    const updated = await issueService(db).update(fixture.currentIssueId, {
+      status: "done",
+      actorAgentId: fixture.managerId,
+    });
+    expect(updated?.status).toBe("done");
+
+    // The sibling must NOT be closed: its record lives on the anchor.
+    const [priorIssueRow] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, fixture.priorIssueId));
+    expect(priorIssueRow?.status).toBe("blocked");
+    expect(priorIssueRow?.completedAt).toBeFalsy();
+
+    // The recovery action must stay ACTIVE so the watch-side reaper repairs
+    // it in the right order: post to the anchor FIRST, then close.
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, priorAction.id));
+    expect(actionRow?.status).toBe("active");
+    expect(actionRow?.outcome).toBeNull();
+    expect(actionRow?.resolutionNote).toBeNull();
+
+    const activeAfter = await recoveryActionSvc.getActiveForIssue(
+      fixture.companyId,
+      fixture.priorIssueId,
+    );
+    expect(activeAfter).not.toBeNull();
+
+    // The refusal has to be auditable.
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, fixture.priorIssueId));
+    const skipLogs = activityRows.filter(
+      (row) => row.action === "issue.recovery_action_auto_clear_skipped",
+    );
+    expect(skipLogs).toHaveLength(1);
+    const skipDetails = skipLogs[0]!.details as Record<string, unknown>;
+    expect(skipDetails.source).toBe("auto_clear_skipped_recording_anchor");
+    expect(skipDetails.anchorIssueId).toBe(anchorId);
+    expect(skipDetails.recoveryActionId).toBe(priorAction.id);
+    expect(skipDetails.triggeringIssueId).toBe(fixture.currentIssueId);
+    expect(skipDetails.triggeringRoutineId).toBe(routineId);
+  });
+
+  it("auto-closes a routine_execution sibling whose parent is NOT a live anchor and records the reconciler outcome (RUAAAAA-5489 AC6)", async () => {
+    const routineId = randomUUID();
+    const fixture = await seedRoutineExecutionFixture({
+      routineId,
+      priorErrorCode: "ECONNREFUSED",
+      priorRunStatus: "failed",
+    });
+    const recoveryActionSvc = issueRecoveryActionService(db);
+
+    // An ASSIGNED parent is a working issue, not a persistent tick log, so
+    // the reconciler stays free to close the sibling.
+    const parentId = randomUUID();
+    await db.insert(issues).values({
+      id: parentId,
+      companyId: fixture.companyId,
+      title: "Working parent issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: fixture.managerId,
+      issueNumber: 90,
+      identifier: `${fixture.prefix}-90`,
+    });
+    await db
+      .update(issues)
+      .set({ parentId })
+      .where(eq(issues.id, fixture.priorIssueId));
+
+    const priorAction = await seedActiveStrandedAction({
+      companyId: fixture.companyId,
+      sourceIssueId: fixture.priorIssueId,
+      ownerAgentId: fixture.managerId,
+      fingerprint: `5489-ac6:${fixture.priorIssueId}`,
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: fixture.currentRunId,
+      companyId: fixture.companyId,
+      agentId: fixture.coderId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "succeeded",
+      contextSnapshot: { issueId: fixture.currentIssueId },
+      startedAt: new Date("2026-06-27T03:00:00.000Z"),
+      finishedAt: new Date("2026-06-27T03:00:25.000Z"),
+    });
+
+    const updated = await issueService(db).update(fixture.currentIssueId, {
+      status: "done",
+      actorAgentId: fixture.managerId,
+    });
+    expect(updated?.status).toBe("done");
+
+    const [priorIssueRow] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, fixture.priorIssueId));
+    expect(priorIssueRow?.status).toBe("done");
+
+    const [clearedAction] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, priorAction.id));
+    expect(clearedAction?.status).toBe("resolved");
+    expect(clearedAction?.outcome).toBe("auto_cleared_by_reconciliation");
+    expect(clearedAction?.outcome).not.toBe("recovered_by_subsequent_run");
+    expect(clearedAction?.resolutionNote).toMatch(/closed by the reconciler itself/);
+
+    const activeAfter = await recoveryActionSvc.getActiveForIssue(
+      fixture.companyId,
+      fixture.priorIssueId,
+    );
+    expect(activeAfter).toBeNull();
+
+    // The anchor guard must not have fired for a non-anchor parent.
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, fixture.priorIssueId));
+    const skipLogs = activityRows.filter(
+      (row) => row.action === "issue.recovery_action_auto_clear_skipped",
+    );
+    expect(skipLogs).toHaveLength(0);
   });
 });

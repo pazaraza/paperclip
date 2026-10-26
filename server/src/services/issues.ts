@@ -1791,6 +1791,27 @@ async function blockedByMapForIssues(
   return map;
 }
 
+/**
+ * A "live recording anchor" is an issue that persists a record FOR its
+ * children instead of being worked as a task of its own: it is not closed,
+ * and no agent owns it. A child of such an issue does not carry its own
+ * history - the anchor does - so the board must not close that child
+ * without the anchor having recorded it.
+ *
+ * This is the same predicate the watch side uses to decide what an anchor
+ * is ("cmd_anchor_live" in scripts/fleet-tick-identity.sh, Godines
+ * workspace). The two sides must change together: if the board treats an
+ * anchor as live and the watch does not, the watch keeps reporting gaps
+ * for firings the board already closed.
+ */
+export function isLiveRecordingAnchor(
+  row: { status: string; assigneeAgentId: string | null } | null | undefined,
+): boolean {
+  if (!row) return false;
+  if (row.status === "done" || row.status === "cancelled") return false;
+  return row.assigneeAgentId === null;
+}
+
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -1803,6 +1824,44 @@ export function issueService(db: Db) {
   // / cancelled / timed_out can be cross-checked against a prior error
   // code.
   const ROUTINE_RECOVERY_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
+
+  /**
+   * Resolve a tick's parent to a live recording anchor (RUAAAAA-5489 AC5).
+   *
+   * Returns null when the parent is not a live anchor: no parent at all, a
+   * closed parent (a finished rollout tracker, a closed issue), or an
+   * assigned parent (a working issue, not a persistent tick log).
+   */
+  async function loadLiveRecordingAnchor(
+    dbOrTx: any,
+    companyId: string,
+    parentId: string | null,
+  ): Promise<{ id: string; identifier: string | null; status: string } | null> {
+    if (!parentId) return null;
+    const row = await dbOrTx
+      .select({
+        id: issues.id,
+        identifier: issues.identifier,
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+      })
+      .from(issues)
+      .where(and(eq(issues.id, parentId), eq(issues.companyId, companyId)))
+      .limit(1)
+      .then(
+        (
+          rows: Array<{
+            id: string;
+            identifier: string | null;
+            status: string;
+            assigneeAgentId: string | null;
+          }>,
+        ) => rows[0] ?? null,
+      );
+    if (!row) return null;
+    if (!isLiveRecordingAnchor(row)) return null;
+    return { id: row.id, identifier: row.identifier, status: row.status };
+  }
 
   async function getLatestRunForIssue(
     issueId: string,
@@ -1899,6 +1958,7 @@ export function issueService(db: Db) {
         identifier: issues.identifier,
         status: issues.status,
         title: issues.title,
+        parentId: issues.parentId,
       })
       .from(issues)
       .where(
@@ -1951,6 +2011,54 @@ export function issueService(db: Db) {
       const priorErrorCode = readNullableString(priorLatestRun?.errorCode);
       const priorRunStatus = readNullableString(priorLatestRun?.status);
 
+      // RUAAAAA-5489 (AC5): a sibling whose record lives on a live recording
+      // anchor must NOT be closed by this reconciler.
+      //
+      // The reconciler closes the sibling as a side effect on the board; it
+      // does not post the firing anywhere. When the sibling's own contract
+      // says its record lives on an anchor, closing it without that record
+      // makes the firing invisible: the anchor has no trace of it, and the
+      // stranded-tick reaper can no longer see it either (it selects on the
+      // issue status the reconciler just overwrote).
+      //
+      // So refuse to close it and leave the recovery action ACTIVE. The
+      // watch-side reaper repairs that class in the right order - post to
+      // the anchor FIRST, then close.
+      const anchor = await loadLiveRecordingAnchor(
+        input.dbOrTx,
+        input.companyId,
+        sibling.parentId,
+      );
+      if (anchor) {
+        await logActivity(db, {
+          companyId: input.companyId,
+          actorType: "system",
+          actorId: "system",
+          agentId: null,
+          runId: currentLatestRun?.id ?? null,
+          action: "issue.recovery_action_auto_clear_skipped",
+          entityType: "issue",
+          entityId: sibling.id,
+          details: {
+            identifier: sibling.identifier,
+            source: "auto_clear_skipped_recording_anchor",
+            recoveryActionId: activeAction.id,
+            recoveryActionStatus: activeAction.status,
+            anchorIssueId: anchor.id,
+            anchorIdentifier: anchor.identifier,
+            anchorStatus: anchor.status,
+            triggeringIssueId: input.currentIssue.id,
+            triggeringIssueIdentifier: input.currentIssue.identifier,
+            triggeringRoutineId: input.routineId,
+            newRunStatus,
+            newErrorCode,
+            priorErrorCode,
+            priorRunStatus,
+          },
+        });
+        continue;
+      }
+
       // Cause reproducibility verdict for this sibling:
       //   - new succeeded → not reproducible (auto-clear)
       //   - new failed AND prior errorCode matches new errorCode (including
@@ -1972,8 +2080,12 @@ export function issueService(db: Db) {
           companyId: input.companyId,
           sourceIssueId: sibling.id,
           status: "resolved",
-          outcome: "recovered_by_subsequent_run",
-          resolutionNote: `Auto-cleared by routine_recovery cross-issue reconciliation (RUAAAAA-2239). ${verdictNote}`,
+          // RUAAAAA-5489 (AC6): the reconciler closed this issue itself, so
+          // it must not claim a run did the work. "recovered_by_subsequent_run"
+          // is the outcome for a run that recovered the issue; this is a
+          // different actor and gets a different outcome.
+          outcome: "auto_cleared_by_reconciliation",
+          resolutionNote: `Auto-cleared by routine_recovery cross-issue reconciliation (RUAAAAA-2239); closed by the reconciler itself, not by a run that did the work. ${verdictNote}`,
         },
         input.dbOrTx,
       );

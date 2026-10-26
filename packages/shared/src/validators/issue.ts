@@ -209,6 +209,11 @@ const RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES = [
   "cancelled",
   "continuing",
   "recovered_by_subsequent_run",
+  // RUAAAAA-5489 (AC6): the reconciler closed the source issue itself, so it
+  // carries its own outcome. The source-status pairing below is identical to
+  // recovered_by_subsequent_run: the reconciler moves the source issue to a
+  // terminal disposition.
+  "auto_cleared_by_reconciliation",
 ] as const;
 
 export const resolveIssueRecoveryActionSchema = z.object({
@@ -270,6 +275,18 @@ export const resolveIssueRecoveryActionSchema = z.object({
         code: z.ZodIssueCode.custom,
         message:
           "Recovered-by-subsequent-run recovery actions must move the source issue to done or in_review",
+        path: ["sourceIssueStatus"],
+      });
+    }
+    return;
+  }
+
+  if (value.outcome === "auto_cleared_by_reconciliation") {
+    if (value.sourceIssueStatus !== "done" && value.sourceIssueStatus !== "in_review") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "Auto-cleared-by-reconciliation recovery actions must move the source issue to done or in_review",
         path: ["sourceIssueStatus"],
       });
     }
