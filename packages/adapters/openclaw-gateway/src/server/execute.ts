@@ -142,7 +142,7 @@ const COOLDOWN_ERROR_PATTERNS: RegExp[] = [
 ];
 
 /**
- * RUAAAAA-5548: a provider that refuses the request because the account's quota or
+ * PROVIDER-QUOTA: a provider that refuses the request because the account's quota or
  * rate limit is exhausted is a TRANSIENT UPSTREAM condition, not an agent fault. The
  * provider emits these in two shapes that neither the cooldown patterns nor the
  * gateway-transport patterns match:
@@ -166,7 +166,7 @@ const PROVIDER_QUOTA_PATTERNS: RegExp[] = [
 ];
 
 /**
- * RUAAAAA-5548: true when the message reports a provider-side quota or rate-limit
+ * PROVIDER-QUOTA: true when the message reports a provider-side quota or rate-limit
  * exhaustion. Returns false for agent faults and for gateway transport failures,
  * which are classified separately.
  */
@@ -375,7 +375,7 @@ const UNREACHABLE_RETRY_DELAY_DEFAULT_MS = 15_000;
 const UNREACHABLE_RETRY_DELAY_MIN_MS = 1_000;
 const UNREACHABLE_RETRY_DELAY_MAX_MS = 300_000;
 
-// RUAAAAA-5548: provider quota windows are typically measured in minutes, not seconds,
+// PROVIDER-QUOTA: provider quota windows are typically measured in minutes, not seconds,
 // so the default retry floor is longer than the gateway-restart one.
 const PROVIDER_QUOTA_RETRY_DELAY_DEFAULT_MS = 5 * 60_000;
 const PROVIDER_QUOTA_RETRY_DELAY_MIN_MS = 1_000;
@@ -483,7 +483,7 @@ export function detectCooldownSignal(messages: Array<string | null | undefined>)
   for (const raw of messages) {
     if (typeof raw !== "string" || raw.trim().length === 0) continue;
     const hasInCooldown = /provider\s+[\w.-]+\s+is in cooldown/i.test(raw);
-    // RUAAAAA-5548: the provider quotes the profile name with DOUBLE quotes. The
+    // PROVIDER-QUOTA: the provider quotes the profile name with DOUBLE quotes. The
     // single-quote-only pattern never matched the message this detector was written
     // for, so the cooldown backoff path did not fire for it.
     const hasAuthProfile = /auth profile\s+['"][^'"]+['"]\s+is temporarily unavailable/i.test(raw);
@@ -1694,7 +1694,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     UNREACHABLE_RETRY_DELAY_MIN_MS,
     UNREACHABLE_RETRY_DELAY_MAX_MS,
   );
-  // RUAAAAA-5548: a provider quota exhaustion is a bounded-retryable upstream condition
+  // PROVIDER-QUOTA: a provider quota exhaustion is a bounded-retryable upstream condition
   // too. It is reported through the same transient-upstream family as a gateway restart
   // so the server schedules a bounded retry instead of failing the run outright.
   const providerQuotaRetryDelayMs = parseSaturatedDuration(
@@ -2207,7 +2207,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           };
         }
         if (waitStatus === "error") {
-          // RUAAAAA-5548: the provider refused the run because the account's quota or
+          // PROVIDER-QUOTA: the provider refused the run because the account's quota or
           // rate limit is exhausted. That is transient upstream, not an agent fault, and
           // it is exactly the condition the sibling gateway-restart case (RUAAAAA-5520)
           // already retries. Report it through the transient-upstream family so the
