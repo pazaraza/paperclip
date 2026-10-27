@@ -41,3 +41,27 @@ test('findExistingComment: returns null when no signed comment exists', async ()
 
   assert.equal(comment, null);
 });
+
+test('findExistingComment: matches a comment posted by the built-in github-actions[bot]', async () => {
+  const comment = await findExistingComment(async () => ([
+    {
+      id: 42,
+      user: { login: 'github-actions[bot]' },
+      body: 'All checks passing.\n\n— commitperclip',
+    },
+  ]), 'token', 'paperclipai/paperclip', 6469);
+
+  assert.equal(comment.id, 42);
+});
+
+test('findExistingComment: does not match a human comment that quotes the signature', async () => {
+  const comment = await findExistingComment(async () => ([
+    {
+      id: 7,
+      user: { login: 'a-human-reviewer' },
+      body: 'I think the old verdict was wrong. — commitperclip',
+    },
+  ]), 'token', 'paperclipai/paperclip', 6469);
+
+  assert.equal(comment, null);
+});

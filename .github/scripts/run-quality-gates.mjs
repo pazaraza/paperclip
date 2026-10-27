@@ -21,6 +21,13 @@ import { checkCoauthors, fetchAllPullRequestCommits } from './check-pr-coauthors
 
 const COMMENT_SIGNATURE = '— commitperclip';
 
+// Logins that may own a gate comment. The app installation token posts as
+// commitperclip[bot]; the built-in GITHUB_TOKEN fallback posts as
+// github-actions[bot]. Both have to resolve to the same comment, otherwise a
+// re-run posts a brand new comment on every push instead of updating the
+// existing verdict.
+const GATE_BOT_LOGINS = new Set(['commitperclip[bot]', 'commitperclip', 'github-actions[bot]']);
+
 function buildComment(author, failures, informational) {
   if (failures.length === 0 && informational.length === 0) {
     return `✅ All checks passing — ready for Greptile review and maintainer approval.\n\n${COMMENT_SIGNATURE}`;
@@ -57,8 +64,7 @@ export async function findExistingComment(fetchFromGitHub, token, repo, prNumber
     );
 
     const existing = comments.find(
-      c => (c.user.login === 'commitperclip[bot]' || c.user.login === 'commitperclip') &&
-           c.body.includes(COMMENT_SIGNATURE)
+      c => GATE_BOT_LOGINS.has(c.user?.login) && (c.body ?? '').includes(COMMENT_SIGNATURE)
     );
     if (existing) return existing;
 

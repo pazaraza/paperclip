@@ -33,14 +33,25 @@ jobs:
         with:
           node-version: '24'
 
+      # Prefer the commitperclip app installation token. When the app's private
+      # key is not available as a repository secret (a fork does not inherit the
+      # upstream repo's secrets), fall back to the job's built-in GITHUB_TOKEN so
+      # the quality gates actually execute instead of being skipped. The app path
+      # is untouched: a real COMMITPERCLIP_KEY always wins.
       - name: Generate commitperclip token
         id: token
         run: |
-          TOKEN=$(node .github/scripts/get-bot-token.mjs)
+          if [ -n "${COMMITPERCLIP_KEY:-}" ]; then
+            TOKEN=$(node .github/scripts/get-bot-token.mjs)
+          else
+            echo "::notice::COMMITPERCLIP_KEY is not set - using the built-in GITHUB_TOKEN for the quality gates."
+            TOKEN="$GITHUB_TOKEN"
+          fi
           echo "::add-mask::$TOKEN"
           echo "value=$TOKEN" >> $GITHUB_OUTPUT
         env:
           COMMITPERCLIP_KEY: ${{ secrets.COMMITPERCLIP_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
 
       - name: Run quality gates
         id: quality
