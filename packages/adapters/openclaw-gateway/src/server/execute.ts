@@ -700,6 +700,54 @@ function nonEmpty(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
+/**
+ * PROVIDER-QUOTA: collect the provider-refusal evidence a lifecycle event carries.
+ *
+ * The provider reports a quota/rate-limit refusal on a `finishing` phase event, and the
+ * details live in `errorObservation` (httpStatus / providerRuntimeFailureKind /
+ * providerErrorMessagePreview). A `fallback_step` event carries the same refusal in
+ * `fallbackStepFromFailureReason` / `fallbackStepFromFailureDetail`. A later `error`
+ * phase event then reports only the *downstream* consequence ("Agent couldn't generate a
+ * response"), so the refusal text is GONE by the time the run fails.
+ *
+ * The terminal wait payload is a bare `{"error":"failed"}`, so neither the wait payload
+ * nor the terminal lifecycle error contains the refusal. Without harvesting the
+ * evidence while it is still in the event stream, the refusal can never be classified,
+ * and the run dies with a terminal agent fault instead of a retryable quota refusal.
+ *
+ * Returns the evidence as a single string, or null when the event carries none.
+ */
+export function extractProviderRefusalEvidence(data: Record<string, unknown>): string | null {
+  const parts: string[] = [];
+
+  const directError = nonEmpty(data.error);
+  if (directError) parts.push(directError);
+
+  const observation = asRecord(data.errorObservation);
+  if (observation) {
+    const preview = nonEmpty(observation.providerErrorMessagePreview);
+    if (preview) parts.push(preview);
+    const kind = nonEmpty(observation.providerRuntimeFailureKind);
+    if (kind) parts.push(`providerRuntimeFailureKind=${kind}`);
+    // httpStatus is a NUMBER in the provider's payload, not a string.
+    const status = observation.httpStatus;
+    if (typeof status === "number" && Number.isFinite(status)) {
+      parts.push(`httpStatus=${status}`);
+    } else {
+      const statusText = nonEmpty(status);
+      if (statusText) parts.push(`httpStatus=${statusText}`);
+    }
+  }
+
+  const failureReason = nonEmpty(data.fallbackStepFromFailureReason);
+  if (failureReason) parts.push(`failureReason=${failureReason}`);
+  const failureDetail = nonEmpty(data.fallbackStepFromFailureDetail);
+  if (failureDetail) parts.push(failureDetail);
+
+  if (parts.length === 0) return null;
+  return parts.join(" | ");
+}
+
 function parseOptionalPositiveInteger(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) {
     return Math.max(1, Math.floor(value));
@@ -1906,6 +1954,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const trackedRunIds = new Set<string>([ctx.runId]);
     const assistantChunks: string[] = [];
     let lifecycleError: string | null = null;
+    // PROVIDER-QUOTA: the provider's refusal text, harvested from lifecycle events as
+    // they arrive. See extractProviderRefusalEvidence for why this cannot be read
+    // from the terminal payload.
+    let providerRefusalEvidence: string | null = null;
     let deviceIdentity: GatewayDeviceIdentity | null = null;
 
     const onEvent = async (frame: GatewayEventFrame) => {
@@ -1952,6 +2004,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         const phase = nonEmpty(data.phase)?.toLowerCase();
         if (phase === "error" || phase === "failed" || phase === "cancelled") {
           lifecycleError = nonEmpty(data.error) ?? nonEmpty(data.message) ?? lifecycleError;
+        }
+        // PROVIDER-QUOTA: harvest the provider-refusal evidence while it is still in the
+        // event stream. The refusal is reported on a `finishing` (or `fallback_step`)
+        // event; the terminal `error` event reports only the downstream consequence, and
+        // the wait payload is a bare `{"error":"failed"}`. Without this, the quota text
+        // is discarded and the run is classified as a terminal agent fault.
+        const refusalEvidence = extractProviderRefusalEvidence(data);
+        if (refusalEvidence) {
+          providerRefusalEvidence = providerRefusalEvidence
+            ? `${providerRefusalEvidence} || ${refusalEvidence}`
+            : refusalEvidence;
         }
       }
     };
@@ -2205,6 +2268,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             saturationReason = null;
           }
           const signal = detectCooldownSignal([
+            // PROVIDER-QUOTA: the provider's refusal evidence is included here too. The
+            // wait slice's own error text is often a bare "failed", so an auth-profile
+            // or cooldown refusal reported on a lifecycle event would otherwise never
+            // reach the cooldown detector.
+            nonEmpty(providerRefusalEvidence),
             typeof errorText === "string" ? errorText : null,
             sliceStatus === "error" ? nonEmpty(slicePayload?.summary) : null,
             sliceStatus === "error" ? nonEmpty(asRecord(slicePayload?.details)?.message) : null,
@@ -2302,7 +2370,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             },
           };
         }
+        // PROVIDER-QUOTA: two different texts are needed here, and they must not be
+        // conflated.
+        //
+        //  - `waitFailureText` is the transport/agent failure text. It is what the
+        //    connection-closed detector below must see, so it keeps its original
+        //    meaning.
+        //  - `providerRefusalText` is the provider's refusal evidence. The wait payload is
+        //    often a bare `{"error":"failed"}` and the terminal lifecycle error may carry
+        //    only the downstream consequence ("Agent couldn't generate a response"), so the
+        //    refusal text has to be harvested from the lifecycle event stream as it
+        //    arrives. The refusal evidence is checked FIRST so a specific provider
+        //    refusal always wins over a generic "failed".
         const waitFailureText = nonEmpty(waitPayload?.error) ?? lifecycleError ?? "";
+        const providerRefusalText =
+          nonEmpty(providerRefusalEvidence) ?? waitFailureText;
         const waitClosedReason = detectGatewayConnectionClosed(waitFailureText);
         if (waitClosedReason && !cooldownSignal) {
           // RUAAAAA-5520: the gateway process went away while the run was in flight (service
@@ -2337,16 +2419,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           // already retries. Report it through the transient-upstream family so the
           // server schedules a bounded retry; otherwise a single quota window kills every
           // heartbeat in the lane for as long as it lasts.
-          const refusal = classifyProviderRefusal(waitFailureText, Boolean(cooldownSignal));
+          const refusal = classifyProviderRefusal(providerRefusalText, Boolean(cooldownSignal));
           if (refusal.kind === "provider_quota") {
             const errorMessage =
-              `OpenClaw gateway run rejected by the provider (quota or rate limit exhausted): ${waitFailureText}. ` +
+              `OpenClaw gateway run rejected by the provider (quota or rate limit exhausted): ${providerRefusalText}. ` +
               "The provider refused the request because the account's quota or rate limit is exhausted. " +
               "This is a provider-side capacity condition, not an agent fault, so the run is retried " +
               "with backoff instead of being failed outright.";
             await ctx.onLog(
               "stderr",
-              `[openclaw-gateway] provider quota exhausted: ${waitFailureText}`,
+              `[openclaw-gateway] provider quota exhausted: ${providerRefusalText}`,
             );
             return {
               exitCode: 1,
@@ -2374,7 +2456,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
               "with backoff instead of being failed outright.";
             await ctx.onLog(
               "stderr",
-              `[openclaw-gateway] provider cooldown: ${waitFailureText || errorMessage}`,
+              `[openclaw-gateway] provider cooldown: ${providerRefusalText || errorMessage}`,
             );
             return {
               exitCode: 1,
