@@ -175,6 +175,40 @@ export function detectProviderQuotaExhausted(message: string): boolean {
   return PROVIDER_QUOTA_PATTERNS.some((pattern) => pattern.test(message));
 }
 
+/**
+ * PROVIDER-QUOTA: decide how a provider refusal is reported.
+ *
+ * A quota exhaustion and a provider cooldown OVERLAP: the provider says
+ * "Provider minimax-portal is in cooldown (rate_limit)" and
+ * "Auth profile \"x\" is temporarily unavailable", and both of those also match a
+ * quota/rate-limit shape. They are the same underlying condition - the provider
+ * is refusing work because the account has no capacity - so they must get the
+ * same treatment.
+ *
+ * The ordering matters. The quota verdict wins, because the cooldown branch
+ * ends in a bare `openclaw_gateway_wait_cooldown` with no `errorFamily`, and a
+ * run with no `errorFamily` gets NO bounded retry from the server. Routing a
+ * rate-limit refusal into that branch would defeat the whole point of this
+ * patch: the run would still die with zero retries.
+ */
+export type ProviderRefusalVerdict =
+  | { kind: "provider_quota"; retryable: true }
+  | { kind: "provider_cooldown"; retryable: true }
+  | { kind: "unknown"; retryable: false };
+
+export function classifyProviderRefusal(
+  message: string,
+  cooldownDetected: boolean,
+): ProviderRefusalVerdict {
+  if (detectProviderQuotaExhausted(message)) {
+    return { kind: "provider_quota", retryable: true };
+  }
+  if (cooldownDetected) {
+    return { kind: "provider_cooldown", retryable: true };
+  }
+  return { kind: "unknown", retryable: false };
+}
+
 const COOLDOWN_BACKOFF_SEQUENCE_DEFAULT_MS = [30_000, 60_000, 120_000];
 const COOLDOWN_BACKOFF_MIN_MS = 100;
 const COOLDOWN_BACKOFF_MAX_MS = 10 * 60_000;
@@ -2213,8 +2247,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           // already retries. Report it through the transient-upstream family so the
           // server schedules a bounded retry; otherwise a single quota window kills every
           // heartbeat in the lane for as long as it lasts.
-          const quotaExhausted = detectProviderQuotaExhausted(waitFailureText);
-          if (quotaExhausted && !cooldownSignal) {
+          const refusal = classifyProviderRefusal(waitFailureText, Boolean(cooldownSignal));
+          if (refusal.kind === "provider_quota") {
             const errorMessage =
               `OpenClaw gateway run rejected by the provider (quota or rate limit exhausted): ${waitFailureText}. ` +
               "The provider refused the request because the account's quota or rate limit is exhausted. " +
@@ -2238,15 +2272,41 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
               },
             };
           }
+          if (refusal.kind === "provider_cooldown" && cooldownSignal) {
+            // PROVIDER-QUOTA: a provider cooldown is the same capacity refusal as a
+            // quota exhaustion, just reported with different words. It must carry the
+            // transient-upstream contract too, or it dies here with zero retries -
+            // the exact defect this patch exists to close.
+            const errorMessage =
+              `OpenClaw gateway run rejected by the provider (cooldown): Provider "${cooldownSignal.provider ?? "unknown"}" ` +
+              `reason=${cooldownSignal.reason ?? "unknown"} ${cooldownSignal.untilIso ? `cooldownUntilIso=${cooldownSignal.untilIso}` : ""} cooldownAttempts=${cooldownAttempts}. ` +
+              "The provider is refusing work because the account has no capacity, so the run is retried " +
+              "with backoff instead of being failed outright.";
+            await ctx.onLog(
+              "stderr",
+              `[openclaw-gateway] provider cooldown: ${waitFailureText || errorMessage}`,
+            );
+            return {
+              exitCode: 1,
+              signal: null,
+              timedOut: false,
+              errorMessage,
+              errorCode: "openclaw_gateway_provider_cooldown",
+              errorFamily: "transient_upstream" as const,
+              retryNotBefore: new Date(Date.now() + providerQuotaRetryDelayMs).toISOString(),
+              errorMeta: { reason: "provider_cooldown", phase: "wait" },
+              resultJson: {
+                ...asRecord(waitPayload),
+                ...(cooldownSignal ? { cooldown: { provider: cooldownSignal.provider ?? null, reason: cooldownSignal.reason ?? null, untilIso: cooldownSignal.untilIso ?? null, untilMs: cooldownSignal.untilMs ?? null, attempts: cooldownAttempts, backoffSequenceMs: cooldownBackoffSequence } } : {}),
+              },
+            };
+          }
           return {
             exitCode: 1, signal: null, timedOut: false,
-            errorMessage: cooldownSignal
-              ? `OpenClaw gateway run in cooldown: Provider "${cooldownSignal.provider ?? "unknown"}" reason=${cooldownSignal.reason ?? "unknown"} ${cooldownSignal.untilIso ? `cooldownUntilIso=${cooldownSignal.untilIso}` : ""} cooldownAttempts=${cooldownAttempts}`
-              : nonEmpty(waitPayload?.error) ?? lifecycleError ?? "OpenClaw gateway run failed",
-            errorCode: cooldownSignal ? "openclaw_gateway_wait_cooldown" : "openclaw_gateway_wait_error",
+            errorMessage: nonEmpty(waitPayload?.error) ?? lifecycleError ?? "OpenClaw gateway run failed",
+            errorCode: "openclaw_gateway_wait_error",
             resultJson: {
               ...asRecord(waitPayload),
-              ...(cooldownSignal ? { cooldown: { provider: cooldownSignal.provider ?? null, reason: cooldownSignal.reason ?? null, untilIso: cooldownSignal.untilIso ?? null, untilMs: cooldownSignal.untilMs ?? null, attempts: cooldownAttempts, backoffSequenceMs: cooldownBackoffSequence } } : {}),
             },
           };
         }
