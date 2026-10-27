@@ -287,6 +287,61 @@ export function parseSaturatedMinQueuedSlices(value: unknown): number {
 }
 
 /**
+ * RUAAAAA-5520: why the gateway transport could not carry the request.
+ *
+ * `connect_refused` is the signature of the `openclaw-gateway` listener not being there at
+ * all: the service aborted on a V8 heap OOM and systemd restarted it, so every agent seat on
+ * the host saw `connect ECONNREFUSED 127.0.0.1:18789`. That used to reach the agent as
+ * `openclaw_gateway_request_failed` with the raw socket error as the message, which is
+ * indistinguishable from a provider or agent fault and is not retried.
+ */
+export type GatewayUnreachableReason =
+  | "connect_refused"
+  | "connection_reset"
+  | "connection_closed"
+  | "host_unreachable"
+  | "network_unreachable"
+  | "pipe_closed"
+  | "socket_hang_up";
+
+const GATEWAY_UNREACHABLE_PATTERNS: ReadonlyArray<readonly [RegExp, GatewayUnreachableReason]> = [
+  [/econnrefused/i, "connect_refused"],
+  [/connect\s+refused/i, "connect_refused"],
+  [/econnreset/i, "connection_reset"],
+  [/ehostunreach/i, "host_unreachable"],
+  [/enetunreach/i, "network_unreachable"],
+  [/epipe/i, "pipe_closed"],
+  [/socket hang up/i, "socket_hang_up"],
+];
+
+/**
+ * RUAAAAA-5520: classify a transport-level failure as "the gateway is not there", not
+ * "the provider or the agent failed". Returns null for everything else.
+ */
+export function detectGatewayUnreachable(message: string): GatewayUnreachableReason | null {
+  if (!message) return null;
+  for (const [pattern, reason] of GATEWAY_UNREACHABLE_PATTERNS) {
+    if (pattern.test(message)) return reason;
+  }
+  return null;
+}
+
+/**
+ * RUAAAAA-5520: the gateway can die mid-run, which surfaces as a websocket close with the
+ * abnormal-closure code instead of a connect error (`gateway closed (1006)`). This is only
+ * used on the wait path, where a bare 1006 means the gateway process went away under the run.
+ */
+export function detectGatewayConnectionClosed(message: string): GatewayUnreachableReason | null {
+  if (!message) return null;
+  if (/\b1006\b/.test(message) && /clos/i.test(message)) return "connection_closed";
+  return detectGatewayUnreachable(message);
+}
+
+const UNREACHABLE_RETRY_DELAY_DEFAULT_MS = 15_000;
+const UNREACHABLE_RETRY_DELAY_MIN_MS = 1_000;
+const UNREACHABLE_RETRY_DELAY_MAX_MS = 300_000;
+
+/**
  * RUAAAAA-5310: why a `waitStatus = "timeout"` verdict was reached.
  *
  * `budget_exhausted` means `waitTimeoutMs` really did run out. `slice_cap_exhausted` means the
@@ -1587,6 +1642,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     1_000,
     SATURATED_RETRY_DELAY_MAX_MS,
   );
+  // RUAAAAA-5520: a gateway restart is a bounded-retryable transport failure, not a provider
+  // or agent fault. Report it through the transient-upstream family so Paperclip retries it
+  // after the listener is back instead of failing the run on a raw socket refusal.
+  const unreachableRetryDelayMs = parseSaturatedDuration(
+    ctx.config.unreachableRetryDelayMs,
+    UNREACHABLE_RETRY_DELAY_DEFAULT_MS,
+    UNREACHABLE_RETRY_DELAY_MIN_MS,
+    UNREACHABLE_RETRY_DELAY_MAX_MS,
+  );
   const configuredSessionKey = nonEmpty(ctx.config.sessionKey);
   const sessionKey = resolveSessionKey({
     strategy: sessionKeyStrategy,
@@ -2062,6 +2126,34 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             },
           };
         }
+        const waitFailureText = nonEmpty(waitPayload?.error) ?? lifecycleError ?? "";
+        const waitClosedReason = detectGatewayConnectionClosed(waitFailureText);
+        if (waitClosedReason && !cooldownSignal) {
+          // RUAAAAA-5520: the gateway process went away while the run was in flight (service
+          // restart / crash). Report it as a bounded-retryable transport failure instead of a
+          // generic wait error, so it is not misattributed to the provider.
+          const errorMessage =
+            `OpenClaw gateway connection closed mid-run (${waitClosedReason}): ${waitFailureText}. ` +
+            "The gateway process went away while the run was in flight (service restart or crash), " +
+            "so this is a gateway-side transport failure, not a provider or agent fault.";
+          await ctx.onLog(
+            "stderr",
+            `[openclaw-gateway] gateway connection closed mid-run: ${waitClosedReason}`,
+          );
+          return {
+            exitCode: 1,
+            signal: null,
+            timedOut: false,
+            errorMessage,
+            errorCode: "openclaw_gateway_unreachable",
+            errorFamily: "transient_upstream" as const,
+            retryNotBefore: new Date(Date.now() + unreachableRetryDelayMs).toISOString(),
+            errorMeta: { reason: waitClosedReason, phase: "wait" },
+            resultJson: {
+              ...asRecord(waitPayload),
+            },
+          };
+        }
         if (waitStatus === "error") {
           return {
             exitCode: 1, signal: null, timedOut: false,
@@ -2134,6 +2226,33 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const lower = message.toLowerCase();
       const timedOut = lower.includes("timeout");
       const pairingRequired = lower.includes("pairing required");
+      const unreachableReason = detectGatewayUnreachable(message);
+      if (unreachableReason) {
+        // RUAAAAA-5520: the gateway listener was not there (service restart / crash). Surface a
+        // gateway-specific, bounded-retryable verdict instead of a raw socket refusal, so the
+        // agent sees "the gateway is restarting" and the run is retried once it is back.
+        const endpoint = parsedUrl.toString();
+        const errorMessage =
+          `OpenClaw gateway unreachable at ${endpoint} (${unreachableReason}): ${message}. ` +
+          "The gateway listener is not accepting connections (the openclaw-gateway service is " +
+          "restarting or down), so this is a gateway-side transport failure, not a provider or " +
+          "agent fault.";
+        await ctx.onLog(
+          "stderr",
+          `[openclaw-gateway] gateway unreachable: ${unreachableReason}: ${message}`,
+        );
+        return {
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          errorMessage,
+          errorCode: "openclaw_gateway_unreachable",
+          errorFamily: "transient_upstream" as const,
+          retryNotBefore: new Date(Date.now() + unreachableRetryDelayMs).toISOString(),
+          errorMeta: { reason: unreachableReason, endpoint },
+          resultJson: asRecord(latestResultPayload),
+        };
+      }
 
       if (
         pairingRequired &&
