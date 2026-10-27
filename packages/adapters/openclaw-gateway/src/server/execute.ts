@@ -416,6 +416,86 @@ const PROVIDER_QUOTA_RETRY_DELAY_MIN_MS = 1_000;
 const PROVIDER_QUOTA_RETRY_DELAY_MAX_MS = 60 * 60_000;
 
 /**
+ * RUAAAAA-5548: the gateway binds its listener BEFORE every agent's background startup
+ * inspection has finished. A request that arrives inside that window is refused with
+ *
+ *   "Agent <id> has not completed startup inspection and preparation. Inspection and
+ *    writable admission continue after the Gateway listener binds."
+ *
+ * That refusal is a gateway-side admission state, not an agent or provider fault: the
+ * gateway is still preparing that agent's database and the session is not writable yet.
+ *
+ * Measured on the Odoo bench (2026-10-27, one gateway worker shared by 91 agents): the
+ * refusal window ran 11-13 minutes for the tail seats, because the gateway publishes each
+ * agent's prepared database strictly one at a time. Every bench seat woken inside that
+ * window failed its run outright instead of being retried once its agent was admitted.
+ *
+ * Report it through the transient-upstream family so Paperclip's bounded retry schedule
+ * picks the run up again after the agent is admitted.
+ */
+export type GatewayAdmissionPendingReason = "startup_inspection_pending";
+
+const GATEWAY_ADMISSION_PENDING_PATTERNS: ReadonlyArray<
+  readonly [RegExp, GatewayAdmissionPendingReason]
+> = [[/has not completed startup inspection and preparation/i, "startup_inspection_pending"]];
+
+/**
+ * RUAAAAA-5548: classify a gateway-side admission refusal as "the gateway is still
+ * preparing this agent", not "the agent failed". Returns null for everything else.
+ */
+export function detectGatewayAdmissionPending(message: string): GatewayAdmissionPendingReason | null {
+  if (!message) return null;
+  for (const [pattern, reason] of GATEWAY_ADMISSION_PENDING_PATTERNS) {
+    if (pattern.test(message)) return reason;
+  }
+  return null;
+}
+
+/**
+ * RUAAAAA-5548: the error contract for a run refused because the gateway is still admitting
+ * that agent. Returning it from one pure function keeps the catch block honest and lets the
+ * contract (retryable family + retry floor) be asserted directly by a test.
+ */
+export function buildGatewayAdmissionPendingError(input: {
+  message: string;
+  endpoint: string;
+  retryDelayMs: number;
+  now?: Date;
+}): {
+  errorMessage: string;
+  errorCode: "openclaw_gateway_admission_pending";
+  errorFamily: "transient_upstream";
+  retryNotBefore: string;
+  errorMeta: { reason: GatewayAdmissionPendingReason; endpoint: string };
+} | null {
+  const reason = detectGatewayAdmissionPending(input.message);
+  if (!reason) return null;
+  const now = input.now ?? new Date();
+  const delayMs = Math.max(1_000, Math.floor(input.retryDelayMs));
+  return {
+    errorMessage:
+      "OpenClaw gateway agent admission still pending at " +
+      input.endpoint +
+      " (" +
+      reason +
+      "): " +
+      input.message +
+      ". The gateway binds its listener before the agent's background startup inspection " +
+      "and preparation finish, so this run was refused while the gateway was still " +
+      "admitting the agent. This is a gateway-side admission state, not a provider or " +
+      "agent fault.",
+    errorCode: "openclaw_gateway_admission_pending",
+    errorFamily: "transient_upstream",
+    retryNotBefore: new Date(now.getTime() + delayMs).toISOString(),
+    errorMeta: { reason, endpoint: input.endpoint },
+  };
+}
+
+const ADMISSION_PENDING_RETRY_DELAY_DEFAULT_MS = 30_000;
+const ADMISSION_PENDING_RETRY_DELAY_MIN_MS = 1_000;
+const ADMISSION_PENDING_RETRY_DELAY_MAX_MS = 300_000;
+
+/**
  * RUAAAAA-5310: why a `waitStatus = "timeout"` verdict was reached.
  *
  * `budget_exhausted` means `waitTimeoutMs` really did run out. `slice_cap_exhausted` means the
@@ -1737,6 +1817,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     PROVIDER_QUOTA_RETRY_DELAY_MIN_MS,
     PROVIDER_QUOTA_RETRY_DELAY_MAX_MS,
   );
+  // RUAAAAA-5548: a seat woken while the gateway is still admitting agent databases is
+  // refused by the gateway, not broken. Report it through the transient-upstream family so
+  // Paperclip retries the run once the agent is admitted. The delay is a per-seat knob so
+  // one bench can be given a longer floor than another without touching the fleet.
+  const admissionPendingRetryDelayMs = parseSaturatedDuration(
+    ctx.config.admissionPendingRetryDelayMs,
+    ADMISSION_PENDING_RETRY_DELAY_DEFAULT_MS,
+    ADMISSION_PENDING_RETRY_DELAY_MIN_MS,
+    ADMISSION_PENDING_RETRY_DELAY_MAX_MS,
+  );
   const configuredSessionKey = nonEmpty(ctx.config.sessionKey);
   const sessionKey = resolveSessionKey({
     strategy: sessionKeyStrategy,
@@ -2393,6 +2483,36 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorFamily: "transient_upstream" as const,
           retryNotBefore: new Date(Date.now() + unreachableRetryDelayMs).toISOString(),
           errorMeta: { reason: unreachableReason, endpoint },
+          resultJson: asRecord(latestResultPayload),
+        };
+      }
+
+      // RUAAAAA-5548: the gateway listener is up, but this agent's background startup
+      // inspection and preparation has not finished, so its session is not writable yet.
+      // The gateway is still admitting the agent; report a bounded-retryable verdict so
+      // the run is retried after admission instead of being failed as an agent fault.
+      const admissionPending = buildGatewayAdmissionPendingError({
+        message,
+        endpoint: parsedUrl.toString(),
+        retryDelayMs: admissionPendingRetryDelayMs,
+      });
+      if (admissionPending) {
+        await ctx.onLog(
+          "stderr",
+          "[openclaw-gateway] agent admission pending: " +
+            admissionPending.errorMeta.reason +
+            ": " +
+            message,
+        );
+        return {
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          errorMessage: admissionPending.errorMessage,
+          errorCode: admissionPending.errorCode,
+          errorFamily: admissionPending.errorFamily,
+          retryNotBefore: admissionPending.retryNotBefore,
+          errorMeta: admissionPending.errorMeta,
           resultJson: asRecord(latestResultPayload),
         };
       }
