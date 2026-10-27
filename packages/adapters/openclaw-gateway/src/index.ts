@@ -40,6 +40,7 @@ Request behavior fields:
 - saturatedMinQueuedSlices (number, optional): consecutive queued/not-started agent.wait slices required before declaring saturation (default 3)
 - saturatedRetryDelayMs (number, optional): retryNotBefore floor reported on a saturated run; routes the run into Paperclip's bounded transient retry (default 120000)
 - unreachableRetryDelayMs (number, optional): retryNotBefore floor reported when the gateway transport is unreachable (listener down / process restarted); reported as errorFamily=transient_upstream so Paperclip retries it in bounded fashion instead of failing the run on a raw socket refusal (default 15000)
+- providerQuotaRetryDelayMs (number, optional): retryNotBefore floor reported when the provider refused the run because the account's quota or rate limit is exhausted (HTTP 429 / "Token Plan usage limit reached"); reported as errorFamily=transient_upstream so Paperclip retries it in bounded fashion instead of failing the run (default 300000)
 - autoPairOnFirstConnect (boolean, optional): on first "pairing required", attempt device.pair.list/device.pair.approve via shared auth, then retry once (default true)
 - paperclipApiUrl (string, optional): absolute Paperclip base URL advertised in wake text
 - claimedApiKeyPath (string, optional): path to the claimed API key JSON file read by the agent at wake time (default ~/.openclaw/workspace/paperclip-claimed-api-key.json)

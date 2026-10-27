@@ -136,10 +136,44 @@ const KNOWN_OPERATOR_SCOPES = new Set([
 const COOLDOWN_ERROR_PATTERNS: RegExp[] = [
   /provider\s+([\w.-]+)\s+is in cooldown/i,
   /provider\s+([\w.-]+)\s+is in cooldown\s*\(([^)]+)\)/i,
-  /auth profile\s+'([^']+)'\s+is temporarily unavailable/i,
+  /auth profile\s+(['"])([^'"]+)\1\s+is temporarily unavailable/i,
   /billing\s+cooldown\s+(?:until|expires?\s+at)\s+([\w:./+-]+)/i,
   /(?<![\w-])cooldown(?![\w-])/i,
 ];
+
+/**
+ * RUAAAAA-5548: a provider that refuses the request because the account's quota or
+ * rate limit is exhausted is a TRANSIENT UPSTREAM condition, not an agent fault. The
+ * provider emits these in two shapes that neither the cooldown patterns nor the
+ * gateway-transport patterns match:
+ *
+ *   - "Token Plan usage limit reached: ... (2056) | 429"
+ *   - "Auth profile \"<profile>\" is temporarily unavailable for <provider>/<model>."
+ *
+ * Without this, a quota exhaustion was classified as a terminal wait error, so the
+ * server saw no transient-recovery contract and never scheduled a retry. A provider
+ * quota window then killed every heartbeat in the lane for as long as it lasted,
+ * while the sibling gateway-restart case (RUAAAAA-5520) was already being retried.
+ */
+const PROVIDER_QUOTA_PATTERNS: RegExp[] = [
+  /token plan usage limit reached/i,
+  /usage limit reached/i,
+  /quota (?:exhausted|exceeded|depleted)/i,
+  /insufficient (?:quota|credits|balance)/i,
+  /rate[ _-]?limit(?:ed|ing)?\b/i,
+  /\b429\b/,
+  /auth profile\s+['"][^'"]+['"]\s+is temporarily unavailable/i,
+];
+
+/**
+ * RUAAAAA-5548: true when the message reports a provider-side quota or rate-limit
+ * exhaustion. Returns false for agent faults and for gateway transport failures,
+ * which are classified separately.
+ */
+export function detectProviderQuotaExhausted(message: string): boolean {
+  if (!message) return false;
+  return PROVIDER_QUOTA_PATTERNS.some((pattern) => pattern.test(message));
+}
 
 const COOLDOWN_BACKOFF_SEQUENCE_DEFAULT_MS = [30_000, 60_000, 120_000];
 const COOLDOWN_BACKOFF_MIN_MS = 100;
@@ -341,6 +375,12 @@ const UNREACHABLE_RETRY_DELAY_DEFAULT_MS = 15_000;
 const UNREACHABLE_RETRY_DELAY_MIN_MS = 1_000;
 const UNREACHABLE_RETRY_DELAY_MAX_MS = 300_000;
 
+// RUAAAAA-5548: provider quota windows are typically measured in minutes, not seconds,
+// so the default retry floor is longer than the gateway-restart one.
+const PROVIDER_QUOTA_RETRY_DELAY_DEFAULT_MS = 5 * 60_000;
+const PROVIDER_QUOTA_RETRY_DELAY_MIN_MS = 1_000;
+const PROVIDER_QUOTA_RETRY_DELAY_MAX_MS = 60 * 60_000;
+
 /**
  * RUAAAAA-5310: why a `waitStatus = "timeout"` verdict was reached.
  *
@@ -443,14 +483,17 @@ export function detectCooldownSignal(messages: Array<string | null | undefined>)
   for (const raw of messages) {
     if (typeof raw !== "string" || raw.trim().length === 0) continue;
     const hasInCooldown = /provider\s+[\w.-]+\s+is in cooldown/i.test(raw);
-    const hasAuthProfile = /auth profile\s+'[^']+'\s+is temporarily unavailable/i.test(raw);
+    // RUAAAAA-5548: the provider quotes the profile name with DOUBLE quotes. The
+    // single-quote-only pattern never matched the message this detector was written
+    // for, so the cooldown backoff path did not fire for it.
+    const hasAuthProfile = /auth profile\s+['"][^'"]+['"]\s+is temporarily unavailable/i.test(raw);
     const hasBilling = /billing\s+cooldown/i.test(raw) || /\(\s*billing\s*\)/i.test(raw);
     const hasGenericCooldown = /(?<![\w-])cooldown(?![\w-])/i.test(raw) && /(provider|model|account)/i.test(raw);
     if (hasInCooldown || hasAuthProfile || hasBilling || hasGenericCooldown) {
       let provider: string | undefined;
       const providerMatch = raw.match(/provider\s+([\w.-]+)\s+is in cooldown/i);
       if (providerMatch) provider = providerMatch[1];
-      const profileMatch = raw.match(/auth profile\s+'([^']+)'/i);
+      const profileMatch = raw.match(/auth profile\s+['"]([^'"]+)['"]/i);
       if (!provider && profileMatch) provider = profileMatch[1];
       let untilMs: number | undefined, untilIso: string | undefined;
       const isoMatch = raw.match(/\b(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2}))\b/);
@@ -1651,6 +1694,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     UNREACHABLE_RETRY_DELAY_MIN_MS,
     UNREACHABLE_RETRY_DELAY_MAX_MS,
   );
+  // RUAAAAA-5548: a provider quota exhaustion is a bounded-retryable upstream condition
+  // too. It is reported through the same transient-upstream family as a gateway restart
+  // so the server schedules a bounded retry instead of failing the run outright.
+  const providerQuotaRetryDelayMs = parseSaturatedDuration(
+    ctx.config.providerQuotaRetryDelayMs,
+    PROVIDER_QUOTA_RETRY_DELAY_DEFAULT_MS,
+    PROVIDER_QUOTA_RETRY_DELAY_MIN_MS,
+    PROVIDER_QUOTA_RETRY_DELAY_MAX_MS,
+  );
   const configuredSessionKey = nonEmpty(ctx.config.sessionKey);
   const sessionKey = resolveSessionKey({
     strategy: sessionKeyStrategy,
@@ -2155,6 +2207,37 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           };
         }
         if (waitStatus === "error") {
+          // RUAAAAA-5548: the provider refused the run because the account's quota or
+          // rate limit is exhausted. That is transient upstream, not an agent fault, and
+          // it is exactly the condition the sibling gateway-restart case (RUAAAAA-5520)
+          // already retries. Report it through the transient-upstream family so the
+          // server schedules a bounded retry; otherwise a single quota window kills every
+          // heartbeat in the lane for as long as it lasts.
+          const quotaExhausted = detectProviderQuotaExhausted(waitFailureText);
+          if (quotaExhausted && !cooldownSignal) {
+            const errorMessage =
+              `OpenClaw gateway run rejected by the provider (quota or rate limit exhausted): ${waitFailureText}. ` +
+              "The provider refused the request because the account's quota or rate limit is exhausted. " +
+              "This is a provider-side capacity condition, not an agent fault, so the run is retried " +
+              "with backoff instead of being failed outright.";
+            await ctx.onLog(
+              "stderr",
+              `[openclaw-gateway] provider quota exhausted: ${waitFailureText}`,
+            );
+            return {
+              exitCode: 1,
+              signal: null,
+              timedOut: false,
+              errorMessage,
+              errorCode: "openclaw_gateway_provider_quota",
+              errorFamily: "transient_upstream" as const,
+              retryNotBefore: new Date(Date.now() + providerQuotaRetryDelayMs).toISOString(),
+              errorMeta: { reason: "provider_quota_exhausted", phase: "wait" },
+              resultJson: {
+                ...asRecord(waitPayload),
+              },
+            };
+          }
           return {
             exitCode: 1, signal: null, timedOut: false,
             errorMessage: cooldownSignal
