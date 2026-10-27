@@ -131,6 +131,38 @@ describe("hermes compaction-stall recovery (RUAAAAA-5339)", () => {
     expect(HERMES_COMPACTION_STALL_ERROR_CODE).not.toBe("adapter_failed");
   });
 
+  it("names the run budget and keeps the adapter's own error text", () => {
+    const fixed = applyHermesCompactionStallRecovery(
+      {
+        exitCode: 130,
+        timedOut: false,
+        errorMessage: "hermes: provider refused the request (401)",
+        resultJson: { result: OBSERVED_SPINNER_RESULT },
+      },
+      { timeoutSec: 1800 },
+    );
+    // The budget is what tells an operator-raised 1800s apart from the
+    // adapter's own 300s default - a stall that ate 1800s is a different
+    // incident from one that ate 300s.
+    expect(fixed.errorMessage).toContain("1800s");
+    // The adapter already narrowed stderr down to the lines that look like
+    // real errors, so the stall diagnosis must not throw them away: they are
+    // the only evidence of WHY hermes stalled.
+    expect(fixed.errorMessage).toContain("provider refused the request");
+    expect(fixed.clearSession).toBe(true);
+    expect(fixed.errorCode).toBe(HERMES_COMPACTION_STALL_ERROR_CODE);
+  });
+
+  it("omits the budget when the run budget is unknown", () => {
+    const fixed = applyHermesCompactionStallRecovery({
+      exitCode: 130,
+      timedOut: false,
+      resultJson: { result: OBSERVED_SPINNER_RESULT },
+    });
+    expect(fixed.errorMessage).toContain("compaction");
+    expect(fixed.errorMessage).not.toContain("run budget");
+  });
+
   it("leaves a run that did not time out untouched", () => {
     const original = { exitCode: 0, timedOut: false, resultJson: { result: OBSERVED_SPINNER_RESULT } };
     expect(applyHermesCompactionStallRecovery(original)).toBe(original);

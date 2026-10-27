@@ -235,6 +235,7 @@ export function isHermesNonSuccessExit(input: {
  */
 export function applyHermesCompactionStallRecovery<TResult extends CompactionStallCarrier>(
   result: TResult,
+  options: { timeoutSec?: number | null } = {},
 ): TResult {
   if (
     !isHermesNonSuccessExit({
@@ -251,10 +252,29 @@ export function applyHermesCompactionStallRecovery<TResult extends CompactionSta
   const spinnerLines = String(scraped).split(/\r?\n/).filter((line) => line.trim().length > 0).length;
   const signal = result.signal ? `, signal ${result.signal}` : "";
   const exit = typeof result.exitCode === "number" ? `, exit ${result.exitCode}` : "";
+  // RUAAAAA-5339: name the budget the run was given. The bare "Timed out"
+  // the server falls back to names neither the cause nor the budget, and the
+  // budget is what tells an operator-raised 1800s apart from the adapter's
+  // own 300s default.
+  const budget =
+    typeof options.timeoutSec === "number" &&
+    Number.isFinite(options.timeoutSec) &&
+    options.timeoutSec > 0
+      ? `run budget ${options.timeoutSec}s`
+      : "";
+  // RUAAAAA-5339: keep the adapter's own error text next to the stall
+  // diagnosis. `parseHermesOutput` already narrowed stderr down to the lines
+  // that look like real errors, so overwriting it would throw away the only
+  // evidence of WHY hermes stalled.
+  const detail =
+    typeof result.errorMessage === "string" && result.errorMessage.trim().length > 0
+      ? ` Adapter also reported: ${result.errorMessage.trim().slice(0, 400)}`
+      : "";
   const errorMessage =
-    `Hermes stalled in context compaction for the whole run budget (${spinnerLines} ` +
-    `progress lines, no assistant output${signal}${exit}); session dropped so the next ` +
-    `dispatch starts fresh. See RUAAAAA-5339.`;
+    `Hermes stalled in context compaction for the whole run` +
+    (budget ? ` (${budget})` : "") +
+    ` (${spinnerLines} progress lines, no assistant output${signal}${exit}); session dropped so ` +
+    `the next dispatch starts fresh. See RUAAAAA-5339.${detail}`;
 
   logger.warn(
     { spinnerLines, signal: result.signal ?? null },
