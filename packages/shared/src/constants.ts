@@ -249,6 +249,11 @@ export const ISSUE_RECOVERY_ACTION_OUTCOMES = [
   "cancelled",
   "continuing",
   "recovered_by_subsequent_run",
+  // RUAAAAA-5489 (AC6): recorded when the routine_recovery cross-issue
+  // reconciliation itself closed the source issue. "recovered_by_subsequent_run"
+  // asserts that a RUN did the work; the reconciler is not that run, so it
+  // gets its own outcome instead of borrowing one that says otherwise.
+  "auto_cleared_by_reconciliation",
 ] as const;
 export type IssueRecoveryActionOutcome = (typeof ISSUE_RECOVERY_ACTION_OUTCOMES)[number];
 
