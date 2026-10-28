@@ -18,7 +18,10 @@ import {
   companies,
   createDb,
   heartbeatRuns,
+  documentRevisions,
+  documents,
   issueComments,
+  issueDocuments,
   issues,
   type Db,
 } from "@paperclipai/db";
@@ -513,6 +516,78 @@ describe("reconcileStrandedTimedOutRunLiveness", () => {
       const run = await readRun(ctx.runId);
       expect(run?.livenessState).toBe("advanced");
     }
+  });
+
+  it("reaches a false-terminal row whose only late evidence is a document revision (ABY-896)", async () => {
+    // The sweep's SQL prefilter and the per-row predicate must agree on
+    // what counts as evidence. A comment-only prefilter cannot SEE a row
+    // whose only late own-write is a document revision, so the sweep
+    // reports convergence it had not reached and the row stays frozen.
+    // Measured live: 2 qualifying rows were invisible to the
+    // comment-only prefilter.
+    const ctx = await seedTimedOutRun({ runStatus: "failed", errorCode: "process_lost" });
+    const ownWriteAt = new Date("2026-10-23T00:53:31.526Z");
+    const documentId = randomUUID();
+    await db.insert(documents).values({
+      id: documentId,
+      companyId: ctx.companyId,
+      title: "Work product",
+      latestBody: "Durable write landed after the wait budget expired.",
+    });
+    await db.insert(issueDocuments).values({
+      companyId: ctx.companyId,
+      issueId: ctx.issueId,
+      documentId,
+      key: "work-product",
+    });
+    await db.insert(documentRevisions).values({
+      companyId: ctx.companyId,
+      documentId,
+      revisionNumber: 1,
+      body: "Durable write landed after the wait budget expired.",
+      createdByAgentId: ctx.agentId,
+      createdByRunId: ctx.runId,
+      createdAt: ownWriteAt,
+    });
+
+    const swept = await sweepStrandedRunLiveness(db, { limit: 50 });
+    expect(swept.runIds).toContain(ctx.runId);
+
+    const run = await readRun(ctx.runId);
+    expect(run?.livenessState).toBe("advanced");
+    expect(run?.lastUsefulActionAt?.toISOString()).toBe(ownWriteAt.toISOString());
+  });
+
+  it("does not credit a run for a write that landed in another company (ABY-896)", async () => {
+    // A comment attributed to the run but belonging to a DIFFERENT tenant
+    // is not this run's own write. Crediting the run for it would be a
+    // cross-tenant repair. Measured live: 21 such rows, all correctly
+    // rejected by the per-row predicate - and now by the SQL prefilter
+    // too, so they no longer occupy slots in the sweep's LIMIT window.
+    const ctx = await seedTimedOutRun({ runStatus: "failed", errorCode: "process_lost" });
+    const otherCompanyId = randomUUID();
+    await db.insert(companies).values({
+      id: otherCompanyId,
+      name: "Other Tenant",
+      issuePrefix: otherCompanyId.replace(/-/g, "").slice(0, 8).toUpperCase(),
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issueComments).values({
+      companyId: otherCompanyId,
+      issueId: ctx.issueId,
+      authorAgentId: ctx.agentId,
+      createdByRunId: ctx.runId,
+      body: "A write attributed to this run but belonging to another tenant.",
+      createdAt: new Date("2026-10-23T00:53:31.526Z"),
+      updatedAt: new Date("2026-10-23T00:53:31.526Z"),
+    });
+
+    const swept = await sweepStrandedRunLiveness(db, { limit: 50 });
+    expect(swept.runIds).not.toContain(ctx.runId);
+
+    const run = await readRun(ctx.runId);
+    expect(run?.livenessState).toBe("failed");
+    expect(run?.lastUsefulActionAt).toBeNull();
   });
 
   it("skips a missing run id without throwing", async () => {

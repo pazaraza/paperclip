@@ -644,10 +644,28 @@ export async function sweepStrandedRunLiveness(
         sql`(${heartbeatRuns.status} = 'timed_out' OR ${heartbeatRuns.errorCode} IN ('process_lost', 'execution_handle_lost'))`,
         isNotNull(heartbeatRuns.finishedAt),
         sql`${heartbeatRuns.id} NOT IN (SELECT ${activityLog.runId} FROM ${activityLog} WHERE ${activityLog.action} = ${STRANDED_TIMED_OUT_RUN_LIVENESS_RECONCILED_ACTION} AND ${activityLog.runId} IS NOT NULL)`,
-        // The prefilter must agree with the per-row predicate: a run with no
-        // source issue has no issue to scope its evidence to, so its own
-        // writes count wherever they landed.
-        sql`EXISTS (SELECT 1 FROM ${issueComments} WHERE ${issueComments.createdByRunId} = ${heartbeatRuns.id} AND ${issueComments.createdAt} > ${heartbeatRuns.finishedAt} AND (${heartbeatRuns.contextSnapshot} ->> 'issueId' IS NULL OR ${issueComments.issueId}::text = ${heartbeatRuns.contextSnapshot} ->> 'issueId'))`,
+        // The prefilter must agree with the per-row predicate on what counts
+        // as evidence, in BOTH directions.
+        //
+        // Scoping: a run with no source issue has no issue to scope its
+        // evidence to, so its own writes count wherever they landed. When it
+        // does have one, the evidence must belong to that issue. The company
+        // is always part of the scope - a comment written in another tenant
+        // is not this run's own write, and crediting a run for it would be a
+        // cross-tenant repair.
+        //
+        // Coverage: the per-row predicate reads comments, document revisions,
+        // work products AND non-lifecycle run events. A prefilter that only
+        // looks at comments therefore cannot SEE a row whose only late
+        // evidence is a document revision - the sweep would report
+        // convergence it had not reached. Measured live: 2 qualifying rows
+        // were invisible to the comment-only prefilter.
+        sql`(
+          EXISTS (SELECT 1 FROM ${issueComments} WHERE ${issueComments.createdByRunId} = ${heartbeatRuns.id} AND ${issueComments.companyId} = ${heartbeatRuns.companyId} AND ${issueComments.createdAt} > ${heartbeatRuns.finishedAt} AND (${heartbeatRuns.contextSnapshot} ->> 'issueId' IS NULL OR ${issueComments.issueId}::text = ${heartbeatRuns.contextSnapshot} ->> 'issueId'))
+          OR EXISTS (SELECT 1 FROM ${documentRevisions} INNER JOIN ${issueDocuments} ON ${issueDocuments.documentId} = ${documentRevisions.documentId} WHERE ${documentRevisions.createdByRunId} = ${heartbeatRuns.id} AND ${documentRevisions.companyId} = ${heartbeatRuns.companyId} AND ${issueDocuments.companyId} = ${heartbeatRuns.companyId} AND ${documentRevisions.createdAt} > ${heartbeatRuns.finishedAt} AND ${issueDocuments.key} != ${ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY} AND (${heartbeatRuns.contextSnapshot} ->> 'issueId' IS NULL OR ${issueDocuments.issueId}::text = ${heartbeatRuns.contextSnapshot} ->> 'issueId'))
+          OR EXISTS (SELECT 1 FROM ${issueWorkProducts} WHERE ${issueWorkProducts.createdByRunId} = ${heartbeatRuns.id} AND ${issueWorkProducts.companyId} = ${heartbeatRuns.companyId} AND ${issueWorkProducts.createdAt} > ${heartbeatRuns.finishedAt} AND (${heartbeatRuns.contextSnapshot} ->> 'issueId' IS NULL OR ${issueWorkProducts.issueId}::text = ${heartbeatRuns.contextSnapshot} ->> 'issueId'))
+          OR EXISTS (SELECT 1 FROM ${heartbeatRunEvents} WHERE ${heartbeatRunEvents.runId} = ${heartbeatRuns.id} AND ${heartbeatRunEvents.companyId} = ${heartbeatRuns.companyId} AND ${heartbeatRunEvents.createdAt} > ${heartbeatRuns.finishedAt} AND ${heartbeatRunEvents.eventType} NOT IN (${sql.join(LIFECYCLE_ONLY_RUN_EVENT_TYPES.map((eventType) => sql`${eventType}`), sql`, `)}))
+        )`,
       ),
     )
     // Deterministic order. Without it the LIMIT returns an arbitrary
