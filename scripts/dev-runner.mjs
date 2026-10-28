@@ -514,7 +514,13 @@ async function maybeAutoRestartChild() {
     restartInFlight = false;
     return;
   }
-  if ((devServer.activeRunCount ?? 0) > 0) {
+  // ABY-919: gate on RUNNING runs only. A queued run is persisted work that
+  // survives the restart (the server calls `resumeQueuedRuns` on startup), so
+  // it is not a reason to defer one. Counting queued runs made this gate
+  // structurally unreachable on a busy fleet - the instance never reached zero
+  // active runs, so an idle-guarded restart could never fire.
+  const runningRunCount = devServer.runningRunCount ?? devServer.activeRunCount ?? 0;
+  if (runningRunCount > 0) {
     restartInFlight = false;
     return;
   }
