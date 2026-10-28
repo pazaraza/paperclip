@@ -33,6 +33,8 @@ export const agents = pgTable(
     pausedAt: timestamp("paused_at", { withTimezone: true }),
     permissions: jsonb("permissions").$type<Record<string, unknown>>().notNull().default({}),
     lastHeartbeatAt: timestamp("last_heartbeat_at", { withTimezone: true }),
+    nextTimerDueAt: timestamp("next_timer_due_at", { withTimezone: true }),
+    heartbeatFailureStreak: integer("heartbeat_failure_streak").notNull().default(0),
     metadata: jsonb("metadata").$type<Record<string, unknown>>(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
