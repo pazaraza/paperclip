@@ -11,6 +11,35 @@ const CODEX_REMOTE_COMPACTION_RE = /remote\s+compact\s+task/i;
 const CODEX_USAGE_LIMIT_RE =
   /you(?:'|’)ve hit your usage limit for .+\.\s+switch to another model now,\s+or try again at\s+([^.!\n]+)(?:[.!]|\n|$)/i;
 
+/**
+ * RUAAAAA-5550: the usage-limit refusal WITHOUT a retry window.
+ *
+ * The provider's message has two forms:
+ *
+ *   "You've hit your usage limit for GPT-5.3-Codex-Spark. Switch to another model
+ *    now, or try again at 10:32 PM."          <- has a clock time
+ *   "You've hit your usage limit for GPT-5.3-Codex-Spark. Switch to another model
+ *    now."                                    <- no clock time
+ *
+ * The first form is matched by CODEX_USAGE_LIMIT_RE, which captures the clock time and
+ * gives the run an exact retry floor. The second form matches NOTHING: CODEX_USAGE_LIMIT_RE
+ * requires the "or try again at" clause, and the generic CODEX_TRANSIENT_UPSTREAM_RE has no
+ * "usage limit" alternative. So a quota refusal with no timestamp was classified as a
+ * TERMINAL agent fault - the exact failure this pattern exists to prevent.
+ *
+ * A provider capacity refusal is transient regardless of whether the provider tells us
+ * when to come back. Detect the shape on its own.
+ */
+const CODEX_USAGE_LIMIT_NO_RETRY_AT_RE =
+  /you(?:'|’)ve hit your usage limit for .+\.\s+switch to another model now/i;
+
+/**
+ * RUAAAAA-5550: the default retry floor for a usage-limit refusal that carries no
+ * timestamp. A provider quota window is measured in minutes, not seconds, so this is
+ * deliberately longer than the server's first generic transient backoff (2 minutes).
+ */
+export const CODEX_PROVIDER_QUOTA_RETRY_DELAY_DEFAULT_MS = 5 * 60_000;
+
 export function parseCodexJsonl(stdout: string) {
   let sessionId: string | null = null;
   let finalMessage: string | null = null;
@@ -234,6 +263,16 @@ function parseLocalClockTime(clockText: string, now: Date): Date | null {
   return retryAt;
 }
 
+/**
+ * RUAAAAA-5550: the retry floor for a provider usage-limit refusal.
+ *
+ * When the provider names a clock time ("try again at 10:32 PM"), that exact time is the
+ * floor - the provider is telling us when the capacity comes back.
+ *
+ * When it does not, the refusal is still a capacity refusal and still needs a floor, or
+ * the run dies with no bounded retry at all. The default is applied here so the adapter
+ * always emits a complete retry contract for a recognised quota shape.
+ */
 export function extractCodexRetryNotBefore(input: {
   stdout?: string | null;
   stderr?: string | null;
@@ -241,8 +280,14 @@ export function extractCodexRetryNotBefore(input: {
 }, now = new Date()): Date | null {
   const haystack = buildCodexErrorHaystack(input);
   const usageLimitMatch = haystack.match(CODEX_USAGE_LIMIT_RE);
-  if (!usageLimitMatch) return null;
-  return parseLocalClockTime(usageLimitMatch[1] ?? "", now);
+  if (usageLimitMatch) {
+    const parsed = parseLocalClockTime(usageLimitMatch[1] ?? "", now);
+    if (parsed) return parsed;
+  }
+  if (CODEX_USAGE_LIMIT_NO_RETRY_AT_RE.test(haystack)) {
+    return new Date(now.getTime() + CODEX_PROVIDER_QUOTA_RETRY_DELAY_DEFAULT_MS);
+  }
+  return null;
 }
 
 export function isCodexTransientUpstreamError(input: {
@@ -253,6 +298,10 @@ export function isCodexTransientUpstreamError(input: {
   const haystack = buildCodexErrorHaystack(input);
 
   if (extractCodexRetryNotBefore(input) != null) return true;
+  // RUAAAAA-5550: a usage-limit refusal is a provider CAPACITY refusal. It must be
+  // transient even when the provider gives no clock time, or it is classified as a
+  // terminal agent fault and the lane dies for as long as the quota window lasts.
+  if (CODEX_USAGE_LIMIT_NO_RETRY_AT_RE.test(haystack)) return true;
   if (!CODEX_TRANSIENT_UPSTREAM_RE.test(haystack)) return false;
   // Keep automatic retries scoped to the observed remote-compaction/high-demand
   // failure shape, plus explicit usage-limit windows that tell us when retrying

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  CODEX_PROVIDER_QUOTA_RETRY_DELAY_DEFAULT_MS,
   extractCodexRetryNotBefore,
   isCodexTransientUpstreamError,
   isCodexUnknownSessionError,
@@ -119,6 +120,70 @@ describe("isCodexTransientUpstreamError", () => {
     expect(extractCodexRetryNotBefore({ errorMessage }, now)?.toISOString()).toBe(
       "2026-04-23T04:31:00.000Z",
     );
+  });
+
+  /**
+   * RUAAAAA-5550: a usage-limit refusal with NO clock time is still a provider capacity
+   * refusal, and must still be transient with a retry floor.
+   *
+   * Before this, the message matched NO pattern at all: CODEX_USAGE_LIMIT_RE requires the
+   * "or try again at" clause, and the generic transient pattern has no "usage limit"
+   * alternative. The run was classified as a terminal agent fault with zero retries.
+   */
+  it("classifies a usage-limit refusal without a retry time as transient", () => {
+    const errorMessage =
+      "You've hit your usage limit for GPT-5.3-Codex-Spark. Switch to another model now.";
+    const now = new Date("2026-06-12T22:41:00.000Z");
+
+    expect(isCodexTransientUpstreamError({ errorMessage })).toBe(true);
+    expect(extractCodexRetryNotBefore({ errorMessage }, now)?.toISOString()).toBe(
+      "2026-06-12T22:46:00.000Z",
+    );
+  });
+
+  /**
+   * The production message from the 2026-06-12 CEO lane incident. The provider DOES name
+   * a clock time here, so the exact time must win over the default floor - the provider is
+   * telling us when the capacity comes back and we must not retry earlier than that.
+   *
+   * The clock time is the provider's WALL-CLOCK time in the server's local timezone, so the
+   * assertion is on the local wall clock, not on an absolute UTC instant. (The June incident
+   * ran on a UTC-7 host, which is why the stored value was 03:32Z for a "10:32 PM" message.)
+   */
+  it("prefers the provider's own clock time over the default floor", () => {
+    const errorMessage =
+      "You've hit your usage limit for GPT-5.3-Codex-Spark. Switch to another model now, or try again at 10:32 PM.";
+    const now = new Date("2026-06-12T22:41:00.000Z");
+
+    expect(isCodexTransientUpstreamError({ errorMessage })).toBe(true);
+    const retryAt = extractCodexRetryNotBefore({ errorMessage }, now);
+    expect(retryAt).not.toBeNull();
+    expect(retryAt!.getHours()).toBe(22);
+    expect(retryAt!.getMinutes()).toBe(32);
+    expect(retryAt!.getTime()).toBeGreaterThan(now.getTime());
+    // And specifically NOT the default floor, which would be 22:46 local.
+    expect(retryAt!.getTime()).not.toBe(
+      now.getTime() + CODEX_PROVIDER_QUOTA_RETRY_DELAY_DEFAULT_MS,
+    );
+  });
+
+  /**
+   * A deterministic agent fault must NOT be swept into the retry path. The default floor
+   * only applies to a recognised usage-limit shape.
+   */
+  it("does not give a default floor to a non-quota failure", () => {
+    const now = new Date("2026-06-12T22:41:00.000Z");
+    expect(
+      extractCodexRetryNotBefore(
+        { errorMessage: "Error running remote compact task: {\"error\":{\"message\":\"bad\"}}}" },
+        now,
+      ),
+    ).toBeNull();
+    expect(
+      isCodexTransientUpstreamError({
+        errorMessage: "Error running remote compact task: {\"error\":{\"message\":\"bad\"}}}",
+      }),
+    ).toBe(false);
   });
 
   it("does not classify deterministic compaction errors as transient", () => {
