@@ -6333,7 +6333,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // `process_lost` on every control-plane restart (8,288 rows in the
       // table, 8,286 of them with no pid and no process group at all).
       const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
-      const livenessObservable = tracksLocalChild;
+      // ABY-896 (hermes/codex residual). Whether the control plane could
+      // observe THIS run's liveness is a property of the RUN, not of the
+      // adapter. A locally-observable adapter can still have a run that
+      // carries no handle at all - no pid and no process group - in which
+      // case the control plane never had anything to observe, and asserting
+      // that the process died is the same false verdict the gateway case
+      // had. Measured live: 87.9% of hermes_local runs and 53.0% of
+      // codex_local runs carry no handle, and 351 hermes_local + 126
+      // codex_local rows were stamped `process_lost` on that basis.
+      //
+      // The reaper already knows the distinction for the retry path:
+      // `shouldRetry` is gated on the run actually having a pid or a
+      // process group. The error code must use the same predicate -
+      // otherwise `process_lost` keeps asserting a death that was never
+      // observed, just for a different adapter set.
+      const runHasObservableHandle = !!run.processPid || !!run.processGroupId;
+      const livenessObservable = tracksLocalChild && runHasObservableHandle;
       const processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
       const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
       if (processPidAlive) {
