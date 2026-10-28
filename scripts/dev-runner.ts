@@ -636,7 +636,14 @@ async function maybeAutoRestartChild() {
   if (dirtyPaths.size === 0 && pendingMigrations.length === 0) return;
 
   restartInFlight = true;
-  let health: { devServer?: { enabled?: boolean; autoRestartEnabled?: boolean; activeRunCount?: number } } | null = null;
+  let health: {
+    devServer?: {
+      enabled?: boolean;
+      autoRestartEnabled?: boolean;
+      activeRunCount?: number;
+      runningRunCount?: number;
+    };
+  } | null = null;
   try {
     health = await getDevHealthPayload();
   } catch {
@@ -649,7 +656,12 @@ async function maybeAutoRestartChild() {
     restartInFlight = false;
     return;
   }
-  if ((devServer.activeRunCount ?? 0) > 0) {
+  // ABY-919: gate on RUNNING runs only. A queued run is persisted work that
+  // survives the restart (the server calls `resumeQueuedRuns` on startup), so
+  // it is not a reason to defer one. Counting queued runs made this gate
+  // structurally unreachable on a busy fleet.
+  const runningRunCount = devServer.runningRunCount ?? devServer.activeRunCount ?? 0;
+  if (runningRunCount > 0) {
     restartInFlight = false;
     return;
   }

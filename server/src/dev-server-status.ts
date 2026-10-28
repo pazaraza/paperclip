@@ -21,6 +21,25 @@ export type DevServerHealthStatus = {
   pendingMigrations: string[];
   autoRestartEnabled: boolean;
   activeRunCount: number;
+  /**
+   * The number of runs that are actually EXECUTING right now.
+   *
+   * This - not `activeRunCount` - is what the idle gate must key on.
+   * `activeRunCount` counts queued runs too, and a queued run is
+   * persisted work: it survives a control-plane restart (the startup
+   * path calls `resumeQueuedRuns`), so a restart cannot lose it.
+   * Counting queued runs toward "is the instance idle" therefore
+   * measures the queue depth, not the restart risk.
+   *
+   * Measured on this control plane (ABY-919): over the 6-hour window
+   * 10:22Z-16:23Z the instance had **zero** idle minutes by the
+   * queued+running definition (minimum 4 active at every sample), while
+   * the running-only definition reached 0 on 20 of 723 20-second
+   * samples. The queued+running gate is therefore structurally
+   * unreachable on a busy fleet, and an idle-guarded restart that keys
+   * on it can never fire.
+   */
+  runningRunCount: number;
   waitingForIdle: boolean;
   lastRestartAt: string | null;
 };
@@ -78,7 +97,7 @@ export function readPersistedDevServerStatus(
 
 export function toDevServerHealthStatus(
   persisted: PersistedDevServerStatus,
-  opts: { autoRestartEnabled: boolean; activeRunCount: number },
+  opts: { autoRestartEnabled: boolean; activeRunCount: number; runningRunCount?: number },
 ): DevServerHealthStatus {
   const hasPathChanges = persisted.changedPathCount > 0;
   const hasPendingMigrations = persisted.pendingMigrations.length > 0;
@@ -102,7 +121,10 @@ export function toDevServerHealthStatus(
     pendingMigrations: persisted.pendingMigrations,
     autoRestartEnabled: opts.autoRestartEnabled,
     activeRunCount: opts.activeRunCount,
-    waitingForIdle: restartRequired && opts.autoRestartEnabled && opts.activeRunCount > 0,
+    runningRunCount: opts.runningRunCount ?? opts.activeRunCount,
+    // The gate keys on RUNNING runs only. A queued run is persisted work
+    // that survives the restart, so it is not a reason to defer one.
+    waitingForIdle: restartRequired && opts.autoRestartEnabled && (opts.runningRunCount ?? opts.activeRunCount) > 0,
     lastRestartAt: persisted.lastRestartAt,
   };
 }

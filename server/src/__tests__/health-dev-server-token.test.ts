@@ -108,6 +108,7 @@ describe("GET /health dev-server supervisor access", () => {
           pendingMigrations: [],
           autoRestartEnabled: true,
           activeRunCount: 0,
+          runningRunCount: 0,
           waitingForIdle: false,
           lastRestartAt: "2026-03-20T11:30:00.000Z",
         },
