@@ -131,6 +131,7 @@ describeEmbeddedPostgres("heartbeat timer baseline on failed runs (ABY-901)", ()
     return rows.filter((row) => row.reason === "heartbeat_timer").length;
   }
 
+
   it("does not advance the timer baseline by a full interval when a run times out", async () => {
     const { agentId } = await seedLane({
       intervalSec: SIX_HOURS_SEC,
@@ -238,14 +239,13 @@ describeEmbeddedPostgres("heartbeat timer baseline on failed runs (ABY-901)", ()
     const wakesBefore = await countTimerWakes(agentId);
 
     // Well inside the 6h interval: 5 minutes after the backoff deadline.
-    const result = await heartbeat.tickTimers(new Date(dueAt.getTime() + 5 * 60 * 1000));
+    await heartbeat.tickTimers(new Date(dueAt.getTime() + 5 * 60 * 1000));
 
-    expect(result.enqueued).toBe(1);
     const wakesAfter = await countTimerWakes(agentId);
     expect(wakesAfter).toBe(wakesBefore + 1);
 
     // AC2: the re-dispatch happened minutes after the failure, not 6 hours.
-    const gapMs = dueAt.getTime() + 5 * 60 * 1000 - dueAt.getTime();
+    const gapMs = 5 * 60 * 1000;
     expect(gapMs).toBeLessThan(SIX_HOURS_SEC * 1000);
   });
 
@@ -261,8 +261,9 @@ describeEmbeddedPostgres("heartbeat timer baseline on failed runs (ABY-901)", ()
       .set({ nextTimerDueAt: dueAt, heartbeatFailureStreak: 1 })
       .where(eq(agents.id, agentId));
 
-    const result = await heartbeat.tickTimers(new Date(dueAt.getTime() - 1000));
-    expect(result.enqueued).toBe(0);
+    const wakesBefore = await countTimerWakes(agentId);
+    await heartbeat.tickTimers(new Date(dueAt.getTime() - 1000));
+    expect(await countTimerWakes(agentId)).toBe(wakesBefore);
   });
 
   it("keeps the normal interval behaviour for a healthy lane", async () => {
@@ -272,12 +273,14 @@ describeEmbeddedPostgres("heartbeat timer baseline on failed runs (ABY-901)", ()
     });
 
     // 5 minutes after the last heartbeat: not due yet.
-    const early = await heartbeat.tickTimers(new Date("2026-10-28T00:05:00.000Z"));
-    expect(early.enqueued).toBe(0);
+    const earlyBefore = await countTimerWakes(agentId);
+    await heartbeat.tickTimers(new Date("2026-10-28T00:05:00.000Z"));
+    expect(await countTimerWakes(agentId)).toBe(earlyBefore);
 
     // After the full interval: due.
-    const due = await heartbeat.tickTimers(new Date("2026-10-28T06:00:01.000Z"));
-    expect(due.enqueued).toBe(1);
+    const dueBefore = await countTimerWakes(agentId);
+    await heartbeat.tickTimers(new Date("2026-10-28T06:00:01.000Z"));
+    expect(await countTimerWakes(agentId)).toBe(dueBefore + 1);
   });
 
   it("does not re-dispatch the same lane repeatedly while a retry is in flight", async () => {
@@ -293,13 +296,14 @@ describeEmbeddedPostgres("heartbeat timer baseline on failed runs (ABY-901)", ()
       .where(eq(agents.id, agentId));
 
     const at = new Date(dueAt.getTime() + 1000);
-    const first = await heartbeat.tickTimers(at);
-    expect(first.enqueued).toBe(1);
+    const before = await countTimerWakes(agentId);
+    await heartbeat.tickTimers(at);
+    expect(await countTimerWakes(agentId)).toBe(before + 1);
 
-    // The deadline is consumed when the retry is dispatched, so a second tick
-    // must not enqueue another run for the same lane.
-    const second = await heartbeat.tickTimers(at);
-    expect(second.enqueued).toBe(0);
+    // The deadline is pushed forward while the retry is in flight, so a second
+    // tick must not enqueue another run for the same lane.
+    await heartbeat.tickTimers(at);
+    expect(await countTimerWakes(agentId)).toBe(before + 1);
   });
 
   it("keeps status:'error' as a meaningful signal after a failure", async () => {
@@ -318,7 +322,8 @@ describeEmbeddedPostgres("heartbeat timer baseline on failed runs (ABY-901)", ()
       .set({ nextTimerDueAt: dueAt, heartbeatFailureStreak: 1 })
       .where(eq(agents.id, agentId));
 
-    const result = await heartbeat.tickTimers(new Date(dueAt.getTime() + 1000));
-    expect(result.enqueued).toBe(1);
+    const before = await countTimerWakes(agentId);
+    await heartbeat.tickTimers(new Date(dueAt.getTime() + 1000));
+    expect(await countTimerWakes(agentId)).toBe(before + 1);
   });
 });
