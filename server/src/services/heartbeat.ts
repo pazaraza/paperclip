@@ -77,7 +77,12 @@ import {
 } from "./heartbeat-stop-metadata.js";
 import {
   classifyAndPersistRunLiveness as classifyAndPersistRunLivenessForRun,
+  sweepStrandedRunLiveness as sweepStrandedRunLivenessRows,
 } from "./run-liveness-reconcile.js";
+import {
+  LOCALLY_OBSERVABLE_ADAPTERS,
+  UNOBSERVED_LIVENESS_ERROR_CODE,
+} from "./run-liveness-observability.js";
 import { logActivity, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
 import {
   buildWorkspaceReadyComment,
@@ -306,15 +311,15 @@ function mergeAdapterRecoveryMetadata(input: {
   };
 }
 const RUNNING_ISSUE_WAKE_REASONS_REQUIRING_FOLLOWUP = new Set(["approval_approved"]);
-const SESSIONED_LOCAL_ADAPTERS = new Set([
-  "claude_local",
-  "codex_local",
-  "cursor",
-  "gemini_local",
-  "hermes_local",
-  "opencode_local",
-  "pi_local",
-]);
+// The set of adapters whose runs execute as a local child process the
+// control plane spawned, and whose liveness it can therefore observe
+// with a pid / process-group probe.
+//
+// "openclaw_gateway" is deliberately absent: the agent runs inside the
+// OpenClaw gateway's process tree, not inside Paperclip's, so the
+// control plane holds no handle it could observe. The shared module
+// documents the measured consequences (ABY-870 / ABY-896).
+const SESSIONED_LOCAL_ADAPTERS = LOCALLY_OBSERVABLE_ADAPTERS;
 const INLINE_BASE64_IMAGE_DATA_RE = /("type":"image","source":\{"type":"base64","data":")([A-Za-z0-9+/=]{1024,})(")/g;
 
 type RuntimeConfigSecretResolver = Pick<
@@ -2185,6 +2190,19 @@ async function terminateHeartbeatRunProcess(input: {
           : null,
     },
     input.graceMs ? { forceAfterMs: input.graceMs } : undefined,
+  );
+}
+
+function buildUnobservedLivenessMessage(adapterType: string) {
+  // ABY-870 / ABY-896. The message must not claim the process died: the
+  // control plane never held a handle to it. It records what did happen
+  // - the control plane lost the handle to the execution - and that the
+  // agent may still be running. Rows carrying this text are reconciled
+  // by the late-evidence repair path if the agent does land writes.
+  return (
+    "Execution handle lost -- the control plane could not observe this run's liveness " +
+    `(adapter ${adapterType} executes outside the control plane's process tree), ` +
+    "so it cannot conclude the agent stopped"
   );
 }
 
@@ -6248,6 +6266,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return classifyAndPersistRunLivenessForRun(db, run, resultJson);
   }
 
+  /**
+   * ABY-896 acceptance criterion 2: a process group can be shared by
+   * more than one agent's run. Killing such a group takes down the
+   * other agent's live work, and the group is not ours to kill.
+   *
+   * Measured live: process group ids 10700 and 98970 are each
+   * shared by two distinct agents' runs. The check is deliberately
+   * conservative - any other run (not just another agent's) in the
+   * same group means we do not kill it.
+   */
+  async function isProcessGroupSharedWithAnotherRun(
+    processGroupId: number | null,
+    runId: string,
+  ): Promise<boolean> {
+    if (!processGroupId) return false;
+    const rows = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.processGroupId, processGroupId),
+          sql`${heartbeatRuns.id} <> ${runId}`
+        ),
+      )
+      .limit(8);
+    return rows.length > 0;
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
@@ -6274,7 +6320,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (now.getTime() - refTime < staleThresholdMs) continue;
       }
 
+      // ABY-870 / ABY-896. The control plane can only conclude that a
+      // process died if it held a handle to that process and observed it
+      // gone. For an adapter whose execution it cannot observe (the
+      // openclaw_gateway agent runs in the gateway's process tree, so
+      // processPid / processGroupId are null), the absence of a handle
+      // is not evidence of death: it is the expected state.
+      //
+      // The old guard short-circuited on `tracksLocalChild &&
+      // run.processPid` and so evaluated to false *by construction, not
+      // by observation*, stamping every live gateway-backed run
+      // `process_lost` on every control-plane restart (8,288 rows in the
+      // table, 8,286 of them with no pid and no process group at all).
       const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
+      const livenessObservable = tracksLocalChild;
       const processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
       const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
       if (processPidAlive) {
@@ -6301,26 +6360,45 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       let descendantOnlyCleanup = false;
       if (processGroupAlive) {
-        descendantOnlyCleanup = true;
-        await terminateHeartbeatRunProcess({
-          pid: run.processPid,
-          processGroupId: run.processGroupId,
-        });
+        // ABY-896 acceptance criterion 2: never arm a process-group kill
+        // against a group that another agent's run also sits in. Killing
+        // a shared group takes down the other agent's live work, and the
+        // group is not ours to kill. Two group ids in the table (10700,
+        // 98970) are each shared by two distinct agents' runs.
+        const groupIsShared = await isProcessGroupSharedWithAnotherRun(run.processGroupId, run.id);
+        if (!groupIsShared) {
+          descendantOnlyCleanup = true;
+          await terminateHeartbeatRunProcess({
+            pid: run.processPid,
+            processGroupId: run.processGroupId,
+          });
+        }
       }
 
       const shouldRetry = tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 1;
-      const baseMessage = buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
+      // ABY-870 / ABY-896. The error code has to say what was actually
+      // observed. "process_lost" asserts that a process died; the reaper
+      // can only make that claim when it held a handle to the process and
+      // saw it gone. When liveness was NOT observable, the only true
+      // statement is that the control plane lost the execution handle -
+      // the agent may well still be running. Stamping "process_lost" in
+      // that case is what made a false verdict indistinguishable from a
+      // true one, and it is the code the repair path keys on.
+      const errorCode = livenessObservable ? "process_lost" : UNOBSERVED_LIVENESS_ERROR_CODE;
+      const baseMessage = livenessObservable
+        ? buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined)
+        : buildUnobservedLivenessMessage(adapterType);
 
       let finalizedRun = await setRunStatus(run.id, "failed", {
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
-        errorCode: "process_lost",
+        errorCode,
         finishedAt: now,
         resultJson: mergeRunStopMetadataForAgent(
           { adapterType, adapterConfig },
           "failed",
           {
             resultJson: parseObject(run.resultJson),
-            errorCode: "process_lost",
+            errorCode,
             errorMessage: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
           },
         ),
@@ -6391,6 +6469,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function reconcileStrandedAssignedIssues() {
     return recovery.reconcileStrandedAssignedIssues();
+  }
+
+  /**
+   * ABY-870 / ABY-896. Repair pass for run rows that were finalized on a
+   * false terminal and then went on to land durable writes.
+   *
+   * Deliberately independent of the issue status: the false stamp is
+   * itself what moves the issue to `blocked`, so a repair that only ran
+   * for `todo` / `in_progress` issues could never reach the rows that
+   * need it most.
+   */
+  async function sweepStrandedRunLiveness(opts?: { limit?: number }) {
+    return sweepStrandedRunLivenessRows(db, opts);
   }
 
   function issueIdFromRunContext(contextSnapshot: unknown) {
@@ -9527,6 +9618,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     },
 
     reconcileStrandedAssignedIssues,
+    sweepStrandedRunLiveness,
 
     buildIssueGraphLivenessAutoRecoveryPreview,
 

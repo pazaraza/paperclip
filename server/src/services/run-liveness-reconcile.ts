@@ -17,7 +17,7 @@
  * service calling back into `heartbeat.ts` would be a circular import.
  * Both callers now share one implementation.
  */
-import { and, desc, eq, notInArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "@paperclipai/shared";
 import {
@@ -36,9 +36,11 @@ import { logActivity } from "./activity-log.js";
 import { getIssueContinuationSummaryDocument } from "./issue-continuation-summary.js";
 import {
   classifyRunLiveness,
+  hasConcreteActionEvidence,
   type RunLivenessClassification,
   type RunLivenessClassificationInput,
 } from "./run-liveness.js";
+import { UNOBSERVED_LIVENESS_ERROR_CODES } from "./run-liveness-observability.js";
 
 /**
  * Activity actions that are liveness bookkeeping rather than task
@@ -270,12 +272,15 @@ export async function classifyAndPersistRunLiveness(
 export type StrandedTimedOutRunReconcileSkipReason =
   | "run_missing"
   | "not_timed_out"
+  | "not_false_terminal"
   | "no_finished_at"
   | "no_late_evidence"
   | "already_reconciled";
 
 export interface StrandedTimedOutRunReconcileInput {
   runStatus: string;
+  /** The run error code, when it carries one. */
+  errorCode?: string | null;
   finishedAt: Date | null;
   latestEvidenceAt: Date | null;
 }
@@ -294,10 +299,29 @@ export type StrandedTimedOutRunReconcileDecision =
  * the same evidence the first one already read, so re-running it is pure
  * churn on an already-settled row.
  */
+function buildRepairedLivenessReason(runStatus: string, errorCode?: string | null): string {
+  return (
+    "Run was finalized without observable liveness (" +
+    (errorCode ?? runStatus) +
+    ") but the run produced durable writes afterwards, so the run was still advancing"
+  );
+}
+
+export function isFalseTerminalRun(runStatus: string, errorCode?: string | null): boolean {
+  if (runStatus === "timed_out") return true;
+  if (runStatus !== "failed") return false;
+  return UNOBSERVED_LIVENESS_ERROR_CODES.has(errorCode ?? "");
+}
+
 export function decideStrandedTimedOutRunReconcile(
   input: StrandedTimedOutRunReconcileInput,
 ): StrandedTimedOutRunReconcileDecision {
-  if (input.runStatus !== "timed_out") return { reconcile: false, reason: "not_timed_out" };
+  if (!isFalseTerminalRun(input.runStatus, input.errorCode)) {
+    return {
+      reconcile: false,
+      reason: input.runStatus === "failed" ? "not_false_terminal" : "not_timed_out",
+    };
+  }
   if (!input.finishedAt) return { reconcile: false, reason: "no_finished_at" };
   if (!input.latestEvidenceAt) return { reconcile: false, reason: "no_late_evidence" };
   if (input.latestEvidenceAt.getTime() <= input.finishedAt.getTime()) {
@@ -472,6 +496,7 @@ export async function reconcileStrandedTimedOutRunLiveness(
   const latestOwnWriteAt = await latestRunOwnWriteAt(db, run, contextIssueId);
   const decision = decideStrandedTimedOutRunReconcile({
     runStatus: run.status,
+    errorCode: run.errorCode,
     finishedAt: dateValue(run.finishedAt),
     latestEvidenceAt: latestOwnWriteAt,
   });
@@ -490,9 +515,28 @@ export async function reconcileStrandedTimedOutRunLiveness(
       latestEvidenceAt: latestOwnWriteAt,
     },
   });
+  // ABY-870 / ABY-896. classifyRunLiveness promotes a timed_out run with
+  // concrete evidence to advanced, but a failed row never gets that
+  // override - by design, because a genuinely failed run did stop. For
+  // the false-terminal family the premise is different: the run was
+  // finalized on the strength of an unobservable absence, and its own
+  // writes landed afterwards, which is positive evidence the agent was
+  // working. Promote it here, where that premise is established, rather
+  // than weakening the classifier for every failed run.
+  const repaired =
+    classification.livenessState === "failed" &&
+    hasConcreteActionEvidence(evidence) &&
+    isFalseTerminalRun(run.status, run.errorCode)
+      ? {
+          ...classification,
+          livenessState: "advanced" as const,
+          livenessReason: buildRepairedLivenessReason(run.status, run.errorCode),
+          lastUsefulActionAt: latestOwnWriteAt,
+        }
+      : classification;
 
-  const persisted = await persistRunLivenessClassification(db, run, classification);
-  const livenessState = persisted?.livenessState ?? classification.livenessState;
+  const persisted = await persistRunLivenessClassification(db, run, repaired);
+  const livenessState = persisted?.livenessState ?? repaired.livenessState;
   const lateEvidenceAt = persisted?.lastUsefulActionAt ?? decision.lateEvidenceAt;
 
   await logActivity(db, {
@@ -530,4 +574,77 @@ export async function reconcileStrandedTimedOutRunLiveness(
     livenessState,
     lateEvidenceAt,
   };
+}
+
+/**
+ * ABY-870 / ABY-896. A sweep for false-terminal rows that carry late
+ * own-writes, run independently of any issue's status.
+ *
+ * The recovery path reaches the reconciler only for issues in
+ * `todo` / `in_progress` (see `reconcileStrandedAssignedIssues`), and
+ * only for a `latestRun` whose `retryReason` is
+ * `issue_continuation_needed`. That is the wrong shape for this
+ * repair: the false stamp itself moves the issue to `blocked`, so
+ * the moment a late write proves the stamp wrong, the issue has
+ * already left the set of issues the recovery path visits. The
+ * repair then never runs, and the row stays frozen at `failed`
+ * forever.
+ *
+ * This was observed live on ABY-843: run `dc98135b` was stamped
+ * `timed_out` at 05:03:37.681Z, the issue was blocked 38 ms later,
+ * and the run's own comment landed at 05:03:43.981Z - six seconds
+ * after the stamp, and after the issue had left the candidate set.
+ * The run row is still `failed` today.
+ *
+ * The sweep therefore starts from the RUN rows, not the issue rows:
+ * every run in the false-terminal family that has not been
+ * reconciled yet is offered to the same per-row repair. The
+ * per-row predicate (`latestRunOwnWriteAt` strictly after
+ * `finishedAt`) still decides whether it actually qualifies, so
+ * this cannot manufacture a repair.
+ */
+export async function sweepStrandedRunLiveness(
+  db: Db,
+  opts?: { limit?: number },
+): Promise<{ scanned: number; reconciled: number; runIds: string[] }> {
+  const limit = Math.max(1, Math.min(opts?.limit ?? 200, 1000));
+  // The candidate query must select rows that actually carry late
+  // own-writes, not every false-terminal row. The false-terminal
+  // family is large (18,676 rows live at the time of writing) while
+  // the rows that qualify are the handful whose own writes landed
+  // after the stamp (35 live). Selecting the whole family and
+  // filtering in memory would page past the qualifying rows and
+  // never repair them.
+  //
+  // The durable evidence sources here are the same ones
+  // `latestRunOwnWriteAt` reads, so the SQL prefilter and the
+  // per-row predicate agree on what counts as evidence.
+  const candidateRows = await db
+    .select({ id: heartbeatRuns.id, status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+    .from(heartbeatRuns)
+    .where(
+      and(
+        sql`${heartbeatRuns.status} IN ('failed', 'timed_out')`,
+        isNotNull(heartbeatRuns.finishedAt),
+        sql`${heartbeatRuns.id} NOT IN (SELECT ${activityLog.runId} FROM ${activityLog} WHERE ${activityLog.action} = ${STRANDED_TIMED_OUT_RUN_LIVENESS_RECONCILED_ACTION} AND ${activityLog.runId} IS NOT NULL)`,
+        sql`EXISTS (SELECT 1 FROM ${issueComments} WHERE ${issueComments.createdByRunId} = ${heartbeatRuns.id} AND ${issueComments.createdAt} > ${heartbeatRuns.finishedAt})`,
+      ),
+    )
+    .limit(limit)
+    .then((rows) => rows);
+
+  const candidates = candidateRows.filter((row) =>
+    isFalseTerminalRun(row.status, row.errorCode),
+  );
+
+  let scanned = 0;
+  const reconciledRunIds: string[] = [];
+  for (const row of candidates) {
+    if (reconciledRunIds.length >= limit) break;
+    scanned += 1;
+    const result = await reconcileStrandedTimedOutRunLiveness(db, row.id);
+    if (result.reconciled) reconciledRunIds.push(row.id);
+  }
+
+  return { scanned, reconciled: reconciledRunIds.length, runIds: reconciledRunIds };
 }

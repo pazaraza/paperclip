@@ -824,6 +824,22 @@ export async function startServer(): Promise<StartedServer> {
           }
         })
         .then(async () => {
+          // ABY-870 / ABY-896. Repair run rows that were finalized on a
+          // false terminal and then went on to land durable writes.
+          //
+          // This runs outside the issue-graph pass on purpose. The false
+          // stamp is what moves an issue to `blocked`, so a repair that
+          // only visited `todo` / `in_progress` issues would never reach
+          // the rows it exists to fix.
+          const swept = await heartbeat.sweepStrandedRunLiveness();
+          if (swept.reconciled > 0) {
+            logger.warn(
+              { reconciled: swept.reconciled, scanned: swept.scanned, runIds: swept.runIds },
+              "stranded run liveness sweep repaired false-terminal rows",
+            );
+          }
+        })
+        .then(async () => {
           const scanned = await heartbeat.scanSilentActiveRuns();
           if (scanned.created > 0 || scanned.escalated > 0) {
             logger.warn({ ...scanned }, "periodic active-run output watchdog created review work");
