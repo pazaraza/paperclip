@@ -9,6 +9,7 @@ import {
   getAdapterSessionManagement,
 } from "@paperclipai/adapter-utils";
 import {
+  applyHermesCompactionStallRecovery,
   applyHermesSessionContentionRecovery,
   createGuardedHermesSessionCodec,
   isHermesSessionId,
@@ -707,10 +708,29 @@ const hermesLocalAdapter: ServerAdapterModule = {
         "[hermes_local] adapter reported a session id that is not a hermes session id; dropping it (RUAAAAA-5244)",
       );
     }
-    return applyHermesSessionContentionRecovery(
+    // RUAAAAA-5339: a run that burns its whole budget in hermes' own context
+    // compaction produces no turns and keeps the same wedged session, so the
+    // next dispatch resumes it and fails identically. Drop the session and
+    // name the cause instead of recording a bare "Timed out".
+    const recovered = applyHermesSessionContentionRecovery(
       sanitizeHermesExecutionResult(hermesResult),
       capturedStderr,
     );
+    // The adapter resolves its budget from `agent.adapterConfig.timeoutSec`
+    // and falls back to its own default, which its shipped config doc states
+    // as "timeoutSec | number | 300" (the constant is not exported by the
+    // package). Name the same budget in the stall diagnosis: the
+    // operator-raised 1800s and the adapter's own 300s default mean very
+    // different things.
+    const HERMES_DEFAULT_TIMEOUT_SEC = 300;
+    const configuredTimeoutSec = existingConfig.timeoutSec;
+    const timeoutSec =
+      typeof configuredTimeoutSec === "number" &&
+      Number.isFinite(configuredTimeoutSec) &&
+      configuredTimeoutSec > 0
+        ? configuredTimeoutSec
+        : HERMES_DEFAULT_TIMEOUT_SEC;
+    return applyHermesCompactionStallRecovery(recovered, { timeoutSec });
   },
   testEnvironment: (ctx) => hermesTestEnvironment(normalizeHermesConfig(ctx) as never),
   sessionCodec: createGuardedHermesSessionCodec(hermesSessionCodec, (rejections) => {
