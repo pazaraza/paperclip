@@ -589,6 +589,28 @@ process.on("SIGTERM", () => {
   void shutdown("SIGTERM");
 });
 
+// RUAAAAA-5497: fail fast with ONE actionable message when a workspace package
+// link is missing. Before this, a missing link (for example
+// packages/db/node_modules/@paperclipai/shared) made every start die with
+// ERR_MODULE_NOT_FOUND and systemd restarted the unit every 10s - 53 restarts
+// in 10 minutes on 2026-10-27. Exiting 78 (EX_CONFIG) is what lets
+// RestartPreventExitStatus=78 keep systemd from repeating a deterministic
+// failure; paperclip-workspace-links.timer restores the links and starts the
+// control plane again once they resolve.
+{
+  let preflightExitCode = 0;
+  try {
+    const preflight = await import("./preflight-workspace-links.mjs");
+    preflightExitCode = await preflight.runPreflight([]);
+  } catch (error) {
+    // The preflight must never be the reason the control plane stays down.
+    console.error("[paperclip] workspace-link preflight could not run:", error);
+  }
+  if (preflightExitCode !== 0) {
+    process.exit(preflightExitCode);
+  }
+}
+
 await maybePreflightMigrations();
 await startServerChild();
 installDevIntervals();

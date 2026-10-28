@@ -23,6 +23,66 @@ import { logger } from "../middleware/logger.js";
 const HERMES_STDERR_CAPTURE_LIMIT = 16 * 1024;
 
 /**
+ * RUAAAAA-5440: the absolute path of an agent's stored Paperclip API key file.
+ *
+ * The path is safe to hand to an agent; the token it holds is not. hermes_local
+ * needs it because the adapter's env injection cannot reach the process that
+ * runs the turn (see buildHermesAuthGuardPrompt).
+ */
+function resolveHermesClaimedApiKeyPath(agent: { id: string; adapterConfig?: unknown }): string | null {
+  const adapterConfig =
+    agent.adapterConfig && typeof agent.adapterConfig === "object"
+      ? (agent.adapterConfig as Record<string, unknown>)
+      : null;
+  const rawPath = adapterConfig?.claimedApiKeyPath;
+  if (typeof rawPath !== "string" || rawPath.trim().length === 0) {
+    return null;
+  }
+  const trimmed = rawPath.trim();
+  if (trimmed === "~" || trimmed.startsWith("~/") || trimmed.startsWith("~\\")) {
+    return path.join(os.homedir(), trimmed.slice(1).replace(/^[\\/]+/, ""));
+  }
+  return trimmed;
+}
+
+/**
+ * RUAAAAA-5440: the Paperclip auth instructions handed to a hermes_local seat.
+ *
+ * Hermes runs the turn inside the long-lived `hermes gateway run` process,
+ * whose environment was frozen when THAT process started. The adapter injects
+ * PAPERCLIP_API_KEY / PAPERCLIP_RUN_ID into its own `hermes chat` child, so
+ * both are absent from the shell the agent actually gets and every Paperclip
+ * call answers 401 (the symptom RUAAAAA-5440 reports).
+ *
+ * The prompt therefore restores the documented contract inside the agent's own
+ * shell: it names the credential FILE (never the secret) and the run id (a
+ * literal, never an env var), and the agent exports both before it calls the
+ * API. The file is the seat's own claimed-key file, which the gateway host can
+ * read because it runs as the same user.
+ */
+function buildHermesAuthGuardPrompt(opts: { runId: string; claimedApiKeyPath: string | null }): string {
+  const lines = ["Paperclip API safety rule:"];
+  if (opts.claimedApiKeyPath) {
+    lines.push(
+      "Your turn runs inside the long-lived Hermes gateway process, whose environment was frozen when it started, so PAPERCLIP_API_KEY and PAPERCLIP_RUN_ID are usually NOT set in your shell. Set them yourself before the first Paperclip call:",
+      `  export PAPERCLIP_API_KEY="$(python3 -c "import json;print(json.load(open('${opts.claimedApiKeyPath}'))['token'])")" && export PAPERCLIP_RUN_ID="${opts.runId}"`,
+      "Run that once at the start of your turn, in the shell you use for curl. Hermes keeps a persistent shell; if a call starts a fresh shell, prefix that command with the same export.",
+    );
+  } else {
+    lines.push(
+      "Your turn runs inside the long-lived Hermes gateway process, whose environment was frozen when it started, so PAPERCLIP_API_KEY is usually NOT set in your shell. If it IS set, use it. If it is unset, do not make Paperclip API calls: say the credential is unavailable instead of retrying.",
+    );
+  }
+  lines.push(
+    "Use Authorization: Bearer $PAPERCLIP_API_KEY on every Paperclip API request.",
+    "Use X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID on every Paperclip API request that writes or mutates data, including comments and issue updates.",
+    "Never use a board, browser, or local-board session for Paperclip API writes.",
+    "Do not print the API key or the bearer token.",
+  );
+  return lines.join("\n");
+}
+
+/**
  * Best-effort lookup of a hermes_local agent's stored Paperclip API key.
  *
  * Preferred source: `agent.adapterConfig.claimedApiKeyPath` (the per-agent
@@ -527,12 +587,6 @@ const hermesLocalAdapter: ServerAdapterModule = {
       typeof existingConfig.promptTemplate === "string" && existingConfig.promptTemplate.trim().length > 0
         ? existingConfig.promptTemplate
         : "";
-    const authGuardPrompt = [
-      "Paperclip API safety rule:",
-      "Use Authorization: Bearer $PAPERCLIP_API_KEY on every Paperclip API request.",
-      "Use X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID on every Paperclip API request that writes or mutates data, including comments and issue updates.",
-      "Never use a board, browser, or local-board session for Paperclip API writes.",
-    ].join("\n");
 
     // RUAAAAA-2375: prefer the agent's stored Paperclip API key (read from the
     // per-agent `paperclip-claimed-api-key.json` written when the agent claimed
@@ -586,6 +640,18 @@ const hermesLocalAdapter: ServerAdapterModule = {
         "[hermes_local] no PAPERCLIP_API_KEY source available; child will run without one (writes will 401)",
       );
     }
+
+    // RUAAAAA-5440: the credential has to reach the agent through the prompt.
+    // The adapter's env injection lands in the `hermes chat` child, but Hermes
+    // runs the turn in the long-lived gateway host, so the agent's shell never
+    // sees PAPERCLIP_API_KEY / PAPERCLIP_RUN_ID and every call answers 401.
+    const authGuardPrompt = buildHermesAuthGuardPrompt({
+      runId: normalizedCtx.runId,
+      claimedApiKeyPath:
+        injectedSource === "claimedApiKeyPath"
+          ? resolveHermesClaimedApiKeyPath(normalizedCtx.agent)
+          : null,
+    });
 
     const patchedConfig: Record<string, unknown> = {
       ...existingConfig,
