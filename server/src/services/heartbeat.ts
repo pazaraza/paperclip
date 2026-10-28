@@ -222,6 +222,24 @@ export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = [
   2 * 60 * 60 * 1000,
 ] as const;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO = 0.25;
+// ABY-901: bounded backoff applied when a lane's run fails or times out.
+// The lane must be re-dispatched in minutes, not after a whole heartbeat
+// interval (6h on the ABY hermes seats). The ladder is deliberately short
+// and capped so a permanently broken lane cannot be turned into a hot loop.
+export const HEARTBEAT_FAILURE_BACKOFF_DELAYS_MS = [
+  2 * 60 * 1000,
+  5 * 60 * 1000,
+  15 * 60 * 1000,
+  30 * 60 * 1000,
+] as const;
+export const HEARTBEAT_FAILURE_BACKOFF_MAX_MS = 30 * 60 * 1000;
+
+export function computeHeartbeatFailureBackoffMs(failureStreak: number): number {
+  const streak = Number.isFinite(failureStreak) ? Math.max(1, Math.floor(failureStreak)) : 1;
+  const index = Math.min(streak, HEARTBEAT_FAILURE_BACKOFF_DELAYS_MS.length) - 1;
+  return HEARTBEAT_FAILURE_BACKOFF_DELAYS_MS[index];
+}
+
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON = "transient_failure";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
@@ -6213,18 +6231,47 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ? "idle"
           : "error";
 
+    // ABY-901: a failed or timed-out run must not consume the lane's whole
+    // heartbeat interval. Previously `lastHeartbeatAt` was stamped on every
+    // outcome, and the scheduler's next-timer baseline is
+    // `lastHeartbeatAt + intervalSec`. On a 6h lane one timeout parked the
+    // agent for six hours with no retry scheduled.
+    //
+    // Instead, a failed outcome records an explicit backoff deadline in
+    // `nextTimerDueAt` and increments a failure streak. The scheduler honours
+    // that deadline (capped well below `intervalSec`) so the lane is
+    // re-dispatched in minutes rather than hours, and the streak resets on
+    // success. `lastHeartbeatAt` keeps its documented meaning: the last time
+    // the agent reported successfully.
+    //
+    // `failed` and `timed_out` are the two outcomes that used to park a lane.
+    // `succeeded` and `cancelled` keep their previous behaviour (the lane is
+    // healthy and the next timer wake is a full interval away).
+    const failedOutcome = outcome === "failed" || outcome === "timed_out";
+    const failureStreak = failedOutcome
+      ? (existing.heartbeatFailureStreak ?? 0) + 1
+      : 0;
+    const failureBackoffMs = failedOutcome
+      ? Math.min(
+        computeHeartbeatFailureBackoffMs(failureStreak),
+        HEARTBEAT_FAILURE_BACKOFF_MAX_MS,
+      )
+      : 0;
+
     const updated = await db
       .update(agents)
       .set({
         status: nextStatus,
-        lastHeartbeatAt: new Date(),
+        lastHeartbeatAt: failedOutcome ? existing.lastHeartbeatAt : new Date(),
+        heartbeatFailureStreak: failureStreak,
+        nextTimerDueAt: failedOutcome ? new Date(Date.now() + failureBackoffMs) : null,
         updatedAt: new Date(),
       })
       .where(eq(agents.id, agentId))
       .returning()
       .then((rows) => rows[0] ?? null);
 
-    if (isFirstHeartbeat && updated) {
+    if (isFirstHeartbeat && updated?.lastHeartbeatAt) {
       const tc = getTelemetryClient();
       if (tc) trackAgentFirstHeartbeat(tc, { agentRole: updated.role, agentId: updated.id });
     }
@@ -9638,6 +9685,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     wakeup: enqueueWakeup,
     triggerIssueMonitor,
 
+    // ABY-901: exposed so the acceptance tests can drive the exact
+    // run-outcome path that used to park a lane for a full interval. This is
+    // the same function the executor, the reaper and the canceller call.
+    finalizeAgentStatus,
+
     reportRunActivity: clearDetachedRunWarning,
 
     reapOrphanedRuns,
@@ -9690,9 +9742,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (!policy.enabled || policy.intervalSec <= 0) continue;
 
         checked += 1;
-        const baseline = new Date(agent.lastHeartbeatAt ?? agent.createdAt).getTime();
-        const elapsedMs = now.getTime() - baseline;
-        if (elapsedMs < policy.intervalSec * 1000) continue;
+        // ABY-901: when a lane's last run failed or timed out, `finalizeAgentStatus`
+        // left `lastHeartbeatAt` on the last SUCCESS and recorded an explicit
+        // retry deadline in `nextTimerDueAt`. The lane is due as soon as EITHER
+        // the normal interval has elapsed since the last success OR that
+        // backoff deadline has passed - whichever comes first. Without this the
+        // lane would sleep for a whole interval after every failure.
+        const dueAt = agent.nextTimerDueAt
+          ? new Date(agent.nextTimerDueAt).getTime()
+          : null;
+        if (dueAt !== null) {
+          if (now.getTime() < dueAt) continue;
+        } else {
+          const baseline = new Date(agent.lastHeartbeatAt ?? agent.createdAt).getTime();
+          const elapsedMs = now.getTime() - baseline;
+          if (elapsedMs < policy.intervalSec * 1000) continue;
+        }
 
         const run = await enqueueWakeup(agent.id, {
           source: "timer",
@@ -9708,6 +9773,40 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
         if (run) enqueued += 1;
         else skipped += 1;
+
+        // ABY-901: consume the backoff deadline once the retry is dispatched.
+        // The lane's next baseline is recomputed by `finalizeAgentStatus` when
+        // this run finishes, so leaving the deadline in place would re-dispatch
+        // the lane on every scheduler tick while the retry is still in flight.
+        //
+        // The write is conditional on the deadline still being the one we
+        // observed. If the run already finished and recorded a NEW deadline
+        // (a fast failure), clearing it here would erase that deadline and
+        // park the lane for a full interval.
+        if (agent.nextTimerDueAt && agent.heartbeatFailureStreak > 0) {
+          // Keep the lane's deadline alive while the retry is in flight, so the
+          // scheduler does not re-fire it on every tick (the deadline is in the
+          // past once dispatched). `finalizeAgentStatus` replaces this value
+          // when the run finishes: null on success, a fresh backoff on failure.
+          // If the run is lost entirely, the deadline still passes and the lane
+          // is re-dispatched instead of parking for a full interval.
+          const retryDeadline = new Date(
+            now.getTime() +
+              Math.min(
+                computeHeartbeatFailureBackoffMs(agent.heartbeatFailureStreak),
+                HEARTBEAT_FAILURE_BACKOFF_MAX_MS,
+              ),
+          );
+          await db
+            .update(agents)
+            .set({ nextTimerDueAt: retryDeadline })
+            .where(
+              and(
+                eq(agents.id, agent.id),
+                eq(agents.nextTimerDueAt, agent.nextTimerDueAt),
+              ),
+            );
+        }
       }
 
       const issueMonitors = await tickDueIssueMonitors(now);
