@@ -17,7 +17,7 @@
  * service calling back into `heartbeat.ts` would be a circular import.
  * Both callers now share one implementation.
  */
-import { and, desc, eq, inArray, isNotNull, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "@paperclipai/shared";
 import {
@@ -359,19 +359,27 @@ async function latestRunOwnWriteAt(
   run: typeof heartbeatRuns.$inferSelect,
   contextIssueId: string | null,
 ): Promise<Date | null> {
-  const commentAt = contextIssueId
-    ? await db
-        .select({ at: sql<Date | null>`max(${issueComments.createdAt})` })
-        .from(issueComments)
-        .where(
-          and(
-            eq(issueComments.companyId, run.companyId),
-            eq(issueComments.issueId, contextIssueId),
-            eq(issueComments.createdByRunId, run.id),
-          ),
-        )
-        .then((rows) => dateValue(rows[0]?.at))
-    : null;
+  // ABY-896. A run with no source issue in its context (a
+  // heartbeat-timer run, for instance) has nothing to scope its
+  // evidence TO. Scoping to the issue is the right rule when there IS
+  // an issue - it keeps a run from being credited for work it did on
+  // a DIFFERENT issue. But when there is no issue, the rule has no
+  // referent, and applying it discards the run's own writes entirely -
+  // so a run that demonstrably worked after its false stamp could
+  // never be repaired. For those runs the scoping is inapplicable
+  // rather than restrictive: the run's own writes count, wherever
+  // they landed.
+  const commentAt = await db
+    .select({ at: sql<Date | null>`max(${issueComments.createdAt})` })
+    .from(issueComments)
+    .where(
+      and(
+        eq(issueComments.companyId, run.companyId),
+        eq(issueComments.createdByRunId, run.id),
+        contextIssueId ? eq(issueComments.issueId, contextIssueId) : undefined,
+      ),
+    )
+    .then((rows) => dateValue(rows[0]?.at));
 
   const documentAt = contextIssueId
     ? await db
@@ -390,19 +398,19 @@ async function latestRunOwnWriteAt(
         .then((rows) => dateValue(rows[0]?.at))
     : null;
 
-  const workProductAt = contextIssueId
-    ? await db
-        .select({ at: sql<Date | null>`max(${issueWorkProducts.createdAt})` })
-        .from(issueWorkProducts)
-        .where(
-          and(
-            eq(issueWorkProducts.companyId, run.companyId),
-            eq(issueWorkProducts.issueId, contextIssueId),
-            eq(issueWorkProducts.createdByRunId, run.id),
-          ),
-        )
-        .then((rows) => dateValue(rows[0]?.at))
-    : null;
+  // Same reasoning as comments: a work product with no source issue
+  // has no issue to scope to, so the run's own products count.
+  const workProductAt = await db
+    .select({ at: sql<Date | null>`max(${issueWorkProducts.createdAt})` })
+    .from(issueWorkProducts)
+    .where(
+      and(
+        eq(issueWorkProducts.companyId, run.companyId),
+        eq(issueWorkProducts.createdByRunId, run.id),
+        contextIssueId ? eq(issueWorkProducts.issueId, contextIssueId) : undefined,
+      ),
+    )
+    .then((rows) => dateValue(rows[0]?.at));
 
   const eventAt = await db
     .select({ at: sql<Date | null>`max(${heartbeatRunEvents.createdAt})` })
@@ -523,9 +531,14 @@ export async function reconcileStrandedTimedOutRunLiveness(
   // writes landed afterwards, which is positive evidence the agent was
   // working. Promote it here, where that premise is established, rather
   // than weakening the classifier for every failed run.
+  // The premise is the run's OWN late write, which is what
+  // `latestOwnWriteAt` measures - not the issue-scoped evidence
+  // count, which is zero for a run with no source issue and would
+  // otherwise block the promotion for exactly the runs the widened
+  // scoping was added to reach.
   const repaired =
     classification.livenessState === "failed" &&
-    hasConcreteActionEvidence(evidence) &&
+    latestOwnWriteAt !== null &&
     isFalseTerminalRun(run.status, run.errorCode)
       ? {
           ...classification,
@@ -625,14 +638,29 @@ export async function sweepStrandedRunLiveness(
     .where(
       and(
         sql`${heartbeatRuns.status} IN ('failed', 'timed_out')`,
+        // The false-terminal family, in SQL rather than in memory: a row
+        // that can never reconcile must not occupy a slot in the LIMIT
+        // window, or it starves a qualifying row behind it.
+        sql`(${heartbeatRuns.status} = 'timed_out' OR ${heartbeatRuns.errorCode} IN ('process_lost', 'execution_handle_lost'))`,
         isNotNull(heartbeatRuns.finishedAt),
         sql`${heartbeatRuns.id} NOT IN (SELECT ${activityLog.runId} FROM ${activityLog} WHERE ${activityLog.action} = ${STRANDED_TIMED_OUT_RUN_LIVENESS_RECONCILED_ACTION} AND ${activityLog.runId} IS NOT NULL)`,
-        sql`EXISTS (SELECT 1 FROM ${issueComments} WHERE ${issueComments.createdByRunId} = ${heartbeatRuns.id} AND ${issueComments.createdAt} > ${heartbeatRuns.finishedAt})`,
+        // The prefilter must agree with the per-row predicate: a run with no
+        // source issue has no issue to scope its evidence to, so its own
+        // writes count wherever they landed.
+        sql`EXISTS (SELECT 1 FROM ${issueComments} WHERE ${issueComments.createdByRunId} = ${heartbeatRuns.id} AND ${issueComments.createdAt} > ${heartbeatRuns.finishedAt} AND (${heartbeatRuns.contextSnapshot} ->> 'issueId' IS NULL OR ${issueComments.issueId}::text = ${heartbeatRuns.contextSnapshot} ->> 'issueId'))`,
       ),
     )
+    // Deterministic order. Without it the LIMIT returns an arbitrary
+    // window, and a pass can come back empty while qualifying rows
+    // remain outside the window - the sweep would then report
+    // convergence it had not reached.
+    .orderBy(asc(heartbeatRuns.finishedAt), asc(heartbeatRuns.id))
     .limit(limit)
     .then((rows) => rows);
 
+  // The family filter is in SQL (see above), so every candidate row can
+  // reconcile. The in-memory check stays as a guard against the SQL and
+  // the predicate drifting apart.
   const candidates = candidateRows.filter((row) =>
     isFalseTerminalRun(row.status, row.errorCode),
   );

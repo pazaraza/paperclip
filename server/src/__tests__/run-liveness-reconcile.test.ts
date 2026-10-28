@@ -156,6 +156,8 @@ describe("reconcileStrandedTimedOutRunLiveness", () => {
     errorCode?: string | null;
     livenessState?: "failed" | "advanced" | null;
     issueStatus?: "in_progress" | "done";
+    /** A run with no source issue in its context (a heartbeat-timer run). */
+    noSourceIssue?: boolean;
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -197,7 +199,7 @@ describe("reconcileStrandedTimedOutRunLiveness", () => {
       invocationSource: "assignment",
       triggerDetail: "system",
       status: input?.runStatus ?? "timed_out",
-      contextSnapshot: { issueId },
+      contextSnapshot: input?.noSourceIssue ? {} : { issueId },
       error: "OpenClaw gateway run did not complete within waitTimeoutMs=600000ms",
       errorCode: input?.errorCode === undefined ? "timeout" : input.errorCode,
       livenessState: input?.livenessState === undefined ? "failed" : input.livenessState,
@@ -441,6 +443,25 @@ describe("reconcileStrandedTimedOutRunLiveness", () => {
     expect(run?.lastUsefulActionAt?.toISOString()).toBe(ownWriteAt.toISOString());
   });
 
+  it("repairs a sourceless run whose own writes landed on another issue (ABY-896)", async () => {
+    // A run with no source issue in its context has no issue to scope its
+    // evidence to. Scoping to the run's own issue is inapplicable
+    // rather than restrictive for these, and the run's own writes count
+    // wherever they landed. (Measured live: 15 of the 36 process_lost
+    // rows with late own-writes are in this shape - several have no
+    // source issue at all.)
+    const ctx = await seedTimedOutRun({ runStatus: "failed", errorCode: "process_lost", noSourceIssue: true });
+    const ownWriteAt = new Date("2026-10-23T00:53:31.526Z");
+    await addComment(ctx, ownWriteAt);
+
+    const result = await reconcileStrandedTimedOutRunLiveness(db, ctx.runId);
+    expect(result.reconciled).toBe(true);
+
+    const run = await readRun(ctx.runId);
+    expect(run?.livenessState).toBe("advanced");
+    expect(run?.lastUsefulActionAt?.toISOString()).toBe(ownWriteAt.toISOString());
+  });
+
   it("does not repair a false-terminal row whose own writes all predate the stamp", async () => {
     const ctx = await seedTimedOutRun({ runStatus: "failed", errorCode: "process_lost" });
     await addComment(ctx, new Date("2026-10-23T00:49:35.385Z"));
@@ -470,6 +491,28 @@ describe("reconcileStrandedTimedOutRunLiveness", () => {
     const run = await readRun(ctx.runId);
     expect(run?.livenessState).toBe("advanced");
     expect(run?.lastUsefulActionAt?.toISOString()).toBe(ownWriteAt.toISOString());
+  });
+
+  it("sweeps every qualifying row, not just the first window (ABY-896)", async () => {
+    // The sweep selects candidates with a LIMIT. If the query is not
+    // ordered, the window is arbitrary, and a pass can come back empty
+    // while qualifying rows sit outside it - the sweep would report
+    // convergence it had not reached, and those rows would stay frozen
+    // at `failed` forever. This pins that every qualifying row is
+    // reached.
+    const contexts = [];
+    for (let i = 0; i < 5; i++) {
+      const ctx = await seedTimedOutRun({ runStatus: "failed", errorCode: "process_lost" });
+      await addComment(ctx, new Date("2026-10-23T00:53:31.526Z"));
+      contexts.push(ctx);
+    }
+
+    const swept = await sweepStrandedRunLiveness(db, { limit: 50 });
+    for (const ctx of contexts) {
+      expect(swept.runIds).toContain(ctx.runId);
+      const run = await readRun(ctx.runId);
+      expect(run?.livenessState).toBe("advanced");
+    }
   });
 
   it("skips a missing run id without throwing", async () => {
