@@ -136,10 +136,78 @@ const KNOWN_OPERATOR_SCOPES = new Set([
 const COOLDOWN_ERROR_PATTERNS: RegExp[] = [
   /provider\s+([\w.-]+)\s+is in cooldown/i,
   /provider\s+([\w.-]+)\s+is in cooldown\s*\(([^)]+)\)/i,
-  /auth profile\s+'([^']+)'\s+is temporarily unavailable/i,
+  /auth profile\s+(['"])([^'"]+)\1\s+is temporarily unavailable/i,
   /billing\s+cooldown\s+(?:until|expires?\s+at)\s+([\w:./+-]+)/i,
   /(?<![\w-])cooldown(?![\w-])/i,
 ];
+
+/**
+ * PROVIDER-QUOTA: a provider that refuses the request because the account's quota or
+ * rate limit is exhausted is a TRANSIENT UPSTREAM condition, not an agent fault. The
+ * provider emits these in two shapes that neither the cooldown patterns nor the
+ * gateway-transport patterns match:
+ *
+ *   - "Token Plan usage limit reached: ... (2056) | 429"
+ *   - "Auth profile \"<profile>\" is temporarily unavailable for <provider>/<model>."
+ *
+ * Without this, a quota exhaustion was classified as a terminal wait error, so the
+ * server saw no transient-recovery contract and never scheduled a retry. A provider
+ * quota window then killed every heartbeat in the lane for as long as it lasted,
+ * while the sibling gateway-restart case (RUAAAAA-5520) was already being retried.
+ */
+const PROVIDER_QUOTA_PATTERNS: RegExp[] = [
+  /token plan usage limit reached/i,
+  /usage limit reached/i,
+  /quota (?:exhausted|exceeded|depleted)/i,
+  /insufficient (?:quota|credits|balance)/i,
+  /rate[ _-]?limit(?:ed|ing)?\b/i,
+  /\b429\b/,
+  /auth profile\s+['"][^'"]+['"]\s+is temporarily unavailable/i,
+];
+
+/**
+ * PROVIDER-QUOTA: true when the message reports a provider-side quota or rate-limit
+ * exhaustion. Returns false for agent faults and for gateway transport failures,
+ * which are classified separately.
+ */
+export function detectProviderQuotaExhausted(message: string): boolean {
+  if (!message) return false;
+  return PROVIDER_QUOTA_PATTERNS.some((pattern) => pattern.test(message));
+}
+
+/**
+ * PROVIDER-QUOTA: decide how a provider refusal is reported.
+ *
+ * A quota exhaustion and a provider cooldown OVERLAP: the provider says
+ * "Provider minimax-portal is in cooldown (rate_limit)" and
+ * "Auth profile \"x\" is temporarily unavailable", and both of those also match a
+ * quota/rate-limit shape. They are the same underlying condition - the provider
+ * is refusing work because the account has no capacity - so they must get the
+ * same treatment.
+ *
+ * The ordering matters. The quota verdict wins, because the cooldown branch
+ * ends in a bare `openclaw_gateway_wait_cooldown` with no `errorFamily`, and a
+ * run with no `errorFamily` gets NO bounded retry from the server. Routing a
+ * rate-limit refusal into that branch would defeat the whole point of this
+ * patch: the run would still die with zero retries.
+ */
+export type ProviderRefusalVerdict =
+  | { kind: "provider_quota"; retryable: true }
+  | { kind: "provider_cooldown"; retryable: true }
+  | { kind: "unknown"; retryable: false };
+
+export function classifyProviderRefusal(
+  message: string,
+  cooldownDetected: boolean,
+): ProviderRefusalVerdict {
+  if (detectProviderQuotaExhausted(message)) {
+    return { kind: "provider_quota", retryable: true };
+  }
+  if (cooldownDetected) {
+    return { kind: "provider_cooldown", retryable: true };
+  }
+  return { kind: "unknown", retryable: false };
+}
 
 const COOLDOWN_BACKOFF_SEQUENCE_DEFAULT_MS = [30_000, 60_000, 120_000];
 const COOLDOWN_BACKOFF_MIN_MS = 100;
@@ -287,6 +355,147 @@ export function parseSaturatedMinQueuedSlices(value: unknown): number {
 }
 
 /**
+ * RUAAAAA-5520: why the gateway transport could not carry the request.
+ *
+ * `connect_refused` is the signature of the `openclaw-gateway` listener not being there at
+ * all: the service aborted on a V8 heap OOM and systemd restarted it, so every agent seat on
+ * the host saw `connect ECONNREFUSED 127.0.0.1:18789`. That used to reach the agent as
+ * `openclaw_gateway_request_failed` with the raw socket error as the message, which is
+ * indistinguishable from a provider or agent fault and is not retried.
+ */
+export type GatewayUnreachableReason =
+  | "connect_refused"
+  | "connection_reset"
+  | "connection_closed"
+  | "host_unreachable"
+  | "network_unreachable"
+  | "pipe_closed"
+  | "socket_hang_up";
+
+const GATEWAY_UNREACHABLE_PATTERNS: ReadonlyArray<readonly [RegExp, GatewayUnreachableReason]> = [
+  [/econnrefused/i, "connect_refused"],
+  [/connect\s+refused/i, "connect_refused"],
+  [/econnreset/i, "connection_reset"],
+  [/ehostunreach/i, "host_unreachable"],
+  [/enetunreach/i, "network_unreachable"],
+  [/epipe/i, "pipe_closed"],
+  [/socket hang up/i, "socket_hang_up"],
+];
+
+/**
+ * RUAAAAA-5520: classify a transport-level failure as "the gateway is not there", not
+ * "the provider or the agent failed". Returns null for everything else.
+ */
+export function detectGatewayUnreachable(message: string): GatewayUnreachableReason | null {
+  if (!message) return null;
+  for (const [pattern, reason] of GATEWAY_UNREACHABLE_PATTERNS) {
+    if (pattern.test(message)) return reason;
+  }
+  return null;
+}
+
+/**
+ * RUAAAAA-5520: the gateway can die mid-run, which surfaces as a websocket close with the
+ * abnormal-closure code instead of a connect error (`gateway closed (1006)`). This is only
+ * used on the wait path, where a bare 1006 means the gateway process went away under the run.
+ */
+export function detectGatewayConnectionClosed(message: string): GatewayUnreachableReason | null {
+  if (!message) return null;
+  if (/\b1006\b/.test(message) && /clos/i.test(message)) return "connection_closed";
+  return detectGatewayUnreachable(message);
+}
+
+const UNREACHABLE_RETRY_DELAY_DEFAULT_MS = 15_000;
+const UNREACHABLE_RETRY_DELAY_MIN_MS = 1_000;
+const UNREACHABLE_RETRY_DELAY_MAX_MS = 300_000;
+
+// PROVIDER-QUOTA: provider quota windows are typically measured in minutes, not seconds,
+// so the default retry floor is longer than the gateway-restart one.
+const PROVIDER_QUOTA_RETRY_DELAY_DEFAULT_MS = 5 * 60_000;
+const PROVIDER_QUOTA_RETRY_DELAY_MIN_MS = 1_000;
+const PROVIDER_QUOTA_RETRY_DELAY_MAX_MS = 60 * 60_000;
+
+/**
+ * RUAAAAA-5548: the gateway binds its listener BEFORE every agent's background startup
+ * inspection has finished. A request that arrives inside that window is refused with
+ *
+ *   "Agent <id> has not completed startup inspection and preparation. Inspection and
+ *    writable admission continue after the Gateway listener binds."
+ *
+ * That refusal is a gateway-side admission state, not an agent or provider fault: the
+ * gateway is still preparing that agent's database and the session is not writable yet.
+ *
+ * Measured on the Odoo bench (2026-10-27, one gateway worker shared by 91 agents): the
+ * refusal window ran 11-13 minutes for the tail seats, because the gateway publishes each
+ * agent's prepared database strictly one at a time. Every bench seat woken inside that
+ * window failed its run outright instead of being retried once its agent was admitted.
+ *
+ * Report it through the transient-upstream family so Paperclip's bounded retry schedule
+ * picks the run up again after the agent is admitted.
+ */
+export type GatewayAdmissionPendingReason = "startup_inspection_pending";
+
+const GATEWAY_ADMISSION_PENDING_PATTERNS: ReadonlyArray<
+  readonly [RegExp, GatewayAdmissionPendingReason]
+> = [[/has not completed startup inspection and preparation/i, "startup_inspection_pending"]];
+
+/**
+ * RUAAAAA-5548: classify a gateway-side admission refusal as "the gateway is still
+ * preparing this agent", not "the agent failed". Returns null for everything else.
+ */
+export function detectGatewayAdmissionPending(message: string): GatewayAdmissionPendingReason | null {
+  if (!message) return null;
+  for (const [pattern, reason] of GATEWAY_ADMISSION_PENDING_PATTERNS) {
+    if (pattern.test(message)) return reason;
+  }
+  return null;
+}
+
+/**
+ * RUAAAAA-5548: the error contract for a run refused because the gateway is still admitting
+ * that agent. Returning it from one pure function keeps the catch block honest and lets the
+ * contract (retryable family + retry floor) be asserted directly by a test.
+ */
+export function buildGatewayAdmissionPendingError(input: {
+  message: string;
+  endpoint: string;
+  retryDelayMs: number;
+  now?: Date;
+}): {
+  errorMessage: string;
+  errorCode: "openclaw_gateway_admission_pending";
+  errorFamily: "transient_upstream";
+  retryNotBefore: string;
+  errorMeta: { reason: GatewayAdmissionPendingReason; endpoint: string };
+} | null {
+  const reason = detectGatewayAdmissionPending(input.message);
+  if (!reason) return null;
+  const now = input.now ?? new Date();
+  const delayMs = Math.max(1_000, Math.floor(input.retryDelayMs));
+  return {
+    errorMessage:
+      "OpenClaw gateway agent admission still pending at " +
+      input.endpoint +
+      " (" +
+      reason +
+      "): " +
+      input.message +
+      ". The gateway binds its listener before the agent's background startup inspection " +
+      "and preparation finish, so this run was refused while the gateway was still " +
+      "admitting the agent. This is a gateway-side admission state, not a provider or " +
+      "agent fault.",
+    errorCode: "openclaw_gateway_admission_pending",
+    errorFamily: "transient_upstream",
+    retryNotBefore: new Date(now.getTime() + delayMs).toISOString(),
+    errorMeta: { reason, endpoint: input.endpoint },
+  };
+}
+
+const ADMISSION_PENDING_RETRY_DELAY_DEFAULT_MS = 30_000;
+const ADMISSION_PENDING_RETRY_DELAY_MIN_MS = 1_000;
+const ADMISSION_PENDING_RETRY_DELAY_MAX_MS = 300_000;
+
+/**
  * RUAAAAA-5310: why a `waitStatus = "timeout"` verdict was reached.
  *
  * `budget_exhausted` means `waitTimeoutMs` really did run out. `slice_cap_exhausted` means the
@@ -388,14 +597,17 @@ export function detectCooldownSignal(messages: Array<string | null | undefined>)
   for (const raw of messages) {
     if (typeof raw !== "string" || raw.trim().length === 0) continue;
     const hasInCooldown = /provider\s+[\w.-]+\s+is in cooldown/i.test(raw);
-    const hasAuthProfile = /auth profile\s+'[^']+'\s+is temporarily unavailable/i.test(raw);
+    // PROVIDER-QUOTA: the provider quotes the profile name with DOUBLE quotes. The
+    // single-quote-only pattern never matched the message this detector was written
+    // for, so the cooldown backoff path did not fire for it.
+    const hasAuthProfile = /auth profile\s+['"][^'"]+['"]\s+is temporarily unavailable/i.test(raw);
     const hasBilling = /billing\s+cooldown/i.test(raw) || /\(\s*billing\s*\)/i.test(raw);
     const hasGenericCooldown = /(?<![\w-])cooldown(?![\w-])/i.test(raw) && /(provider|model|account)/i.test(raw);
     if (hasInCooldown || hasAuthProfile || hasBilling || hasGenericCooldown) {
       let provider: string | undefined;
       const providerMatch = raw.match(/provider\s+([\w.-]+)\s+is in cooldown/i);
       if (providerMatch) provider = providerMatch[1];
-      const profileMatch = raw.match(/auth profile\s+'([^']+)'/i);
+      const profileMatch = raw.match(/auth profile\s+['"]([^'"]+)['"]/i);
       if (!provider && profileMatch) provider = profileMatch[1];
       let untilMs: number | undefined, untilIso: string | undefined;
       const isoMatch = raw.match(/\b(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2}))\b/);
@@ -486,6 +698,54 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function nonEmpty(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+/**
+ * PROVIDER-QUOTA: collect the provider-refusal evidence a lifecycle event carries.
+ *
+ * The provider reports a quota/rate-limit refusal on a `finishing` phase event, and the
+ * details live in `errorObservation` (httpStatus / providerRuntimeFailureKind /
+ * providerErrorMessagePreview). A `fallback_step` event carries the same refusal in
+ * `fallbackStepFromFailureReason` / `fallbackStepFromFailureDetail`. A later `error`
+ * phase event then reports only the *downstream* consequence ("Agent couldn't generate a
+ * response"), so the refusal text is GONE by the time the run fails.
+ *
+ * The terminal wait payload is a bare `{"error":"failed"}`, so neither the wait payload
+ * nor the terminal lifecycle error contains the refusal. Without harvesting the
+ * evidence while it is still in the event stream, the refusal can never be classified,
+ * and the run dies with a terminal agent fault instead of a retryable quota refusal.
+ *
+ * Returns the evidence as a single string, or null when the event carries none.
+ */
+export function extractProviderRefusalEvidence(data: Record<string, unknown>): string | null {
+  const parts: string[] = [];
+
+  const directError = nonEmpty(data.error);
+  if (directError) parts.push(directError);
+
+  const observation = asRecord(data.errorObservation);
+  if (observation) {
+    const preview = nonEmpty(observation.providerErrorMessagePreview);
+    if (preview) parts.push(preview);
+    const kind = nonEmpty(observation.providerRuntimeFailureKind);
+    if (kind) parts.push(`providerRuntimeFailureKind=${kind}`);
+    // httpStatus is a NUMBER in the provider's payload, not a string.
+    const status = observation.httpStatus;
+    if (typeof status === "number" && Number.isFinite(status)) {
+      parts.push(`httpStatus=${status}`);
+    } else {
+      const statusText = nonEmpty(status);
+      if (statusText) parts.push(`httpStatus=${statusText}`);
+    }
+  }
+
+  const failureReason = nonEmpty(data.fallbackStepFromFailureReason);
+  if (failureReason) parts.push(`failureReason=${failureReason}`);
+  const failureDetail = nonEmpty(data.fallbackStepFromFailureDetail);
+  if (failureDetail) parts.push(failureDetail);
+
+  if (parts.length === 0) return null;
+  return parts.join(" | ");
 }
 
 function parseOptionalPositiveInteger(value: unknown): number | null {
@@ -1587,6 +1847,34 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     1_000,
     SATURATED_RETRY_DELAY_MAX_MS,
   );
+  // RUAAAAA-5520: a gateway restart is a bounded-retryable transport failure, not a provider
+  // or agent fault. Report it through the transient-upstream family so Paperclip retries it
+  // after the listener is back instead of failing the run on a raw socket refusal.
+  const unreachableRetryDelayMs = parseSaturatedDuration(
+    ctx.config.unreachableRetryDelayMs,
+    UNREACHABLE_RETRY_DELAY_DEFAULT_MS,
+    UNREACHABLE_RETRY_DELAY_MIN_MS,
+    UNREACHABLE_RETRY_DELAY_MAX_MS,
+  );
+  // PROVIDER-QUOTA: a provider quota exhaustion is a bounded-retryable upstream condition
+  // too. It is reported through the same transient-upstream family as a gateway restart
+  // so the server schedules a bounded retry instead of failing the run outright.
+  const providerQuotaRetryDelayMs = parseSaturatedDuration(
+    ctx.config.providerQuotaRetryDelayMs,
+    PROVIDER_QUOTA_RETRY_DELAY_DEFAULT_MS,
+    PROVIDER_QUOTA_RETRY_DELAY_MIN_MS,
+    PROVIDER_QUOTA_RETRY_DELAY_MAX_MS,
+  );
+  // RUAAAAA-5548: a seat woken while the gateway is still admitting agent databases is
+  // refused by the gateway, not broken. Report it through the transient-upstream family so
+  // Paperclip retries the run once the agent is admitted. The delay is a per-seat knob so
+  // one bench can be given a longer floor than another without touching the fleet.
+  const admissionPendingRetryDelayMs = parseSaturatedDuration(
+    ctx.config.admissionPendingRetryDelayMs,
+    ADMISSION_PENDING_RETRY_DELAY_DEFAULT_MS,
+    ADMISSION_PENDING_RETRY_DELAY_MIN_MS,
+    ADMISSION_PENDING_RETRY_DELAY_MAX_MS,
+  );
   const configuredSessionKey = nonEmpty(ctx.config.sessionKey);
   const sessionKey = resolveSessionKey({
     strategy: sessionKeyStrategy,
@@ -1666,6 +1954,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const trackedRunIds = new Set<string>([ctx.runId]);
     const assistantChunks: string[] = [];
     let lifecycleError: string | null = null;
+    // PROVIDER-QUOTA: the provider's refusal text, harvested from lifecycle events as
+    // they arrive. See extractProviderRefusalEvidence for why this cannot be read
+    // from the terminal payload.
+    let providerRefusalEvidence: string | null = null;
     let deviceIdentity: GatewayDeviceIdentity | null = null;
 
     const onEvent = async (frame: GatewayEventFrame) => {
@@ -1712,6 +2004,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         const phase = nonEmpty(data.phase)?.toLowerCase();
         if (phase === "error" || phase === "failed" || phase === "cancelled") {
           lifecycleError = nonEmpty(data.error) ?? nonEmpty(data.message) ?? lifecycleError;
+        }
+        // PROVIDER-QUOTA: harvest the provider-refusal evidence while it is still in the
+        // event stream. The refusal is reported on a `finishing` (or `fallback_step`)
+        // event; the terminal `error` event reports only the downstream consequence, and
+        // the wait payload is a bare `{"error":"failed"}`. Without this, the quota text
+        // is discarded and the run is classified as a terminal agent fault.
+        const refusalEvidence = extractProviderRefusalEvidence(data);
+        if (refusalEvidence) {
+          providerRefusalEvidence = providerRefusalEvidence
+            ? `${providerRefusalEvidence} || ${refusalEvidence}`
+            : refusalEvidence;
         }
       }
     };
@@ -1965,6 +2268,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             saturationReason = null;
           }
           const signal = detectCooldownSignal([
+            // PROVIDER-QUOTA: the provider's refusal evidence is included here too. The
+            // wait slice's own error text is often a bare "failed", so an auth-profile
+            // or cooldown refusal reported on a lifecycle event would otherwise never
+            // reach the cooldown detector.
+            nonEmpty(providerRefusalEvidence),
             typeof errorText === "string" ? errorText : null,
             sliceStatus === "error" ? nonEmpty(slicePayload?.summary) : null,
             sliceStatus === "error" ? nonEmpty(asRecord(slicePayload?.details)?.message) : null,
@@ -2062,16 +2370,115 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             },
           };
         }
-        if (waitStatus === "error") {
+        // PROVIDER-QUOTA: two different texts are needed here, and they must not be
+        // conflated.
+        //
+        //  - `waitFailureText` is the transport/agent failure text. It is what the
+        //    connection-closed detector below must see, so it keeps its original
+        //    meaning.
+        //  - `providerRefusalText` is the provider's refusal evidence. The wait payload is
+        //    often a bare `{"error":"failed"}` and the terminal lifecycle error may carry
+        //    only the downstream consequence ("Agent couldn't generate a response"), so the
+        //    refusal text has to be harvested from the lifecycle event stream as it
+        //    arrives. The refusal evidence is checked FIRST so a specific provider
+        //    refusal always wins over a generic "failed".
+        const waitFailureText = nonEmpty(waitPayload?.error) ?? lifecycleError ?? "";
+        const providerRefusalText =
+          nonEmpty(providerRefusalEvidence) ?? waitFailureText;
+        const waitClosedReason = detectGatewayConnectionClosed(waitFailureText);
+        if (waitClosedReason && !cooldownSignal) {
+          // RUAAAAA-5520: the gateway process went away while the run was in flight (service
+          // restart / crash). Report it as a bounded-retryable transport failure instead of a
+          // generic wait error, so it is not misattributed to the provider.
+          const errorMessage =
+            `OpenClaw gateway connection closed mid-run (${waitClosedReason}): ${waitFailureText}. ` +
+            "The gateway process went away while the run was in flight (service restart or crash), " +
+            "so this is a gateway-side transport failure, not a provider or agent fault.";
+          await ctx.onLog(
+            "stderr",
+            `[openclaw-gateway] gateway connection closed mid-run: ${waitClosedReason}`,
+          );
           return {
-            exitCode: 1, signal: null, timedOut: false,
-            errorMessage: cooldownSignal
-              ? `OpenClaw gateway run in cooldown: Provider "${cooldownSignal.provider ?? "unknown"}" reason=${cooldownSignal.reason ?? "unknown"} ${cooldownSignal.untilIso ? `cooldownUntilIso=${cooldownSignal.untilIso}` : ""} cooldownAttempts=${cooldownAttempts}`
-              : nonEmpty(waitPayload?.error) ?? lifecycleError ?? "OpenClaw gateway run failed",
-            errorCode: cooldownSignal ? "openclaw_gateway_wait_cooldown" : "openclaw_gateway_wait_error",
+            exitCode: 1,
+            signal: null,
+            timedOut: false,
+            errorMessage,
+            errorCode: "openclaw_gateway_unreachable",
+            errorFamily: "transient_upstream" as const,
+            retryNotBefore: new Date(Date.now() + unreachableRetryDelayMs).toISOString(),
+            errorMeta: { reason: waitClosedReason, phase: "wait" },
             resultJson: {
               ...asRecord(waitPayload),
-              ...(cooldownSignal ? { cooldown: { provider: cooldownSignal.provider ?? null, reason: cooldownSignal.reason ?? null, untilIso: cooldownSignal.untilIso ?? null, untilMs: cooldownSignal.untilMs ?? null, attempts: cooldownAttempts, backoffSequenceMs: cooldownBackoffSequence } } : {}),
+            },
+          };
+        }
+        if (waitStatus === "error") {
+          // PROVIDER-QUOTA: the provider refused the run because the account's quota or
+          // rate limit is exhausted. That is transient upstream, not an agent fault, and
+          // it is exactly the condition the sibling gateway-restart case (RUAAAAA-5520)
+          // already retries. Report it through the transient-upstream family so the
+          // server schedules a bounded retry; otherwise a single quota window kills every
+          // heartbeat in the lane for as long as it lasts.
+          const refusal = classifyProviderRefusal(providerRefusalText, Boolean(cooldownSignal));
+          if (refusal.kind === "provider_quota") {
+            const errorMessage =
+              `OpenClaw gateway run rejected by the provider (quota or rate limit exhausted): ${providerRefusalText}. ` +
+              "The provider refused the request because the account's quota or rate limit is exhausted. " +
+              "This is a provider-side capacity condition, not an agent fault, so the run is retried " +
+              "with backoff instead of being failed outright.";
+            await ctx.onLog(
+              "stderr",
+              `[openclaw-gateway] provider quota exhausted: ${providerRefusalText}`,
+            );
+            return {
+              exitCode: 1,
+              signal: null,
+              timedOut: false,
+              errorMessage,
+              errorCode: "openclaw_gateway_provider_quota",
+              errorFamily: "transient_upstream" as const,
+              retryNotBefore: new Date(Date.now() + providerQuotaRetryDelayMs).toISOString(),
+              errorMeta: { reason: "provider_quota_exhausted", phase: "wait" },
+              resultJson: {
+                ...asRecord(waitPayload),
+              },
+            };
+          }
+          if (refusal.kind === "provider_cooldown" && cooldownSignal) {
+            // PROVIDER-QUOTA: a provider cooldown is the same capacity refusal as a
+            // quota exhaustion, just reported with different words. It must carry the
+            // transient-upstream contract too, or it dies here with zero retries -
+            // the exact defect this patch exists to close.
+            const errorMessage =
+              `OpenClaw gateway run rejected by the provider (cooldown): Provider "${cooldownSignal.provider ?? "unknown"}" ` +
+              `reason=${cooldownSignal.reason ?? "unknown"} ${cooldownSignal.untilIso ? `cooldownUntilIso=${cooldownSignal.untilIso}` : ""} cooldownAttempts=${cooldownAttempts}. ` +
+              "The provider is refusing work because the account has no capacity, so the run is retried " +
+              "with backoff instead of being failed outright.";
+            await ctx.onLog(
+              "stderr",
+              `[openclaw-gateway] provider cooldown: ${providerRefusalText || errorMessage}`,
+            );
+            return {
+              exitCode: 1,
+              signal: null,
+              timedOut: false,
+              errorMessage,
+              errorCode: "openclaw_gateway_provider_cooldown",
+              errorFamily: "transient_upstream" as const,
+              retryNotBefore: new Date(Date.now() + providerQuotaRetryDelayMs).toISOString(),
+              errorMeta: { reason: "provider_cooldown", phase: "wait" },
+              resultJson: {
+                ...asRecord(waitPayload),
+                ...(cooldownSignal ? { cooldown: { provider: cooldownSignal.provider ?? null, reason: cooldownSignal.reason ?? null, untilIso: cooldownSignal.untilIso ?? null, untilMs: cooldownSignal.untilMs ?? null, attempts: cooldownAttempts, backoffSequenceMs: cooldownBackoffSequence } } : {}),
+              },
+            };
+          }
+          return {
+            exitCode: 1, signal: null, timedOut: false,
+            errorMessage: nonEmpty(waitPayload?.error) ?? lifecycleError ?? "OpenClaw gateway run failed",
+            errorCode: "openclaw_gateway_wait_error",
+            resultJson: {
+              ...asRecord(waitPayload),
             },
           };
         }
@@ -2134,6 +2541,63 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const lower = message.toLowerCase();
       const timedOut = lower.includes("timeout");
       const pairingRequired = lower.includes("pairing required");
+      const unreachableReason = detectGatewayUnreachable(message);
+      if (unreachableReason) {
+        // RUAAAAA-5520: the gateway listener was not there (service restart / crash). Surface a
+        // gateway-specific, bounded-retryable verdict instead of a raw socket refusal, so the
+        // agent sees "the gateway is restarting" and the run is retried once it is back.
+        const endpoint = parsedUrl.toString();
+        const errorMessage =
+          `OpenClaw gateway unreachable at ${endpoint} (${unreachableReason}): ${message}. ` +
+          "The gateway listener is not accepting connections (the openclaw-gateway service is " +
+          "restarting or down), so this is a gateway-side transport failure, not a provider or " +
+          "agent fault.";
+        await ctx.onLog(
+          "stderr",
+          `[openclaw-gateway] gateway unreachable: ${unreachableReason}: ${message}`,
+        );
+        return {
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          errorMessage,
+          errorCode: "openclaw_gateway_unreachable",
+          errorFamily: "transient_upstream" as const,
+          retryNotBefore: new Date(Date.now() + unreachableRetryDelayMs).toISOString(),
+          errorMeta: { reason: unreachableReason, endpoint },
+          resultJson: asRecord(latestResultPayload),
+        };
+      }
+
+      // RUAAAAA-5548: the gateway listener is up, but this agent's background startup
+      // inspection and preparation has not finished, so its session is not writable yet.
+      // The gateway is still admitting the agent; report a bounded-retryable verdict so
+      // the run is retried after admission instead of being failed as an agent fault.
+      const admissionPending = buildGatewayAdmissionPendingError({
+        message,
+        endpoint: parsedUrl.toString(),
+        retryDelayMs: admissionPendingRetryDelayMs,
+      });
+      if (admissionPending) {
+        await ctx.onLog(
+          "stderr",
+          "[openclaw-gateway] agent admission pending: " +
+            admissionPending.errorMeta.reason +
+            ": " +
+            message,
+        );
+        return {
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          errorMessage: admissionPending.errorMessage,
+          errorCode: admissionPending.errorCode,
+          errorFamily: admissionPending.errorFamily,
+          retryNotBefore: admissionPending.retryNotBefore,
+          errorMeta: admissionPending.errorMeta,
+          resultJson: asRecord(latestResultPayload),
+        };
+      }
 
       if (
         pairingRequired &&

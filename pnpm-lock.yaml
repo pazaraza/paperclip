@@ -11,9 +11,9 @@ patchedDependencies:
   embedded-postgres@18.1.0-beta.16:
     hash: 55uhvnotpqyiy37rn3pqpukhei
     path: patches/embedded-postgres@18.1.0-beta.16.patch
-  hermes-paperclip-adapter@0.3.0:
-    hash: viygo6zawky3fvnmdj3w4ud4h4
-    path: patches/hermes-paperclip-adapter@0.3.0.patch
+  hermes-paperclip-adapter@0.2.1:
+    hash: apapbvddwtwkymsnqqgzagrfhy
+    path: patches/hermes-paperclip-adapter@0.2.1.patch
 
 importers:
 
@@ -647,8 +647,8 @@ importers:
         specifier: ^5.1.0
         version: 5.2.1
       hermes-paperclip-adapter:
-        specifier: ^0.3.0
-        version: 0.3.0(patch_hash=viygo6zawky3fvnmdj3w4ud4h4)
+        specifier: ^0.2.0
+        version: 0.2.1(patch_hash=apapbvddwtwkymsnqqgzagrfhy)
       jsdom:
         specifier: ^28.1.0
         version: 28.1.0(@noble/hashes@2.0.1)
@@ -795,8 +795,8 @@ importers:
         specifier: ^1.1.1
         version: 1.1.1(@types/react-dom@19.2.3(@types/react@19.2.14))(@types/react@19.2.14)(react-dom@19.2.4(react@19.2.4))(react@19.2.4)
       hermes-paperclip-adapter:
-        specifier: ^0.3.0
-        version: 0.3.0(patch_hash=viygo6zawky3fvnmdj3w4ud4h4)
+        specifier: ^0.2.0
+        version: 0.2.1(patch_hash=apapbvddwtwkymsnqqgzagrfhy)
       lexical:
         specifier: 0.35.0
         version: 0.35.0
@@ -5316,8 +5316,8 @@ packages:
   help-me@5.0.0:
     resolution: {integrity: sha512-7xgomUX6ADmcYzFik0HzAxh/73YlKR9bmFzf51CZwR+b6YtzU2m0u49hQCqV6SvlqIqsaxovfwdvbnsw3b/zpg==}
 
-  hermes-paperclip-adapter@0.3.0:
-    resolution: {integrity: sha512-MgAM/H2Fp650RVr5E1hYat5n8FaCzvxOOjhlN98hUMS9q6M+JeLvVE8Z1LfUs8KlavCn10m+DiwBxH55m0SmHA==}
+  hermes-paperclip-adapter@0.2.1:
+    resolution: {integrity: sha512-9D4SrmMXm4AhOZ08lnlGCZBzwfRnGjzZjkvPlkRfoPTODM2YeIAaEk+zO0vInh8DI4Qr3ySN8hLFxV1eKRYFaA==}
     engines: {node: '>=20.0.0'}
 
   hono@4.12.12:
@@ -12311,7 +12311,7 @@ snapshots:
 
   help-me@5.0.0: {}
 
-  hermes-paperclip-adapter@0.3.0(patch_hash=viygo6zawky3fvnmdj3w4ud4h4):
+  hermes-paperclip-adapter@0.2.1(patch_hash=apapbvddwtwkymsnqqgzagrfhy):
     dependencies:
       '@paperclipai/adapter-utils': 2026.325.0
       picocolors: 1.1.1

@@ -1,0 +1,49 @@
+diff --git a/dist/server/execute.js b/dist/server/execute.js
+index 793ea18ba65f450c7d90fb125fb9f08deeb79d2d..0ed5cf426e0bba78edf0cc6fbcc5113cb8616c46 100644
+--- a/dist/server/execute.js
++++ b/dist/server/execute.js
+@@ -289,20 +289,30 @@ export async function execute(ctx) {
+     const args = ["chat", "-q", prompt];
+     if (useQuiet)
+         args.push("-Q");
+-    if (model) {
++    // RUAAAAA-5436: a resume must carry NO creation overrides. The Hermes CLI
++    // refuses a resume whose creation policy differs from the session's frozen
++    // launch (gateway_chat.py check_resume_policy -> "Resume retains gateway
++    // session policy; creation overrides are unsupported on resume.", exit 2).
++    // The adapter re-derives model/provider/toolsets from the CURRENT config on
++    // every run, so a config change - or a Hermes CLI upgrade that re-resolves
++    // model aliases - makes the resume fail before the agent does any work.
++    // Per the CLI's own contract: resume bare, then /model after resuming.
++    const prevSessionId = cfgString(ctx.runtime?.sessionParams?.sessionId);
++    const isResume = persistSession && Boolean(prevSessionId);
++    if (model && !isResume) {
+         args.push("-m", model);
+     }
+     // Always pass --provider when we have a resolved one (not "auto").
+     // "auto" means Hermes will decide on its own — no need to pass it.
+-    if (resolvedProvider !== "auto") {
++    if (resolvedProvider !== "auto" && !isResume) {
+         args.push("--provider", resolvedProvider);
+     }
+-    if (toolsets) {
++    if (toolsets && !isResume) {
+         args.push("-t", toolsets);
+     }
+     if (worktreeMode)
+         args.push("-w");
+-    if (checkpoints)
++    if (checkpoints && !isResume)
+         args.push("--checkpoints");
+     if (cfgBoolean(config.verbose) === true)
+         args.push("-v");
+@@ -316,8 +326,7 @@ export async function execute(ctx) {
+     // system is designed for human-attended interactive sessions.
+     args.push("--yolo");
+     // Session resume
+-    const prevSessionId = cfgString(ctx.runtime?.sessionParams?.sessionId);
+-    if (persistSession && prevSessionId) {
++    if (isResume) {
+         args.push("--resume", prevSessionId);
+     }
+     if (extraArgs?.length) {
