@@ -8,6 +8,8 @@ export type DevServerHealthStatus = {
   pendingMigrations: string[];
   autoRestartEnabled: boolean;
   activeRunCount: number;
+  /** Runs that are actually executing right now. This is what the idle gate keys on. */
+  runningRunCount: number;
   waitingForIdle: boolean;
   lastRestartAt: string | null;
 };

@@ -931,6 +931,126 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(wakeup?.status).toBe("claimed");
   });
 
+  it("does not stamp process_lost on a gateway-backed run it cannot observe (ABY-896)", async () => {
+    // The agent runs inside the OpenClaw gateway's process tree, so the
+    // control plane holds no pid and no process group for it. The reaper
+    // must not conclude the process died from the ABSENCE of a handle
+    // it never had - that is the stamp that put 8,288 live runs on the
+    // table as process_lost (ABY-870).
+    const { runId } = await seedRunFixture({
+      adapterType: "openclaw_gateway",
+      processPid: null,
+      processGroupId: null,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+
+    const run = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("execution_handle_lost");
+    // The message must not assert the agent stopped.
+    expect(run?.error).toContain("could not observe");
+    expect(run?.error).not.toContain("Process lost");
+    expect(run?.resultJson).toMatchObject({ stopReason: "adapter_failed" });
+  });
+
+  it("does not stamp process_lost on a locally-observable run that has no handle (ABY-896)", async () => {
+    // hermes_local and codex_local ARE locally observable adapters, so the
+    // reaper can observe liveness for them - but only when the RUN carries a
+    // handle. The majority of their runs carry neither a pid nor a process
+    // group (measured live: 87.9% of hermes_local runs, 53.0% of codex_local),
+    // and for those the control plane held nothing it could observe.
+    //
+    // Stamping `process_lost` on such a row asserts that a process died,
+    // which is the same false verdict the gateway case had - one adapter set
+    // over. Measured live: 351 hermes_local and 126 codex_local rows carry
+    // `process_lost` with no handle at all, and one more was stamped by the
+    // 14:37:58Z control-plane restart.
+    const { runId } = await seedRunFixture({
+      adapterType: "hermes_local",
+      processPid: null,
+      processGroupId: null,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+
+    const run = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(run?.status).toBe("failed");
+    // The error code must say the control plane lost the handle, not that
+    // the agent process died.
+    expect(run?.errorCode).toBe("execution_handle_lost");
+    expect(run?.error).not.toContain("Process lost");
+  });
+
+  it("still stamps process_lost on a locally-observable run whose handle it held (ABY-896)", async () => {
+    // The complement of the case above: when the reaper DID hold a handle
+    // and the pid is gone, `process_lost` is a true statement and must be
+    // preserved. Narrowing the error code must not erase the true positives.
+    const { runId } = await seedRunFixture({
+      adapterType: "hermes_local",
+      processPid: 999_999_999,
+      processGroupId: null,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+
+    const run = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_lost");
+    expect(run?.error).toContain("Process lost");
+  });
+
+  it("does not kill a process group that another run also sits in (ABY-896)", async () => {
+    // Two runs of DIFFERENT agents share one process group id. Killing
+    // that group would take down the other agent's live work, and the
+    // group is not ours to kill. (Measured live: pgids 10700 and 98970
+    // are each shared by two distinct agents' runs.)
+    const { agentId, runId } = await seedRunFixture({
+      processPid: 999_999_999,
+      processGroupId: 424_242,
+    });
+
+    // A second agent's run in the same process group.
+    const other = await seedRunFixture({
+      processPid: 999_999_998,
+      processGroupId: 424_242,
+    });
+    expect(other.agentId).not.toBe(agentId);
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(2);
+
+    // Both runs are still finalized (the pid is gone), but the shared
+    // group must not have been terminated - that is what would have
+    // taken out the other agent's work.
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.processGroupId, 424_242))
+      .then((rows) => rows);
+    expect(runs.length).toBe(2);
+    expect(runs.every((row) => row.status === "failed")).toBe(true);
+  });
+
   it("queues exactly one retry when the recorded local pid is dead", async () => {
     const { agentId, runId, issueId } = await seedRunFixture({
       processPid: 999_999_999,

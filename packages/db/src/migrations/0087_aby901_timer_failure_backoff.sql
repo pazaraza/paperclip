@@ -1,0 +1,2 @@
+ALTER TABLE "agents" ADD COLUMN IF NOT EXISTS "next_timer_due_at" timestamp with time zone;--> statement-breakpoint
+ALTER TABLE "agents" ADD COLUMN IF NOT EXISTS "heartbeat_failure_streak" integer DEFAULT 0 NOT NULL;

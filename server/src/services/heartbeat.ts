@@ -82,7 +82,12 @@ import {
 } from "./heartbeat-run-outcome.js";
 import {
   classifyAndPersistRunLiveness as classifyAndPersistRunLivenessForRun,
+  sweepStrandedRunLiveness as sweepStrandedRunLivenessRows,
 } from "./run-liveness-reconcile.js";
+import {
+  LOCALLY_OBSERVABLE_ADAPTERS,
+  UNOBSERVED_LIVENESS_ERROR_CODE,
+} from "./run-liveness-observability.js";
 import { logActivity, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
 import {
   buildWorkspaceReadyComment,
@@ -217,6 +222,24 @@ export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = [
   2 * 60 * 60 * 1000,
 ] as const;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO = 0.25;
+// ABY-901: bounded backoff applied when a lane's run fails or times out.
+// The lane must be re-dispatched in minutes, not after a whole heartbeat
+// interval (6h on the ABY hermes seats). The ladder is deliberately short
+// and capped so a permanently broken lane cannot be turned into a hot loop.
+export const HEARTBEAT_FAILURE_BACKOFF_DELAYS_MS = [
+  2 * 60 * 1000,
+  5 * 60 * 1000,
+  15 * 60 * 1000,
+  30 * 60 * 1000,
+] as const;
+export const HEARTBEAT_FAILURE_BACKOFF_MAX_MS = 30 * 60 * 1000;
+
+export function computeHeartbeatFailureBackoffMs(failureStreak: number): number {
+  const streak = Number.isFinite(failureStreak) ? Math.max(1, Math.floor(failureStreak)) : 1;
+  const index = Math.min(streak, HEARTBEAT_FAILURE_BACKOFF_DELAYS_MS.length) - 1;
+  return HEARTBEAT_FAILURE_BACKOFF_DELAYS_MS[index];
+}
+
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON = "transient_failure";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
@@ -311,15 +334,15 @@ function mergeAdapterRecoveryMetadata(input: {
   };
 }
 const RUNNING_ISSUE_WAKE_REASONS_REQUIRING_FOLLOWUP = new Set(["approval_approved"]);
-const SESSIONED_LOCAL_ADAPTERS = new Set([
-  "claude_local",
-  "codex_local",
-  "cursor",
-  "gemini_local",
-  "hermes_local",
-  "opencode_local",
-  "pi_local",
-]);
+// The set of adapters whose runs execute as a local child process the
+// control plane spawned, and whose liveness it can therefore observe
+// with a pid / process-group probe.
+//
+// "openclaw_gateway" is deliberately absent: the agent runs inside the
+// OpenClaw gateway's process tree, not inside Paperclip's, so the
+// control plane holds no handle it could observe. The shared module
+// documents the measured consequences (ABY-870 / ABY-896).
+const SESSIONED_LOCAL_ADAPTERS = LOCALLY_OBSERVABLE_ADAPTERS;
 const INLINE_BASE64_IMAGE_DATA_RE = /("type":"image","source":\{"type":"base64","data":")([A-Za-z0-9+/=]{1024,})(")/g;
 
 type RuntimeConfigSecretResolver = Pick<
@@ -2190,6 +2213,19 @@ async function terminateHeartbeatRunProcess(input: {
           : null,
     },
     input.graceMs ? { forceAfterMs: input.graceMs } : undefined,
+  );
+}
+
+function buildUnobservedLivenessMessage(adapterType: string) {
+  // ABY-870 / ABY-896. The message must not claim the process died: the
+  // control plane never held a handle to it. It records what did happen
+  // - the control plane lost the handle to the execution - and that the
+  // agent may still be running. Rows carrying this text are reconciled
+  // by the late-evidence repair path if the agent does land writes.
+  return (
+    "Execution handle lost -- the control plane could not observe this run's liveness " +
+    `(adapter ${adapterType} executes outside the control plane's process tree), ` +
+    "so it cannot conclude the agent stopped"
   );
 }
 
@@ -6195,18 +6231,47 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ? "idle"
           : "error";
 
+    // ABY-901: a failed or timed-out run must not consume the lane's whole
+    // heartbeat interval. Previously `lastHeartbeatAt` was stamped on every
+    // outcome, and the scheduler's next-timer baseline is
+    // `lastHeartbeatAt + intervalSec`. On a 6h lane one timeout parked the
+    // agent for six hours with no retry scheduled.
+    //
+    // Instead, a failed outcome records an explicit backoff deadline in
+    // `nextTimerDueAt` and increments a failure streak. The scheduler honours
+    // that deadline (capped well below `intervalSec`) so the lane is
+    // re-dispatched in minutes rather than hours, and the streak resets on
+    // success. `lastHeartbeatAt` keeps its documented meaning: the last time
+    // the agent reported successfully.
+    //
+    // `failed` and `timed_out` are the two outcomes that used to park a lane.
+    // `succeeded` and `cancelled` keep their previous behaviour (the lane is
+    // healthy and the next timer wake is a full interval away).
+    const failedOutcome = outcome === "failed" || outcome === "timed_out";
+    const failureStreak = failedOutcome
+      ? (existing.heartbeatFailureStreak ?? 0) + 1
+      : 0;
+    const failureBackoffMs = failedOutcome
+      ? Math.min(
+        computeHeartbeatFailureBackoffMs(failureStreak),
+        HEARTBEAT_FAILURE_BACKOFF_MAX_MS,
+      )
+      : 0;
+
     const updated = await db
       .update(agents)
       .set({
         status: nextStatus,
-        lastHeartbeatAt: new Date(),
+        lastHeartbeatAt: failedOutcome ? existing.lastHeartbeatAt : new Date(),
+        heartbeatFailureStreak: failureStreak,
+        nextTimerDueAt: failedOutcome ? new Date(Date.now() + failureBackoffMs) : null,
         updatedAt: new Date(),
       })
       .where(eq(agents.id, agentId))
       .returning()
       .then((rows) => rows[0] ?? null);
 
-    if (isFirstHeartbeat && updated) {
+    if (isFirstHeartbeat && updated?.lastHeartbeatAt) {
       const tc = getTelemetryClient();
       if (tc) trackAgentFirstHeartbeat(tc, { agentRole: updated.role, agentId: updated.id });
     }
@@ -6253,6 +6318,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return classifyAndPersistRunLivenessForRun(db, run, resultJson);
   }
 
+  /**
+   * ABY-896 acceptance criterion 2: a process group can be shared by
+   * more than one agent's run. Killing such a group takes down the
+   * other agent's live work, and the group is not ours to kill.
+   *
+   * Measured live: process group ids 10700 and 98970 are each
+   * shared by two distinct agents' runs. The check is deliberately
+   * conservative - any other run (not just another agent's) in the
+   * same group means we do not kill it.
+   */
+  async function isProcessGroupSharedWithAnotherRun(
+    processGroupId: number | null,
+    runId: string,
+  ): Promise<boolean> {
+    if (!processGroupId) return false;
+    const rows = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.processGroupId, processGroupId),
+          sql`${heartbeatRuns.id} <> ${runId}`
+        ),
+      )
+      .limit(8);
+    return rows.length > 0;
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
@@ -6279,7 +6372,36 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (now.getTime() - refTime < staleThresholdMs) continue;
       }
 
+      // ABY-870 / ABY-896. The control plane can only conclude that a
+      // process died if it held a handle to that process and observed it
+      // gone. For an adapter whose execution it cannot observe (the
+      // openclaw_gateway agent runs in the gateway's process tree, so
+      // processPid / processGroupId are null), the absence of a handle
+      // is not evidence of death: it is the expected state.
+      //
+      // The old guard short-circuited on `tracksLocalChild &&
+      // run.processPid` and so evaluated to false *by construction, not
+      // by observation*, stamping every live gateway-backed run
+      // `process_lost` on every control-plane restart (8,288 rows in the
+      // table, 8,286 of them with no pid and no process group at all).
       const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
+      // ABY-896 (hermes/codex residual). Whether the control plane could
+      // observe THIS run's liveness is a property of the RUN, not of the
+      // adapter. A locally-observable adapter can still have a run that
+      // carries no handle at all - no pid and no process group - in which
+      // case the control plane never had anything to observe, and asserting
+      // that the process died is the same false verdict the gateway case
+      // had. Measured live: 87.9% of hermes_local runs and 53.0% of
+      // codex_local runs carry no handle, and 351 hermes_local + 126
+      // codex_local rows were stamped `process_lost` on that basis.
+      //
+      // The reaper already knows the distinction for the retry path:
+      // `shouldRetry` is gated on the run actually having a pid or a
+      // process group. The error code must use the same predicate -
+      // otherwise `process_lost` keeps asserting a death that was never
+      // observed, just for a different adapter set.
+      const runHasObservableHandle = !!run.processPid || !!run.processGroupId;
+      const livenessObservable = tracksLocalChild && runHasObservableHandle;
       const processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
       const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
       if (processPidAlive) {
@@ -6306,26 +6428,45 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       let descendantOnlyCleanup = false;
       if (processGroupAlive) {
-        descendantOnlyCleanup = true;
-        await terminateHeartbeatRunProcess({
-          pid: run.processPid,
-          processGroupId: run.processGroupId,
-        });
+        // ABY-896 acceptance criterion 2: never arm a process-group kill
+        // against a group that another agent's run also sits in. Killing
+        // a shared group takes down the other agent's live work, and the
+        // group is not ours to kill. Two group ids in the table (10700,
+        // 98970) are each shared by two distinct agents' runs.
+        const groupIsShared = await isProcessGroupSharedWithAnotherRun(run.processGroupId, run.id);
+        if (!groupIsShared) {
+          descendantOnlyCleanup = true;
+          await terminateHeartbeatRunProcess({
+            pid: run.processPid,
+            processGroupId: run.processGroupId,
+          });
+        }
       }
 
       const shouldRetry = tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 1;
-      const baseMessage = buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
+      // ABY-870 / ABY-896. The error code has to say what was actually
+      // observed. "process_lost" asserts that a process died; the reaper
+      // can only make that claim when it held a handle to the process and
+      // saw it gone. When liveness was NOT observable, the only true
+      // statement is that the control plane lost the execution handle -
+      // the agent may well still be running. Stamping "process_lost" in
+      // that case is what made a false verdict indistinguishable from a
+      // true one, and it is the code the repair path keys on.
+      const errorCode = livenessObservable ? "process_lost" : UNOBSERVED_LIVENESS_ERROR_CODE;
+      const baseMessage = livenessObservable
+        ? buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined)
+        : buildUnobservedLivenessMessage(adapterType);
 
       let finalizedRun = await setRunStatus(run.id, "failed", {
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
-        errorCode: "process_lost",
+        errorCode,
         finishedAt: now,
         resultJson: mergeRunStopMetadataForAgent(
           { adapterType, adapterConfig },
           "failed",
           {
             resultJson: parseObject(run.resultJson),
-            errorCode: "process_lost",
+            errorCode,
             errorMessage: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
           },
         ),
@@ -6396,6 +6537,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function reconcileStrandedAssignedIssues() {
     return recovery.reconcileStrandedAssignedIssues();
+  }
+
+  /**
+   * ABY-870 / ABY-896. Repair pass for run rows that were finalized on a
+   * false terminal and then went on to land durable writes.
+   *
+   * Deliberately independent of the issue status: the false stamp is
+   * itself what moves the issue to `blocked`, so a repair that only ran
+   * for `todo` / `in_progress` issues could never reach the rows that
+   * need it most.
+   */
+  async function sweepStrandedRunLiveness(opts?: { limit?: number }) {
+    return sweepStrandedRunLivenessRows(db, opts);
   }
 
   function issueIdFromRunContext(contextSnapshot: unknown) {
@@ -9531,6 +9685,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     wakeup: enqueueWakeup,
     triggerIssueMonitor,
 
+    // ABY-901: exposed so the acceptance tests can drive the exact
+    // run-outcome path that used to park a lane for a full interval. This is
+    // the same function the executor, the reaper and the canceller call.
+    finalizeAgentStatus,
+
     reportRunActivity: clearDetachedRunWarning,
 
     reapOrphanedRuns,
@@ -9559,6 +9718,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     },
 
     reconcileStrandedAssignedIssues,
+    sweepStrandedRunLiveness,
 
     buildIssueGraphLivenessAutoRecoveryPreview,
 
@@ -9582,9 +9742,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (!policy.enabled || policy.intervalSec <= 0) continue;
 
         checked += 1;
-        const baseline = new Date(agent.lastHeartbeatAt ?? agent.createdAt).getTime();
-        const elapsedMs = now.getTime() - baseline;
-        if (elapsedMs < policy.intervalSec * 1000) continue;
+        // ABY-901: when a lane's last run failed or timed out, `finalizeAgentStatus`
+        // left `lastHeartbeatAt` on the last SUCCESS and recorded an explicit
+        // retry deadline in `nextTimerDueAt`. The lane is due as soon as EITHER
+        // the normal interval has elapsed since the last success OR that
+        // backoff deadline has passed - whichever comes first. Without this the
+        // lane would sleep for a whole interval after every failure.
+        const dueAt = agent.nextTimerDueAt
+          ? new Date(agent.nextTimerDueAt).getTime()
+          : null;
+        if (dueAt !== null) {
+          if (now.getTime() < dueAt) continue;
+        } else {
+          const baseline = new Date(agent.lastHeartbeatAt ?? agent.createdAt).getTime();
+          const elapsedMs = now.getTime() - baseline;
+          if (elapsedMs < policy.intervalSec * 1000) continue;
+        }
 
         const run = await enqueueWakeup(agent.id, {
           source: "timer",
@@ -9600,6 +9773,40 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
         if (run) enqueued += 1;
         else skipped += 1;
+
+        // ABY-901: consume the backoff deadline once the retry is dispatched.
+        // The lane's next baseline is recomputed by `finalizeAgentStatus` when
+        // this run finishes, so leaving the deadline in place would re-dispatch
+        // the lane on every scheduler tick while the retry is still in flight.
+        //
+        // The write is conditional on the deadline still being the one we
+        // observed. If the run already finished and recorded a NEW deadline
+        // (a fast failure), clearing it here would erase that deadline and
+        // park the lane for a full interval.
+        if (agent.nextTimerDueAt && agent.heartbeatFailureStreak > 0) {
+          // Keep the lane's deadline alive while the retry is in flight, so the
+          // scheduler does not re-fire it on every tick (the deadline is in the
+          // past once dispatched). `finalizeAgentStatus` replaces this value
+          // when the run finishes: null on success, a fresh backoff on failure.
+          // If the run is lost entirely, the deadline still passes and the lane
+          // is re-dispatched instead of parking for a full interval.
+          const retryDeadline = new Date(
+            now.getTime() +
+              Math.min(
+                computeHeartbeatFailureBackoffMs(agent.heartbeatFailureStreak),
+                HEARTBEAT_FAILURE_BACKOFF_MAX_MS,
+              ),
+          );
+          await db
+            .update(agents)
+            .set({ nextTimerDueAt: retryDeadline })
+            .where(
+              and(
+                eq(agents.id, agent.id),
+                eq(agents.nextTimerDueAt, agent.nextTimerDueAt),
+              ),
+            );
+        }
       }
 
       const issueMonitors = await tickDueIssueMonitors(now);

@@ -18,7 +18,10 @@ import {
   companies,
   createDb,
   heartbeatRuns,
+  documentRevisions,
+  documents,
   issueComments,
+  issueDocuments,
   issues,
   type Db,
 } from "@paperclipai/db";
@@ -29,6 +32,7 @@ import {
   decideStrandedTimedOutRunReconcile,
   reconcileStrandedTimedOutRunLiveness,
   STRANDED_TIMED_OUT_RUN_LIVENESS_RECONCILED_ACTION,
+  sweepStrandedRunLiveness,
 } from "../services/run-liveness-reconcile.ts";
 
 describe("stranded timed-out run liveness reconciliation guard", () => {
@@ -68,15 +72,34 @@ describe("stranded timed-out run liveness reconciliation guard", () => {
     ).toEqual({ reconcile: false, reason: "no_late_evidence" });
   });
 
-  it("excludes runs outside the wait-budget family", () => {
+  it("excludes runs outside the false-terminal family", () => {
     const finishedAt = new Date("2026-10-23T00:49:35.390Z");
     const later = new Date("2026-10-23T00:53:31.526Z");
 
-    for (const runStatus of ["succeeded", "failed", "cancelled", "running", "queued"]) {
+    // ABY-870 / ABY-896. `failed` qualifies only when the error code
+    // says the control plane could not observe the run liveness. A
+    // failed run that actually failed is not a false terminal.
+    for (const runStatus of ["succeeded", "cancelled", "running", "queued"]) {
       expect(
         decideStrandedTimedOutRunReconcile({ runStatus, finishedAt, latestEvidenceAt: later }),
       ).toEqual({ reconcile: false, reason: "not_timed_out" });
     }
+    expect(
+      decideStrandedTimedOutRunReconcile({
+        runStatus: "failed",
+        errorCode: "adapter_crashed",
+        finishedAt,
+        latestEvidenceAt: later,
+      }),
+    ).toEqual({ reconcile: false, reason: "not_false_terminal" });
+    expect(
+      decideStrandedTimedOutRunReconcile({
+        runStatus: "failed",
+        errorCode: null,
+        finishedAt,
+        latestEvidenceAt: later,
+      }),
+    ).toEqual({ reconcile: false, reason: "not_false_terminal" });
     expect(
       decideStrandedTimedOutRunReconcile({
         runStatus: "timed_out",
@@ -84,6 +107,35 @@ describe("stranded timed-out run liveness reconciliation guard", () => {
         latestEvidenceAt: later,
       }),
     ).toEqual({ reconcile: false, reason: "no_finished_at" });
+  });
+
+  it("admits process_lost rows, whose stamp asserted an unobserved death (ABY-870)", () => {
+    const finishedAt = new Date("2026-10-23T00:49:35.390Z");
+    const later = new Date("2026-10-23T00:53:31.526Z");
+
+    // The historical `process_lost` rows were stamped by a reaper
+    // that held no handle to the agent process, so the stamp is not
+    // evidence the run died. A late own-write is positive evidence
+    // it did not.
+    expect(
+      decideStrandedTimedOutRunReconcile({
+        runStatus: "failed",
+        errorCode: "process_lost",
+        finishedAt,
+        latestEvidenceAt: later,
+      }),
+    ).toEqual({ reconcile: true, lateEvidenceAt: later });
+
+    // The code the reaper now writes for adapters whose execution
+    // the control plane cannot observe.
+    expect(
+      decideStrandedTimedOutRunReconcile({
+        runStatus: "failed",
+        errorCode: "execution_handle_lost",
+        finishedAt,
+        latestEvidenceAt: later,
+      }),
+    ).toEqual({ reconcile: true, lateEvidenceAt: later });
   });
 });
 
@@ -104,8 +156,11 @@ describe("reconcileStrandedTimedOutRunLiveness", () => {
 
   async function seedTimedOutRun(input?: {
     runStatus?: "timed_out" | "succeeded" | "failed";
+    errorCode?: string | null;
     livenessState?: "failed" | "advanced" | null;
     issueStatus?: "in_progress" | "done";
+    /** A run with no source issue in its context (a heartbeat-timer run). */
+    noSourceIssue?: boolean;
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -147,9 +202,9 @@ describe("reconcileStrandedTimedOutRunLiveness", () => {
       invocationSource: "assignment",
       triggerDetail: "system",
       status: input?.runStatus ?? "timed_out",
-      contextSnapshot: { issueId },
+      contextSnapshot: input?.noSourceIssue ? {} : { issueId },
       error: "OpenClaw gateway run did not complete within waitTimeoutMs=600000ms",
-      errorCode: "timeout",
+      errorCode: input?.errorCode === undefined ? "timeout" : input.errorCode,
       livenessState: input?.livenessState === undefined ? "failed" : input.livenessState,
       lastUsefulActionAt: null,
       startedAt: new Date("2026-10-23T00:39:34.902Z"),
@@ -245,14 +300,20 @@ describe("reconcileStrandedTimedOutRunLiveness", () => {
     expect((await readRun(ctx.runId))?.livenessState).toBe("failed");
   });
 
-  it("leaves non-timed_out runs alone even when late evidence exists", async () => {
+  it("leaves genuinely failed runs alone even when late evidence exists", async () => {
     for (const runStatus of ["succeeded", "failed"] as const) {
-      const ctx = await seedTimedOutRun({ runStatus, livenessState: "failed" });
+      // A run that actually failed is not a false terminal: its own
+      // late writes do not prove the control plane mis-stamped it.
+      const ctx = await seedTimedOutRun({
+        runStatus,
+        errorCode: runStatus === "failed" ? "adapter_crashed" : null,
+        livenessState: "failed",
+      });
       await addComment(ctx, new Date("2026-10-23T00:53:31.526Z"));
 
       const result = await reconcileStrandedTimedOutRunLiveness(db, ctx.runId);
       expect(result.reconciled).toBe(false);
-      expect(result.reason).toBe("not_timed_out");
+      expect(result.reason).toBe(runStatus === "failed" ? "not_false_terminal" : "not_timed_out");
 
       const run = await readRun(ctx.runId);
       expect(run?.livenessState).toBe("failed");
@@ -347,6 +408,182 @@ describe("reconcileStrandedTimedOutRunLiveness", () => {
     const result = await reconcileStrandedTimedOutRunLiveness(db, ctx.runId);
     expect(result.reconciled).toBe(false);
     expect(result.reason).toBe("no_late_evidence");
+
+    const run = await readRun(ctx.runId);
+    expect(run?.livenessState).toBe("failed");
+    expect(run?.lastUsefulActionAt).toBeNull();
+  });
+
+  it("repairs a process_lost row whose own writes landed after the false stamp (ABY-896)", async () => {
+    // The ABY-870 class: the reaper stamped the run `process_lost` on the
+    // strength of a handle the control plane never had, and the agent went
+    // on to land real durable writes afterwards. The row must be repaired,
+    // not left frozen at `failed` forever.
+    const ctx = await seedTimedOutRun({ runStatus: "failed", errorCode: "process_lost" });
+    const ownWriteAt = new Date("2026-10-23T00:53:31.526Z");
+    await addComment(ctx, ownWriteAt);
+
+    const result = await reconcileStrandedTimedOutRunLiveness(db, ctx.runId);
+    expect(result.reconciled).toBe(true);
+
+    const run = await readRun(ctx.runId);
+    expect(run?.livenessState).toBe("advanced");
+    expect(run?.lastUsefulActionAt?.toISOString()).toBe(ownWriteAt.toISOString());
+  });
+
+  it("repairs an execution_handle_lost row the same way (ABY-896)", async () => {
+    // The code the reaper now writes for adapters whose execution the
+    // control plane cannot observe. Same repair path, same predicate.
+    const ctx = await seedTimedOutRun({ runStatus: "failed", errorCode: "execution_handle_lost" });
+    const ownWriteAt = new Date("2026-10-23T00:53:31.526Z");
+    await addComment(ctx, ownWriteAt);
+
+    const result = await reconcileStrandedTimedOutRunLiveness(db, ctx.runId);
+    expect(result.reconciled).toBe(true);
+
+    const run = await readRun(ctx.runId);
+    expect(run?.livenessState).toBe("advanced");
+    expect(run?.lastUsefulActionAt?.toISOString()).toBe(ownWriteAt.toISOString());
+  });
+
+  it("repairs a sourceless run whose own writes landed on another issue (ABY-896)", async () => {
+    // A run with no source issue in its context has no issue to scope its
+    // evidence to. Scoping to the run's own issue is inapplicable
+    // rather than restrictive for these, and the run's own writes count
+    // wherever they landed. (Measured live: 15 of the 36 process_lost
+    // rows with late own-writes are in this shape - several have no
+    // source issue at all.)
+    const ctx = await seedTimedOutRun({ runStatus: "failed", errorCode: "process_lost", noSourceIssue: true });
+    const ownWriteAt = new Date("2026-10-23T00:53:31.526Z");
+    await addComment(ctx, ownWriteAt);
+
+    const result = await reconcileStrandedTimedOutRunLiveness(db, ctx.runId);
+    expect(result.reconciled).toBe(true);
+
+    const run = await readRun(ctx.runId);
+    expect(run?.livenessState).toBe("advanced");
+    expect(run?.lastUsefulActionAt?.toISOString()).toBe(ownWriteAt.toISOString());
+  });
+
+  it("does not repair a false-terminal row whose own writes all predate the stamp", async () => {
+    const ctx = await seedTimedOutRun({ runStatus: "failed", errorCode: "process_lost" });
+    await addComment(ctx, new Date("2026-10-23T00:49:35.385Z"));
+
+    const result = await reconcileStrandedTimedOutRunLiveness(db, ctx.runId);
+    expect(result.reconciled).toBe(false);
+    expect(result.reason).toBe("no_late_evidence");
+
+    const run = await readRun(ctx.runId);
+    expect(run?.livenessState).toBe("failed");
+    expect(run?.lastUsefulActionAt).toBeNull();
+  });
+
+  it("sweeps a false-terminal row whose issue was already blocked (ABY-896)", async () => {
+    // The live ABY-843 shape: the false stamp moved the issue to
+    // `blocked`, and the run's own write landed afterwards. The
+    // recovery path only visits `todo` / `in_progress` issues, so
+    // the repair is only reachable from the status-independent sweep.
+    const ctx = await seedTimedOutRun({ runStatus: "failed", errorCode: "process_lost" });
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, ctx.issueId));
+    const ownWriteAt = new Date("2026-10-23T00:53:31.526Z");
+    await addComment(ctx, ownWriteAt);
+
+    const swept = await sweepStrandedRunLiveness(db, { limit: 50 });
+    expect(swept.runIds).toContain(ctx.runId);
+
+    const run = await readRun(ctx.runId);
+    expect(run?.livenessState).toBe("advanced");
+    expect(run?.lastUsefulActionAt?.toISOString()).toBe(ownWriteAt.toISOString());
+  });
+
+  it("sweeps every qualifying row, not just the first window (ABY-896)", async () => {
+    // The sweep selects candidates with a LIMIT. If the query is not
+    // ordered, the window is arbitrary, and a pass can come back empty
+    // while qualifying rows sit outside it - the sweep would report
+    // convergence it had not reached, and those rows would stay frozen
+    // at `failed` forever. This pins that every qualifying row is
+    // reached.
+    const contexts = [];
+    for (let i = 0; i < 5; i++) {
+      const ctx = await seedTimedOutRun({ runStatus: "failed", errorCode: "process_lost" });
+      await addComment(ctx, new Date("2026-10-23T00:53:31.526Z"));
+      contexts.push(ctx);
+    }
+
+    const swept = await sweepStrandedRunLiveness(db, { limit: 50 });
+    for (const ctx of contexts) {
+      expect(swept.runIds).toContain(ctx.runId);
+      const run = await readRun(ctx.runId);
+      expect(run?.livenessState).toBe("advanced");
+    }
+  });
+
+  it("reaches a false-terminal row whose only late evidence is a document revision (ABY-896)", async () => {
+    // The sweep's SQL prefilter and the per-row predicate must agree on
+    // what counts as evidence. A comment-only prefilter cannot SEE a row
+    // whose only late own-write is a document revision, so the sweep
+    // reports convergence it had not reached and the row stays frozen.
+    // Measured live: 2 qualifying rows were invisible to the
+    // comment-only prefilter.
+    const ctx = await seedTimedOutRun({ runStatus: "failed", errorCode: "process_lost" });
+    const ownWriteAt = new Date("2026-10-23T00:53:31.526Z");
+    const documentId = randomUUID();
+    await db.insert(documents).values({
+      id: documentId,
+      companyId: ctx.companyId,
+      title: "Work product",
+      latestBody: "Durable write landed after the wait budget expired.",
+    });
+    await db.insert(issueDocuments).values({
+      companyId: ctx.companyId,
+      issueId: ctx.issueId,
+      documentId,
+      key: "work-product",
+    });
+    await db.insert(documentRevisions).values({
+      companyId: ctx.companyId,
+      documentId,
+      revisionNumber: 1,
+      body: "Durable write landed after the wait budget expired.",
+      createdByAgentId: ctx.agentId,
+      createdByRunId: ctx.runId,
+      createdAt: ownWriteAt,
+    });
+
+    const swept = await sweepStrandedRunLiveness(db, { limit: 50 });
+    expect(swept.runIds).toContain(ctx.runId);
+
+    const run = await readRun(ctx.runId);
+    expect(run?.livenessState).toBe("advanced");
+    expect(run?.lastUsefulActionAt?.toISOString()).toBe(ownWriteAt.toISOString());
+  });
+
+  it("does not credit a run for a write that landed in another company (ABY-896)", async () => {
+    // A comment attributed to the run but belonging to a DIFFERENT tenant
+    // is not this run's own write. Crediting the run for it would be a
+    // cross-tenant repair. Measured live: 21 such rows, all correctly
+    // rejected by the per-row predicate - and now by the SQL prefilter
+    // too, so they no longer occupy slots in the sweep's LIMIT window.
+    const ctx = await seedTimedOutRun({ runStatus: "failed", errorCode: "process_lost" });
+    const otherCompanyId = randomUUID();
+    await db.insert(companies).values({
+      id: otherCompanyId,
+      name: "Other Tenant",
+      issuePrefix: otherCompanyId.replace(/-/g, "").slice(0, 8).toUpperCase(),
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issueComments).values({
+      companyId: otherCompanyId,
+      issueId: ctx.issueId,
+      authorAgentId: ctx.agentId,
+      createdByRunId: ctx.runId,
+      body: "A write attributed to this run but belonging to another tenant.",
+      createdAt: new Date("2026-10-23T00:53:31.526Z"),
+      updatedAt: new Date("2026-10-23T00:53:31.526Z"),
+    });
+
+    const swept = await sweepStrandedRunLiveness(db, { limit: 50 });
+    expect(swept.runIds).not.toContain(ctx.runId);
 
     const run = await readRun(ctx.runId);
     expect(run?.livenessState).toBe("failed");

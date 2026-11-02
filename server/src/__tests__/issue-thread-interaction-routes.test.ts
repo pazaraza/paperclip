@@ -295,7 +295,12 @@ describe.sequential("issue thread interaction routes", () => {
     const listRes = await request(app).get("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions");
     expect(listRes.status).toBe(200);
     expect(listRes.body).toEqual([
-      { id: "interaction-1", kind: "suggest_tasks", status: "pending" },
+      {
+        id: "interaction-1",
+        kind: "suggest_tasks",
+        status: "pending",
+        wakeTarget: { agentId: ASSIGNEE_AGENT_ID, source: "issue_assignee" },
+      },
     ]);
 
     const createRes = await request(app)
@@ -309,6 +314,10 @@ describe.sequential("issue thread interaction routes", () => {
       });
 
     expect(createRes.status).toBe(201);
+    expect(createRes.body.wakeTarget).toEqual({
+      agentId: ASSIGNEE_AGENT_ID,
+      source: "issue_assignee",
+    });
     expect(mockInteractionService.create).toHaveBeenCalled();
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),
@@ -654,5 +663,173 @@ describe.sequential("issue thread interaction routes", () => {
         userId: null,
       },
     );
+  });
+
+  it("wakes the card creator when the issue has no assignee", async () => {
+    mockIssueService.getById.mockResolvedValue(createIssue({ assigneeAgentId: null }));
+    mockInteractionService.answerQuestions.mockResolvedValue({
+      id: "interaction-2",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "ask_user_questions",
+      status: "answered",
+      continuationPolicy: "wake_assignee",
+      idempotencyKey: null,
+      sourceCommentId: "comment-2",
+      sourceRunId: "run-2",
+      createdByAgentId: CREATED_AGENT_ID,
+      payload: {
+        version: 1,
+        questions: [
+          {
+            id: "scope",
+            prompt: "Scope?",
+            selectionMode: "single",
+            options: [{ id: "phase-1", label: "Phase 1" }],
+          },
+        ],
+      },
+      result: {
+        version: 1,
+        answers: [{ questionId: "scope", optionIds: ["phase-1"] }],
+      },
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:05:00.000Z",
+      resolvedAt: "2026-04-20T12:05:00.000Z",
+    });
+    const app = await createApp();
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-2/respond")
+      .send({
+        answers: [{ questionId: "scope", optionIds: ["phase-1"] }],
+      });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      CREATED_AGENT_ID,
+      expect.objectContaining({
+        reason: "issue_commented",
+        payload: expect.objectContaining({
+          interactionId: "interaction-2",
+          wakeTargetAgentId: CREATED_AGENT_ID,
+          wakeTargetSource: "card_creator",
+        }),
+        contextSnapshot: expect.objectContaining({
+          wakeTargetAgentId: CREATED_AGENT_ID,
+          wakeTargetSource: "card_creator",
+        }),
+      }),
+    );
+  });
+
+  it("wakes nobody when the card has no assignee and no creator", async () => {
+    mockIssueService.getById.mockResolvedValue(createIssue({ assigneeAgentId: null }));
+    mockInteractionService.answerQuestions.mockResolvedValue({
+      id: "interaction-2",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "ask_user_questions",
+      status: "answered",
+      continuationPolicy: "wake_assignee",
+      idempotencyKey: null,
+      sourceCommentId: "comment-2",
+      sourceRunId: "run-2",
+      createdByAgentId: null,
+      payload: {
+        version: 1,
+        questions: [
+          {
+            id: "scope",
+            prompt: "Scope?",
+            selectionMode: "single",
+            options: [{ id: "phase-1", label: "Phase 1" }],
+          },
+        ],
+      },
+      result: {
+        version: 1,
+        answers: [{ questionId: "scope", optionIds: ["phase-1"] }],
+      },
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:05:00.000Z",
+      resolvedAt: "2026-04-20T12:05:00.000Z",
+    });
+    const app = await createApp();
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-2/respond")
+      .send({
+        answers: [{ questionId: "scope", optionIds: ["phase-1"] }],
+      });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it("refuses to create a wake_assignee card that has no wake target", async () => {
+    mockIssueService.getById.mockResolvedValue(createIssue({ assigneeAgentId: null }));
+    const app = await createApp();
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+      .send({
+        kind: "suggest_tasks",
+        payload: {
+          version: 1,
+          tasks: [{ clientKey: "task-1", title: "One" }],
+        },
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("interaction_wake_target_missing");
+    expect(mockInteractionService.create).not.toHaveBeenCalled();
+  });
+
+  it("creates a wake_assignee card from an agent seat on an issue with no assignee", async () => {
+    mockIssueService.getById.mockResolvedValue(createIssue({ assigneeAgentId: null }));
+    const app = await createApp({
+      type: "agent",
+      agentId: CREATED_AGENT_ID,
+      companyId: "company-1",
+      runId: "run-1",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+      .send({
+        kind: "suggest_tasks",
+        payload: {
+          version: 1,
+          tasks: [{ clientKey: "task-1", title: "One" }],
+        },
+      });
+
+    expect(res.status).toBe(201);
+    expect(res.body.wakeTarget).toEqual({
+      agentId: CREATED_AGENT_ID,
+      source: "card_creator",
+    });
+    expect(mockInteractionService.create).toHaveBeenCalled();
+  });
+
+  it("creates a card with continuationPolicy none on an issue with no assignee", async () => {
+    mockIssueService.getById.mockResolvedValue(createIssue({ assigneeAgentId: null }));
+    const app = await createApp();
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+      .send({
+        kind: "request_confirmation",
+        continuationPolicy: "none",
+        payload: {
+          version: 1,
+          prompt: "Proceed?",
+        },
+      });
+
+    expect(res.status).toBe(201);
+    expect(mockInteractionService.create).toHaveBeenCalled();
   });
 });

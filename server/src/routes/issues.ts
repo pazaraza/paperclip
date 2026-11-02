@@ -90,6 +90,10 @@ import {
   SVG_CONTENT_TYPE,
 } from "../attachment-types.js";
 import { queueIssueAssignmentWakeup, recordAgentWakeAttempt, isRoutineExecutionOpenConflict } from "../services/issue-assignment-wakeup.js";
+import {
+  resolveInteractionWakeTarget,
+  isWakeAssigneeContinuationPolicy,
+} from "../services/interaction-wake-target.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { executionWorkspaceService as executionWorkspaceServiceDirect } from "../services/execution-workspaces.js";
 import { feedbackService } from "../services/feedback.js";
@@ -632,24 +636,72 @@ function queueResolvedInteractionContinuationWakeup(input: {
     kind: string;
     status: string;
     continuationPolicy: string;
+    createdByAgentId?: string | null;
     sourceCommentId?: string | null;
     sourceRunId?: string | null;
   };
   actor: { actorType: "user" | "agent"; actorId: string };
   source: string;
 }) {
-  if (
-    input.interaction.continuationPolicy !== "wake_assignee"
-    && input.interaction.continuationPolicy !== "wake_assignee_on_accept"
-  ) return;
+  if (!isWakeAssigneeContinuationPolicy(input.interaction.continuationPolicy)) return;
   if (
     input.interaction.continuationPolicy === "wake_assignee_on_accept"
     && input.interaction.status !== "accepted"
   ) return;
   if (input.interaction.status === "expired") return;
-  if (!input.issue.assigneeAgentId || isClosedIssueStatus(input.issue.status)) return;
+  if (isClosedIssueStatus(input.issue.status)) {
+    // The issue beneath the card is closed (done/cancelled). The answer cannot
+    // be delivered to anybody, so record that instead of dropping it silently.
+    logger.info(
+      {
+        issueId: input.issue.id,
+        interactionId: input.interaction.id,
+        interactionKind: input.interaction.kind,
+        interactionStatus: input.interaction.status,
+        issueStatus: input.issue.status,
+        source: input.source,
+      },
+      "resolved interaction skipped: the issue is closed",
+    );
+    return;
+  }
 
-  input.heartbeat.wakeup(input.issue.assigneeAgentId, {
+  // RUAAAAA-5786: the wake target is resolved through a fallback chain, so a
+  // card filed on an issue with no assignee still reaches the seat that filed
+  // it. Before this, the card resolved to nobody and the board's answer was
+  // delivered nowhere.
+  const wakeTarget = resolveInteractionWakeTarget({
+    issueAssigneeAgentId: input.issue.assigneeAgentId,
+    cardCreatorAgentId: input.interaction.createdByAgentId,
+  });
+  if (!wakeTarget) {
+    // The board answered a card and there is nobody to wake. This used to
+    // return silently: no log, no error, no metric.
+    logger.warn(
+      {
+        issueId: input.issue.id,
+        interactionId: input.interaction.id,
+        interactionKind: input.interaction.kind,
+        interactionStatus: input.interaction.status,
+        source: input.source,
+      },
+      "resolved interaction has no wake target: the answer was delivered to nobody",
+    );
+    return;
+  }
+  if (wakeTarget.source === "card_creator") {
+    logger.info(
+      {
+        issueId: input.issue.id,
+        interactionId: input.interaction.id,
+        agentId: wakeTarget.agentId,
+        source: input.source,
+      },
+      "resolved interaction woke the card creator: the issue has no assignee",
+    );
+  }
+
+  input.heartbeat.wakeup(wakeTarget.agentId, {
     source: "automation",
     triggerDetail: "system",
     reason: "issue_commented",
@@ -661,6 +713,8 @@ function queueResolvedInteractionContinuationWakeup(input: {
       sourceCommentId: input.interaction.sourceCommentId ?? null,
       sourceRunId: input.interaction.sourceRunId ?? null,
       mutation: "interaction",
+      wakeTargetAgentId: wakeTarget.agentId,
+      wakeTargetSource: wakeTarget.source,
     },
     requestedByActorType: input.actor.actorType,
     requestedByActorId: input.actor.actorId,
@@ -674,6 +728,8 @@ function queueResolvedInteractionContinuationWakeup(input: {
       sourceRunId: input.interaction.sourceRunId ?? null,
       wakeReason: "issue_commented",
       source: input.source,
+      wakeTargetAgentId: wakeTarget.agentId,
+      wakeTargetSource: wakeTarget.source,
     },
   }).catch(async (err) => {
     // Persist the wake attempt on agent_runtime_state so the fleet-health
@@ -681,20 +737,20 @@ function queueResolvedInteractionContinuationWakeup(input: {
     // failures that left the last run path clean. Contention on
     // issues_open_routine_execution_uq is logged at info, not warn — see
     // RUAAAAA-5205.
-    if (input.issue.assigneeAgentId) {
+    if (wakeTarget.agentId) {
       if (isRoutineExecutionOpenConflict(err)) {
         logger.info(
           {
             err,
             issueId: input.issue.id,
             interactionId: input.interaction.id,
-            agentId: input.issue.assigneeAgentId,
+            agentId: wakeTarget.agentId,
           },
           "skipped wake: open routine execution already exists for this routine",
         );
         await recordAgentWakeAttempt({
           db: input.db,
-          agentId: input.issue.assigneeAgentId,
+          agentId: wakeTarget.agentId,
           errorMessage:
             "issues_open_routine_execution_uq: another open execution already holds the routine lock",
         });
@@ -702,7 +758,7 @@ function queueResolvedInteractionContinuationWakeup(input: {
       }
       await recordAgentWakeAttempt({
         db: input.db,
-        agentId: input.issue.assigneeAgentId,
+        agentId: wakeTarget.agentId,
         errorMessage: err instanceof Error ? err.message : String(err),
       });
     }
@@ -710,8 +766,9 @@ function queueResolvedInteractionContinuationWakeup(input: {
       err,
       issueId: input.issue.id,
       interactionId: input.interaction.id,
-      agentId: input.issue.assigneeAgentId,
-    }, "failed to wake assignee on issue interaction resolution");
+      agentId: wakeTarget.agentId,
+      wakeTargetSource: wakeTarget.source,
+    }, "failed to wake the interaction wake target on issue interaction resolution");
   });
 }
 
@@ -3917,7 +3974,15 @@ export function issueRoutes(
     }
     assertCompanyAccess(req, issue.companyId);
     const interactions = await issueThreadInteractionService(db).listForIssue(id);
-    res.json(interactions);
+    // RUAAAAA-5786: surface the wake target so a stranded card is visible to
+    // the board instead of being invisible until the answer goes nowhere.
+    res.json(interactions.map((interaction) => ({
+      ...interaction,
+      wakeTarget: resolveInteractionWakeTarget({
+        issueAssigneeAgentId: issue.assigneeAgentId,
+        cardCreatorAgentId: interaction.createdByAgentId,
+      }),
+    })));
   });
 
   router.post("/issues/:id/interactions", validate(createIssueThreadInteractionSchema), async (req, res) => {
@@ -3937,6 +4002,33 @@ export function issueRoutes(
     const actor = getActorInfo(req);
     const agentSourceRunId = req.actor.type === "agent" ? await resolveAgentRunId(req, res) : null;
     if (req.actor.type === "agent" && !agentSourceRunId) return;
+
+    // RUAAAAA-5786: a wake_assignee card must have somebody to wake. The issue
+    // assignee is the primary target and the seat filing the card is the
+    // fallback, so an agent-filed card always resolves to a target. A card
+    // that resolves to neither would deliver the board's answer to nobody, so
+    // it is refused at creation instead of being born stranded. The fallback
+    // is the escape hatch: no filing seat is locked out of the review path.
+    const continuationPolicy = typeof req.body?.continuationPolicy === "string"
+      ? req.body.continuationPolicy
+      : null;
+    const wakeTarget = resolveInteractionWakeTarget({
+      issueAssigneeAgentId: issue.assigneeAgentId,
+      cardCreatorAgentId: actor.agentId,
+    });
+    if (isWakeAssigneeContinuationPolicy(continuationPolicy) && !wakeTarget) {
+      res.status(422).json({
+        error: "This card has no wake target: the issue has no assignee and the card was not filed by an agent seat.",
+        code: "interaction_wake_target_missing",
+        continuationPolicy,
+        remediation: [
+          "Assign the issue to a seat that can act on the answer, or",
+          "file the card from an agent seat (the filing seat is woken as the fallback), or",
+          "use continuationPolicy 'none' when the answer does not need to wake anybody.",
+        ],
+      });
+      return;
+    }
 
     const interaction = await issueThreadInteractionService(db).create(issue, {
       ...req.body,
@@ -3963,7 +4055,7 @@ export function issueRoutes(
       },
     });
 
-    res.status(201).json(interaction);
+    res.status(201).json({ ...interaction, wakeTarget });
   });
 
   router.post(

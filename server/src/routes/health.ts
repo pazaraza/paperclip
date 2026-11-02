@@ -113,9 +113,29 @@ export function healthRoutes(
         .where(inArray(heartbeatRuns.status, ["queued", "running"]))
         .then((rows) => Number(rows[0]?.count ?? 0));
 
+      // ABY-919: the idle gate must key on runs that are actually EXECUTING.
+      //
+      // A queued run is persisted work: the startup path calls
+      // `resumeQueuedRuns`, so a restart cannot lose it. Counting queued
+      // runs toward "is the instance idle" measures queue depth, not
+      // restart risk, and it makes the gate structurally unreachable on a
+      // busy fleet - the instance never reaches zero active runs because
+      // the queue is always refilling.
+      //
+      // Measured on this control plane: over 10:22Z-16:23Z the instance had
+      // ZERO idle minutes by the queued+running definition (minimum 4 active
+      // at every one of 362 one-minute samples). An idle-guarded restart
+      // keyed on that number could never fire.
+      const runningRunCount = await db
+        .select({ count: count() })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.status, "running"))
+        .then((rows) => Number(rows[0]?.count ?? 0));
+
       devServer = toDevServerHealthStatus(persistedDevServerStatus, {
         autoRestartEnabled: experimentalSettings.autoRestartDevServerWhenIdle ?? false,
         activeRunCount,
+        runningRunCount,
       });
     }
 
