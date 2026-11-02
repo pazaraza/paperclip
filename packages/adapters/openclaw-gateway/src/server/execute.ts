@@ -13,6 +13,12 @@ import {
   stringifyPaperclipWakePayload,
 } from "@paperclipai/adapter-utils/server-utils";
 import crypto, { randomUUID } from "node:crypto";
+import {
+  describeClaimedApiKeyFailure,
+  expandClaimedApiKeyPath,
+  readClaimedApiKeyFile,
+} from "./claimedApiKey.js";
+import type { ClaimedApiKeyFileResult } from "./claimedApiKey.js";
 import { WebSocket } from "ws";
 
 type SessionKeyStrategy = "fixed" | "issue" | "run";
@@ -1058,7 +1064,33 @@ function buildWakeText(
   paperclipEnv: Record<string, string>,
   structuredWakePrompt: string,
   claimedApiKeyPath: string,
+  claimedApiKeyStatus: ClaimedApiKeyFileResult,
 ): string {
+  // RUAAAAA-5770: the claimed API key file is the only copy of the seat's
+  // bearer token (the server stores a sha256). When it holds a placeholder
+  // or a scrubbed value, EVERY Paperclip call answers 401
+  // {"error":"Unauthorized","guard":"signature"} and the seat looks
+  // authenticated the whole time. Say so at the top of the wake instead of
+  // letting the run burn 30 hours on a 401 loop.
+  const credentialGuardLines: string[] = [];
+  if (
+    !claimedApiKeyStatus.ok &&
+    claimedApiKeyStatus.reason !== "missing" &&
+    claimedApiKeyStatus.reason !== "unreadable"
+  ) {
+    credentialGuardLines.push(
+      "!!! CLAIMED API KEY FILE IS INVALID - FIX IT BEFORE YOUR FIRST PAPERCLIP CALL !!!",
+      `The claimed API key file ${claimedApiKeyPath} is unusable: ${describeClaimedApiKeyFailure(claimedApiKeyStatus)}.`,
+      "Each Paperclip call made with that file answers 401 Unauthorized (guard=signature). The seat looks authenticated and is not (RUAAAAA-5770).",
+      "Do not make Paperclip calls until the file holds a real token:",
+      "  1. re-claim the key (the board approves the claim; the claim response carries .token),",
+      "  2. write it with the Paperclip repo helper, token on STDIN so the token literal never appears in a shell command:",
+      `       node scripts/paperclip/write-claimed-key.mjs --path ${claimedApiKeyPath}`,
+      "  3. the file must contain a real pcp_ token and stay mode 0600.",
+      "Never write a placeholder token, and never paste a token literal into a command string: the OpenClaw exec scrubber rewrites it to *** and the file becomes unusable.",
+      "",
+    );
+  }
   const orderedKeys = [
     "PAPERCLIP_RUN_ID",
     "PAPERCLIP_AGENT_ID",
@@ -1083,6 +1115,7 @@ function buildWakeText(
   const apiBaseHint = paperclipEnv.PAPERCLIP_API_URL ?? "<set PAPERCLIP_API_URL>";
 
   const lines = [
+    ...credentialGuardLines,
     "Paperclip wake event for a cloud adapter.",
     "",
     "Run this procedure now. Do not guess undocumented endpoints and do not ask for additional heartbeat docs.",
@@ -1822,13 +1855,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const paperclipEnv = buildPaperclipEnvForWake(ctx, wakePayload);
   const structuredWakePrompt = renderPaperclipWakePrompt(ctx.context.paperclipWake);
   const structuredWakeJson = stringifyPaperclipWakePayload(ctx.context.paperclipWake);
+  const claimedApiKeyPath = expandClaimedApiKeyPath(
+    resolveClaimedApiKeyPath(ctx.config.claimedApiKeyPath),
+  );
+  const claimedApiKeyStatus = readClaimedApiKeyFile(claimedApiKeyPath);
   const wakeText = buildWakeText(
     wakePayload,
     paperclipEnv,
     structuredWakeJson
       ? joinWakePayloadSections(structuredWakePrompt, structuredWakeJson)
       : structuredWakePrompt,
-    resolveClaimedApiKeyPath(ctx.config.claimedApiKeyPath),
+    claimedApiKeyPath,
+    claimedApiKeyStatus,
   );
 
   const sessionKeyStrategy = normalizeSessionKeyStrategy(ctx.config.sessionKeyStrategy);
