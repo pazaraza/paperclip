@@ -37,9 +37,8 @@ interface AdapterCtxOverrides {
   runId?: string;
 }
 
-async function executeHermes(overrides: AdapterCtxOverrides = {}) {
-  const adapter = requireServerAdapter("hermes_local");
-  const ctx = {
+function buildHermesCtx(overrides: AdapterCtxOverrides = {}) {
+  return {
     runId: overrides.runId ?? "run-123",
     agent: {
       id: "agent-123",
@@ -57,9 +56,23 @@ async function executeHermes(overrides: AdapterCtxOverrides = {}) {
     onSpawn: async () => {},
     ...(overrides.authToken === undefined ? {} : { authToken: overrides.authToken }),
   };
-  await adapter.execute(ctx);
+}
+
+async function executeHermes(overrides: AdapterCtxOverrides = {}) {
+  const adapter = requireServerAdapter("hermes_local");
+  await adapter.execute(buildHermesCtx(overrides));
   expect(hermesExecuteMock).toHaveBeenCalledTimes(1);
   return hermesExecuteMock.mock.calls[0][0];
+}
+
+/**
+ * RUAAAAA-5770: an EXISTING but unusable claimed key file must fail the run
+ * loudly instead of silently continuing on the local-agent JWT path, which
+ * can only answer 401 for a hermes_local seat.
+ */
+async function executeHermesExpectingRejection(overrides: AdapterCtxOverrides = {}) {
+  const adapter = requireServerAdapter("hermes_local");
+  await expect(adapter.execute(buildHermesCtx(overrides))).rejects.toThrow(/claimed API key file/i);
 }
 
 describe("hermes_local PAPERCLIP_API_KEY injection (RUAAAAA-2375)", () => {
@@ -155,52 +168,46 @@ describe("hermes_local PAPERCLIP_API_KEY injection (RUAAAAA-2375)", () => {
     expect(fsReadFileSpy).toHaveBeenCalledWith(missing, expect.any(String));
   });
 
-  it("falls back to the local JWT when the configured file is malformed JSON", async () => {
+  it("refuses the JWT fallback when the configured file is malformed JSON", async () => {
     const malformed = path.join(tmpRoot, "malformed.json");
     fs.writeFileSync(malformed, "not-json{");
-    const patchedCtx = await executeHermes({
+    await executeHermesExpectingRejection({
       authToken: "broken-local-agent-jwt",
       agent: { adapterConfig: { claimedApiKeyPath: malformed } },
     });
-
-    expect(patchedCtx.agent.adapterConfig.env.PAPERCLIP_API_KEY).toBe("broken-local-agent-jwt");
     expect(fsReadFileSpy).toHaveBeenCalledWith(malformed, expect.any(String));
   });
 
-  it("falls back to the local JWT when the token field is missing", async () => {
+  it("refuses the JWT fallback when the token field is missing", async () => {
     const noToken = path.join(tmpRoot, "no-token.json");
     fs.writeFileSync(noToken, JSON.stringify({ agentId: "x" }));
-    const ctx = await executeHermes({
+    await executeHermesExpectingRejection({
       authToken: "j-missing", agent: { adapterConfig: { claimedApiKeyPath: noToken } },
     });
-    expect(ctx.agent.adapterConfig.env.PAPERCLIP_API_KEY).toBe("j-missing");
   });
 
-  it("falls back to the local JWT when the token is not pcp_-prefixed", async () => {
+  it("refuses the JWT fallback when the token is not pcp_-prefixed", async () => {
     const noPrefix = path.join(tmpRoot, "bad-prefix.json");
     fs.writeFileSync(noPrefix, JSON.stringify({ token: "jwt-shaped-token" }));
-    const ctx = await executeHermes({
+    await executeHermesExpectingRejection({
       authToken: "j-prefix", agent: { adapterConfig: { claimedApiKeyPath: noPrefix } },
     });
-    expect(ctx.agent.adapterConfig.env.PAPERCLIP_API_KEY).toBe("j-prefix");
   });
 
-  it("falls back to the local JWT when the token is an empty string", async () => {
+  it("refuses the JWT fallback when the token is an empty string", async () => {
     const blank = path.join(tmpRoot, "blank.json");
     fs.writeFileSync(blank, JSON.stringify({ token: "" }));
-    const ctx = await executeHermes({
+    await executeHermesExpectingRejection({
       authToken: "j-blank", agent: { adapterConfig: { claimedApiKeyPath: blank } },
     });
-    expect(ctx.agent.adapterConfig.env.PAPERCLIP_API_KEY).toBe("j-blank");
   });
 
-  it("falls back to the local JWT when the JSON root is not an object", async () => {
+  it("refuses the JWT fallback when the JSON root is not an object", async () => {
     const notObject = path.join(tmpRoot, "not-object.json");
     fs.writeFileSync(notObject, JSON.stringify(["nope"]));
-    const ctx = await executeHermes({
+    await executeHermesExpectingRejection({
       authToken: "j-not-object", agent: { adapterConfig: { claimedApiKeyPath: notObject } },
     });
-    expect(ctx.agent.adapterConfig.env.PAPERCLIP_API_KEY).toBe("j-not-object");
   });
 
   it("never overwrites an explicit operator-supplied PAPERCLIP_API_KEY", async () => {

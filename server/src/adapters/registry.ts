@@ -107,6 +107,65 @@ function buildHermesAuthGuardPrompt(opts: { runId: string; claimedApiKeyPath: st
  * responsibility (the run id is the natural cache key — every wake is one
  * execute()).
  */
+
+/**
+ * RUAAAAA-5770: a claimed API key file that EXISTS but cannot be used.
+ *
+ * The old behaviour was to log a warning and fall back to the local-agent JWT.
+ * For a hermes_local seat that fallback can only 401 - the JWT signature
+ * verifies but the agent lookup in actorMiddleware returns null - so the run
+ * looked alive while every Paperclip call failed with
+ * 401 {"error":"Unauthorized","guard":"signature"}. That is the exact shape of
+ * the RUAAAAA-5770 outage, which stayed invisible for ~30 hours.
+ *
+ * A MISSING file is still a legitimate state (the agent never claimed a key),
+ * so only an existing-but-unusable file is fatal.
+ */
+export class ClaimedApiKeyInvalidError extends Error {
+  readonly code = "paperclip_claimed_api_key_invalid";
+
+  constructor(
+    readonly agentId: string,
+    readonly claimedApiKeyPath: string,
+    readonly reason: string,
+    readonly detail: string,
+  ) {
+    super(
+      `[hermes_local] the claimed API key file ${claimedApiKeyPath} is unusable (${reason}: ${detail}). ` +
+        `Refusing to fall back to the local-agent JWT: for a hermes_local seat that path answers 401 ` +
+        `({"error":"Unauthorized","guard":"signature"}), so the run would look alive and fail every call. ` +
+        `Re-claim the key (the board approves the claim) and write a real pcp_ token into the file.`,
+    );
+    this.name = "ClaimedApiKeyInvalidError";
+  }
+}
+
+/**
+ * Best-effort lookup of a hermes_local agent's stored Paperclip API key.
+ *
+ * Preferred source: `agent.adapterConfig.claimedApiKeyPath` (the per-agent
+ * `paperclip-claimed-api-key.json` file the agent writes when it claims its
+ * key, generated 2026-06-27 by the per-agent keyfile migration). The
+ * `agent_api_keys` table only stores SHA-256 hashes of keys and cannot
+ * recover the plaintext, so it is not a viable source. The file path is the
+ * canonical source of truth for raw tokens today (see RUAAAAA-2375).
+ *
+ * Behaviour:
+ * - Reads + parses the JSON file at the configured path (resolving a leading
+ *   `~` against `os.homedir()`).
+ * - Returns `parsed.token` when the JSON parses and the token is a usable
+ *   Paperclip api key (minted tokens are `pcp_<hex>`).
+ * - Returns `null` (with a warn log) when the path is unset or the file does
+ *   not exist: the agent never claimed a key, so the JWT path is still tried.
+ * - THROWS `ClaimedApiKeyInvalidError` when the file exists but is unusable
+ *   (unreadable, malformed JSON, no .token, or a token that is not a minted
+ *   `pcp_` value). RUAAAAA-5770: the seat must fail loudly instead of
+ *   silently continuing on a path that can only 401.
+ *
+ * The lookup is run once per `execute()` call. Cache-busting is the caller's
+ * responsibility (the run id is the natural cache key - every wake is one
+ * execute()).
+ */
 async function resolveHermesPaperclipApiKey(
   agent: { id: string; adapterConfig?: unknown },
   runId: string,
@@ -130,50 +189,71 @@ async function resolveHermesPaperclipApiKey(
   try {
     raw = await fs.promises.readFile(resolved, "utf-8");
   } catch (err) {
-    logger.warn(
-      { agentId: agent.id, runId, claimedApiKeyPath: resolved, err: err instanceof Error ? err.message : String(err) },
-      "[hermes_local] PAPERCLIP_API_KEY source unreadable; falling back to JWT path",
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      // The agent never claimed a key: the JWT path is still the only option.
+      logger.warn(
+        { agentId: agent.id, runId, claimedApiKeyPath: resolved },
+        "[hermes_local] claimedApiKeyPath file does not exist; falling back to JWT path",
+      );
+      return null;
+    }
+    const detail = err instanceof Error ? err.message : String(err);
+    logger.error(
+      { agentId: agent.id, runId, claimedApiKeyPath: resolved, err: detail },
+      "[hermes_local] claimedApiKeyPath file is unreadable; refusing the JWT fallback",
     );
-    return null;
+    throw new ClaimedApiKeyInvalidError(agent.id, resolved, "unreadable", detail);
   }
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch (err) {
-    logger.warn(
-      { agentId: agent.id, runId, claimedApiKeyPath: resolved, err: err instanceof Error ? err.message : String(err) },
-      "[hermes_local] claimedApiKeyPath file is not valid JSON; falling back to JWT path",
+    const detail = err instanceof Error ? err.message : String(err);
+    logger.error(
+      { agentId: agent.id, runId, claimedApiKeyPath: resolved, err: detail },
+      "[hermes_local] claimedApiKeyPath file is not valid JSON; refusing the JWT fallback",
     );
-    return null;
+    throw new ClaimedApiKeyInvalidError(agent.id, resolved, "invalid_json", detail);
   }
-  if (!parsed || typeof parsed !== "object") {
-    logger.warn(
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    logger.error(
       { agentId: agent.id, runId, claimedApiKeyPath: resolved },
-      "[hermes_local] claimedApiKeyPath JSON is not an object; falling back to JWT path",
+      "[hermes_local] claimedApiKeyPath JSON is not an object; refusing the JWT fallback",
     );
-    return null;
+    throw new ClaimedApiKeyInvalidError(
+      agent.id,
+      resolved,
+      "not_object",
+      "the JSON root is not an object",
+    );
   }
   const token = (parsed as { token?: unknown }).token;
-  if (typeof token !== "string" || token.trim().length === 0) {
-    logger.warn(
+  if (token === undefined || token === null) {
+    logger.error(
       { agentId: agent.id, runId, claimedApiKeyPath: resolved },
-      "[hermes_local] claimedApiKeyPath JSON missing .token; falling back to JWT path",
+      "[hermes_local] claimedApiKeyPath JSON missing .token; refusing the JWT fallback",
     );
-    return null;
+    throw new ClaimedApiKeyInvalidError(agent.id, resolved, "missing_token", "the JSON has no .token field");
   }
-  const trimmedToken = token.trim();
   // Defense-in-depth: the agent_api_keys table only ever stores tokens
   // minted via server/src/services/agents.ts:createApiKey which produces
   // `pcp_<random>` strings. Reject anything that does not match so we never
-  // silently inject a raw JWT or other unrelated value.
-  if (!trimmedToken.startsWith("pcp_")) {
-    logger.warn(
-      { agentId: agent.id, runId, claimedApiKeyPath: resolved, tokenPrefix: trimmedToken.slice(0, 4) },
-      "[hermes_local] claimedApiKeyPath token does not look like a Paperclip api key; falling back to JWT path",
+  // silently inject a raw JWT, a placeholder, or a scrubbed value.
+  const validated = validateClaimedApiKeyToken(token);
+  if (!validated.ok) {
+    logger.error(
+      {
+        agentId: agent.id,
+        runId,
+        claimedApiKeyPath: resolved,
+        reason: validated.reason,
+        detail: validated.detail,
+      },
+      "[hermes_local] claimedApiKeyPath holds an unusable token; refusing the JWT fallback",
     );
-    return null;
+    throw new ClaimedApiKeyInvalidError(agent.id, resolved, validated.reason, validated.detail);
   }
-  return trimmedToken;
+  return validated.token;
 }
 import {
   execute as acpxExecute,
@@ -259,8 +339,10 @@ import {
   modelProfiles as openCodeModelProfiles,
 } from "@paperclipai/adapter-opencode-local";
 import {
+  describeClaimedApiKeyFailure,
   execute as openclawGatewayExecute,
   testEnvironment as openclawGatewayTestEnvironment,
+  validateClaimedApiKeyToken,
 } from "@paperclipai/adapter-openclaw-gateway/server";
 import {
   agentConfigurationDoc as openclawGatewayAgentConfigurationDoc,
@@ -614,7 +696,12 @@ const hermesLocalAdapter: ServerAdapterModule = {
       try {
         resolvedStoredKey = await resolveHermesPaperclipApiKey(normalizedCtx.agent, runId);
       } catch (err) {
-        // resolveHermesPaperclipApiKey already logs; swallow so we still take the JWT path.
+        if (err instanceof ClaimedApiKeyInvalidError) {
+          // RUAAAAA-5770: fail the run loudly. The JWT fallback can only 401
+          // for a hermes_local seat, so continuing hides a broken credential
+          // behind a silent auth failure that lasts until someone looks.
+          throw err;
+        }
         resolvedStoredKey = null;
       }
     }
