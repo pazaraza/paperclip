@@ -8,6 +8,7 @@ import {
   type IssueGraphLivenessAutoRecoveryPreviewItem,
 } from "@paperclipai/shared";
 import {
+  activityLog,
   agents,
   agentWakeupRequests,
   approvals,
@@ -437,6 +438,76 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
   });
 
+  /**
+   * Run ids that wrote to an issue, as recorded in `activity_log`.
+   *
+   * `context_snapshot.issueId` is the canonical run -> issue pointer, but it is only
+   * present when the run was woken *for* that issue. A run woken by `heartbeat_timer`
+   * (or any other unscoped wake) that then works an issue - checks it out, writes
+   * comments - is invisible to a `context_snapshot ->> 'issueId'` predicate, so the
+   * recovery could declare "no live execution path" while that run was still writing.
+   *
+   * This mirrors the widening the issue run list already ships in
+   * `server/src/services/issues.ts`.
+   */
+  async function getActivityLinkedIssueRunIds(companyId: string, issueId: string): Promise<string[]> {
+    const rows = await db
+      .select({ runId: activityLog.runId })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, issueId),
+        ),
+      );
+
+    return Array.from(
+      new Set(
+        rows
+          .map((row) => row.runId)
+          .filter((runId): runId is string => typeof runId === "string" && runId.length > 0),
+      ),
+    );
+  }
+
+  /**
+   * The run -> issue scope predicate used by the recovery path.
+   *
+   * Matches a run when EITHER:
+   *   - `context_snapshot.issueId` names the issue (the canonical pointer), OR
+   *   - `activity_log` records the run writing to the issue.
+   *
+   * The second disjunct closes the blind spot where a run woken outside the issue
+   * (e.g. `heartbeat_timer`) later works the issue; without it the recovery could
+   * declare "no live execution path" and park an issue that a live run was still
+   * writing to.
+   */
+  async function issueRunScopeCondition(companyId: string, issueId: string) {
+    const activityRunIds = await getActivityLinkedIssueRunIds(companyId, issueId);
+
+    return activityRunIds.length > 0
+      ? or(
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          inArray(heartbeatRuns.id, activityRunIds),
+        )
+      : sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`;
+  }
+
+  /**
+   * Test-only view of the issue -> run scope used by the recovery.
+   *
+   * Exposed so the blind-spot regression (ABY-943) can assert against the same
+   * predicates the recovery uses, rather than against a copy of them.
+   */
+  async function getIssueRunScopeForTest(companyId: string, issueId: string) {
+    const [latestRun, activeExecutionPath] = await Promise.all([
+      getLatestIssueRun(companyId, issueId),
+      hasActiveExecutionPath(companyId, issueId),
+    ]);
+    return { latestRunId: latestRun?.id ?? null, hasActiveExecutionPath: activeExecutionPath };
+  }
+
   async function getAgent(agentId: string) {
     return db.select().from(agents).where(eq(agents.id, agentId)).then((rows) => rows[0] ?? null);
   }
@@ -456,7 +527,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .where(
         and(
           eq(heartbeatRuns.companyId, companyId),
-          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          await issueRunScopeCondition(companyId, issueId),
         ),
       )
       .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
@@ -473,7 +544,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           and(
             eq(heartbeatRuns.companyId, companyId),
             inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
-            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+            await issueRunScopeCondition(companyId, issueId),
           ),
         )
         .limit(1)
@@ -4538,5 +4609,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     buildIssueGraphLivenessAutoRecoveryPreview,
     reconcileIssueGraphLiveness,
     readRecoveryTimerIntervalMs,
+    getIssueRunScopeForTest,
   };
 }
